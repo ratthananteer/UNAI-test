@@ -549,13 +549,13 @@ export default function LiveMap({
         </div>
       </div>
 
-      <div className="border-t border-slate-200 bg-white p-4">
-        <div className="mb-3 flex items-center justify-between">
+      <div className="border-t border-slate-200 bg-white p-3">
+        <div className="mb-2 flex items-center justify-between">
           <div>
-            <h2 className="text-lg font-bold text-slate-800">Tag Groups</h2>
+            <h2 className="text-sm font-bold text-slate-800">Tag Groups</h2>
             <p className="text-xs text-slate-400">Grouped from real-time Socket.IO tag data</p>
           </div>
-          <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
+          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-500">
             {socketTagGroups.length} group{socketTagGroups.length === 1 ? "" : "s"}
           </span>
         </div>
@@ -565,20 +565,20 @@ export default function LiveMap({
             Waiting for tag data from Socket.IO...
           </div>
         ) : (
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          <div className="max-h-44 space-y-1.5 overflow-y-auto pr-1">
             {socketTagGroups.map((group) => (
               <div
                 key={group.groupName}
-                className="rounded-2xl border border-slate-200 bg-slate-50 p-4"
+                className="rounded-lg border border-slate-200 bg-slate-50 p-2"
               >
                 <div className="mb-3 flex items-center justify-between">
-                  <h3 className="font-bold text-slate-800">{group.groupName}</h3>
-                  <span className="rounded-full bg-violet-100 px-2 py-1 text-xs font-bold text-violet-700">
+                  <h3 className="min-w-0 truncate text-xs font-bold text-slate-800">{group.groupName}</h3>
+                  <span className="rounded-full bg-violet-100 px-1.5 py-0.5 text-[10px] font-bold text-violet-700">
                     {group.members.length}
                   </span>
                 </div>
 
-                <div className="space-y-2">
+                <div className="mt-1 max-h-24 space-y-1 overflow-y-auto pr-1">
                   {group.members.map((tag, index) => {
                     const firstname = getStringField(tag, "firstname", "first_name", "firstName");
                     const lastname = getStringField(tag, "lastname", "last_name", "lastName");
@@ -589,12 +589,12 @@ export default function LiveMap({
                     return (
                       <div
                         key={String(tagId)}
-                        className="rounded-xl border border-white bg-white p-3 shadow-sm"
+                        className="rounded-md border border-white bg-white px-2 py-1 shadow-sm"
                       >
-                        <p className="font-semibold text-slate-700">
+                        <p className="truncate text-[10px] font-semibold text-slate-700">
                           {fullName || tagName || `Tag ${String(tagId)}`}
                         </p>
-                        <p className="mt-1 text-xs text-slate-400">
+                        <p className="mt-0.5 truncate text-[9px] text-slate-400">
                           {tagName && fullName ? `${tagName} · ` : ""}
                           Tag ID: {String(tagId)}
                         </p>
