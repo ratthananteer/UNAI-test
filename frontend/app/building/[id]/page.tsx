@@ -1,67 +1,71 @@
-import { notFound } from "next/navigation";
 import Link from "next/link";
 
-type ApiResponse = unknown;
 type DataItem = Record<string, unknown>;
 
-async function getApi(path: string): Promise<ApiResponse> {
+async function getApi(path: string): Promise<DataItem[]> {
   try {
-    const response = await fetch(path, { cache: "no-store" });
+    const response = await fetch(path, {
+      cache: "no-store",
+    });
 
     if (!response.ok) {
-      console.error(`[Building] API ${path} returned HTTP ${response.status}`);
+      console.error(
+        `[Building] ${path} returned HTTP ${response.status}`,
+      );
       return [];
     }
 
-    return await response.json();
+    const json: unknown = await response.json();
+
+    if (Array.isArray(json)) {
+      return json.filter(
+        (item): item is DataItem =>
+          item !== null &&
+          typeof item === "object" &&
+          !Array.isArray(item),
+      );
+    }
+
+    if (json && typeof json === "object") {
+      const data = json as DataItem;
+
+      for (const value of [data.data, data.items, data.results]) {
+        if (Array.isArray(value)) {
+          return value.filter(
+            (item): item is DataItem =>
+              item !== null &&
+              typeof item === "object" &&
+              !Array.isArray(item),
+          );
+        }
+      }
+    }
+
+    return [];
   } catch (error) {
-    console.error(`[Building] API ${path} failed:`, error);
+    console.error(`[Building] ${path} failed:`, error);
     return [];
   }
 }
 
-function asArray(value: unknown): DataItem[] {
-  if (Array.isArray(value)) {
-    return value.filter(
-      (item): item is DataItem =>
-        item !== null && typeof item === "object" && !Array.isArray(item),
-    );
-  }
-
-  if (value && typeof value === "object") {
-    const object = value as DataItem;
-    const candidates = [object.data, object.items, object.results];
-
-    for (const candidate of candidates) {
-      if (Array.isArray(candidate)) {
-        return candidate.filter(
-          (item): item is DataItem =>
-            item !== null && typeof item === "object" && !Array.isArray(item),
-        );
-      }
-    }
-  }
-
-  return [];
-}
-
 function getId(value: unknown): string | number | undefined {
-  if (typeof value === "string" || typeof value === "number") return value;
+  if (typeof value === "string" || typeof value === "number") {
+    return value;
+  }
+
   return undefined;
 }
 
 function getString(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (typeof value === "number" || typeof value === "boolean") return String(value);
-  return "";
-}
-
-function getNestedId(value: unknown): string | number | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return undefined;
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return String(value);
   }
 
-  return getId((value as DataItem).id);
+  return "";
 }
 
 export default async function BuildingPage({
@@ -71,86 +75,136 @@ export default async function BuildingPage({
 }) {
   const { id } = await params;
 
-  const [buildingResponse, floorResponse, anchorResponse, tagResponse, zoneResponse] =
-    await Promise.all([
-      getApi("/api/v1/get_all_building"),
-      getApi("/api/floors"),
-      getApi("/api/anchor"),
-      getApi("/api/tag"),
-      getApi("/api/zone"),
-    ]);
-
-  const buildings = asArray(buildingResponse);
-  const floors = asArray(floorResponse);
-  const anchors = asArray(anchorResponse);
-  const tags = asArray(tagResponse);
-  const zones = asArray(zoneResponse);
+  const [
+    buildings,
+    floors,
+    anchors,
+    tags,
+    zones,
+  ] = await Promise.all([
+    getApi("/api/v1/get_all_building"),
+    getApi("/api/floors"),
+    getApi("/api/anchor"),
+    getApi("/api/tag"),
+    getApi("/api/zone"),
+  ]);
 
   const building = buildings.find((item) => {
-    const itemId = getId(item.id ?? item.building_id ?? item.buildingId);
-    return itemId !== undefined && String(itemId) === id;
+    const buildingId = getId(
+      item.id ??
+        item.building_id ??
+        item.buildingId,
+    );
+
+    return buildingId !== undefined && String(buildingId) === id;
   });
 
-  if (buildings.length > 0 && !building) {
-    notFound();
-  }
-
   const buildingName = building
-    ? getString(building.name ?? building.building_name ?? building.title) || `Building ${id}`
+    ? getString(
+        building.name ??
+          building.building_name ??
+          building.title,
+      ) || `Building ${id}`
     : `Building ${id}`;
 
   const buildingFloors = floors.filter((floor) => {
-    const floorBuildingId = getId(floor.building_id ?? floor.buildingId);
-    const nestedBuildingId = getNestedId(floor.building);
-    const relatedId = floorBuildingId ?? nestedBuildingId;
+    const floorBuildingId = getId(
+      floor.building_id ??
+        floor.buildingId,
+    );
 
-    return relatedId === undefined || String(relatedId) === id;
+    return (
+      floorBuildingId === undefined ||
+      String(floorBuildingId) === id
+    );
   });
 
   return (
     <main className="min-h-screen bg-gray-50 p-6 text-gray-900">
       <div className="mx-auto max-w-7xl">
-        <div className="mb-6 flex items-center justify-between gap-4">
-          <div>
-            <Link href="/" className="text-sm text-blue-600 hover:underline">
-              ← Back to Home
-            </Link>
-            <h1 className="mt-2 text-3xl font-bold">{buildingName}</h1>
-            <p className="mt-1 text-sm text-gray-500">Building ID: {id}</p>
-          </div>
+
+        <Link
+          href="/"
+          className="text-sm text-blue-600 hover:underline"
+        >
+          ← Back to Home
+        </Link>
+
+        <div className="mt-4">
+          <h1 className="text-3xl font-bold">
+            {buildingName}
+          </h1>
+
+          <p className="mt-1 text-sm text-gray-500">
+            Building ID: {id}
+          </p>
         </div>
 
-        <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-          <Stat label="Floors" value={buildingFloors.length} />
-          <Stat label="Anchors" value={anchors.length} />
-          <Stat label="Tags" value={tags.length} />
-          <Stat label="Zones" value={zones.length} />
-          <Stat label="Building API" value={building ? "Connected" : "Unavailable"} />
+        <section className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+          <Stat
+            label="Floors"
+            value={buildingFloors.length}
+          />
+
+          <Stat
+            label="Anchors"
+            value={anchors.length}
+          />
+
+          <Stat
+            label="Tags"
+            value={tags.length}
+          />
+
+          <Stat
+            label="Zones"
+            value={zones.length}
+          />
+
+          <Stat
+            label="Building"
+            value={building ? "Available" : "Unavailable"}
+          />
         </section>
 
         <section className="mt-6 rounded-xl border bg-white p-5 shadow-sm">
-          <h2 className="text-xl font-semibold">Floor Data</h2>
+          <h2 className="text-xl font-semibold">
+            Floor Data
+          </h2>
 
           {buildingFloors.length === 0 ? (
             <p className="mt-4 text-sm text-gray-500">
-              No floor data is currently available. Check the backend API configuration
-              if floors are expected here.
+              No floor data available.
             </p>
           ) : (
             <div className="mt-4 flex gap-2 overflow-x-auto pb-2">
               {buildingFloors.map((floor, index) => {
-                const floorId = getId(floor.id ?? floor.floor_id ?? floor.floorId) ?? index;
+                const floorId =
+                  getId(
+                    floor.id ??
+                      floor.floor_id ??
+                      floor.floorId,
+                  ) ?? index;
+
                 const floorName =
-                  getString(floor.name ?? floor.floor_name ?? floor.title) ||
-                  `Floor ${index + 1}`;
+                  getString(
+                    floor.name ??
+                      floor.floor_name ??
+                      floor.title,
+                  ) || `Floor ${index + 1}`;
 
                 return (
                   <div
                     key={String(floorId)}
                     className="min-w-32 rounded-lg border px-4 py-3"
                   >
-                    <div className="font-medium">{floorName}</div>
-                    <div className="text-xs text-gray-500">ID: {String(floorId)}</div>
+                    <div className="font-medium">
+                      {floorName}
+                    </div>
+
+                    <div className="text-xs text-gray-500">
+                      ID: {String(floorId)}
+                    </div>
                   </div>
                 );
               })}
@@ -159,13 +213,35 @@ export default async function BuildingPage({
         </section>
 
         <section className="mt-6 rounded-xl border bg-white p-5 shadow-sm">
-          <h2 className="text-xl font-semibold">API Status</h2>
+          <h2 className="text-xl font-semibold">
+            API Status
+          </h2>
+
           <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            <ApiStatus name="Buildings" available={buildings.length > 0} />
-            <ApiStatus name="Floors" available={floors.length > 0} />
-            <ApiStatus name="Anchors" available={anchors.length > 0} />
-            <ApiStatus name="Tags" available={tags.length > 0} />
-            <ApiStatus name="Zones" available={zones.length > 0} />
+            <ApiStatus
+              name="Buildings"
+              available={buildings.length > 0}
+            />
+
+            <ApiStatus
+              name="Floors"
+              available={floors.length > 0}
+            />
+
+            <ApiStatus
+              name="Anchors"
+              available={anchors.length > 0}
+            />
+
+            <ApiStatus
+              name="Tags"
+              available={tags.length > 0}
+            />
+
+            <ApiStatus
+              name="Zones"
+              available={zones.length > 0}
+            />
           </div>
         </section>
       </div>
@@ -173,20 +249,40 @@ export default async function BuildingPage({
   );
 }
 
-function Stat({ label, value }: { label: string; value: string | number }) {
+function Stat({
+  label,
+  value,
+}: {
+  label: string;
+  value: string | number;
+}) {
   return (
     <div className="rounded-xl border bg-white p-4 shadow-sm">
-      <div className="text-sm text-gray-500">{label}</div>
-      <div className="mt-1 text-2xl font-semibold">{value}</div>
+      <div className="text-sm text-gray-500">
+        {label}
+      </div>
+
+      <div className="mt-1 text-2xl font-semibold">
+        {value}
+      </div>
     </div>
   );
 }
 
-function ApiStatus({ name, available }: { name: string; available: boolean }) {
+function ApiStatus({
+  name,
+  available,
+}: {
+  name: string;
+  available: boolean;
+}) {
   return (
     <div className="flex items-center justify-between rounded-lg border px-4 py-3">
       <span>{name}</span>
-      <span className="text-sm font-medium">{available ? "Available" : "Unavailable"}</span>
+
+      <span className="text-sm font-medium">
+        {available ? "Available" : "Unavailable"}
+      </span>
     </div>
   );
 }
