@@ -1,21 +1,20 @@
 import Link from "next/link";
+import BuildingLiveMap from "../../../components/map/BuildingLiveMap";
 
 type DataItem = Record<string, unknown>;
 
-// Server Components run in Node.js, where fetch() requires an absolute URL.
-// BACKEND_URL must be set to the deployed backend origin, e.g.
-// https://unai-test.onrender.com
 const BACKEND_URL = (
   process.env.BACKEND_URL || "https://unai-test.onrender.com"
 ).replace(/\/$/, "");
 
 async function getApi(path: string): Promise<DataItem[]> {
   try {
-    const url = `${BACKEND_URL}${path}`;
-    const response = await fetch(url, { cache: "no-store" });
+    const response = await fetch(`${BACKEND_URL}${path}`, {
+      cache: "no-store",
+    });
 
     if (!response.ok) {
-      console.error(`[Building] ${url} returned HTTP ${response.status}`);
+      console.error(`[Building] ${path} returned HTTP ${response.status}`);
       return [];
     }
 
@@ -28,9 +27,7 @@ async function getApi(path: string): Promise<DataItem[]> {
     if (json && typeof json === "object") {
       const object = json as DataItem;
       for (const candidate of [object.data, object.items, object.results]) {
-        if (Array.isArray(candidate)) {
-          return candidate.filter(isDataItem);
-        }
+        if (Array.isArray(candidate)) return candidate.filter(isDataItem);
       }
     }
 
@@ -41,31 +38,22 @@ async function getApi(path: string): Promise<DataItem[]> {
   }
 }
 
-function isDataItem(item: unknown): item is DataItem {
-  return item !== null && typeof item === "object" && !Array.isArray(item);
+function isDataItem(value: unknown): value is DataItem {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function getId(value: unknown): string | number | undefined {
-  if (typeof value === "string" || typeof value === "number") {
-    return value;
-  }
-  return undefined;
+  return typeof value === "string" || typeof value === "number"
+    ? value
+    : undefined;
 }
 
 function getString(value: unknown): string {
-  if (
-    typeof value === "string" ||
+  return typeof value === "string" ||
     typeof value === "number" ||
     typeof value === "boolean"
-  ) {
-    return String(value);
-  }
-  return "";
-}
-
-function getNestedId(value: unknown): string | number | undefined {
-  if (!isDataItem(value)) return undefined;
-  return getId(value.id);
+    ? String(value)
+    : "";
 }
 
 export default async function BuildingPage({
@@ -75,7 +63,13 @@ export default async function BuildingPage({
 }) {
   const { id } = await params;
 
-  const [buildings, floors, anchors, tags, zones] = await Promise.all([
+  const [
+    buildingResponse,
+    floorResponse,
+    anchorResponse,
+    tagResponse,
+    zoneResponse,
+  ] = await Promise.all([
     getApi("/api/v1/get_all_building"),
     getApi("/api/floors"),
     getApi("/api/anchor"),
@@ -83,27 +77,37 @@ export default async function BuildingPage({
     getApi("/api/zone"),
   ]);
 
+  const buildings = buildingResponse;
+  const floors = floorResponse;
+  const anchors = anchorResponse;
+  const tags = tagResponse;
+  const zones = zoneResponse;
+
   const building = buildings.find((item) => {
-    const buildingId = getId(
-      item.id ?? item.building_id ?? item.buildingId,
-    );
-    return buildingId !== undefined && String(buildingId) === id;
+    const itemId = getId(item.id ?? item.building_id ?? item.buildingId);
+    return itemId !== undefined && String(itemId) === id;
   });
 
   const buildingName = building
-    ? getString(
-        building.name ?? building.building_name ?? building.title,
-      ) || `Building ${id}`
+    ? getString(building.name ?? building.building_name ?? building.title) ||
+      `Building ${id}`
     : `Building ${id}`;
 
   const buildingFloors = floors.filter((floor) => {
-    const directBuildingId = getId(
-      floor.building_id ?? floor.buildingId,
-    );
-    const nestedBuildingId = getNestedId(floor.building);
-    const relatedId = directBuildingId ?? nestedBuildingId;
+    const floorBuildingId = getId(floor.building_id ?? floor.buildingId);
+    if (floorBuildingId !== undefined) return String(floorBuildingId) === id;
 
-    return relatedId === undefined || String(relatedId) === id;
+    const buildingObject = floor.building;
+    if (isDataItem(buildingObject)) {
+      const nestedId = getId(
+        buildingObject.id ??
+          buildingObject.building_id ??
+          buildingObject.buildingId,
+      );
+      if (nestedId !== undefined) return String(nestedId) === id;
+    }
+
+    return true;
   });
 
   return (
@@ -123,12 +127,32 @@ export default async function BuildingPage({
           <Stat label="Anchors" value={anchors.length} />
           <Stat label="Tags" value={tags.length} />
           <Stat label="Zones" value={zones.length} />
-          <Stat label="Building" value={building ? "Available" : "Unavailable"} />
+          <Stat
+            label="Building"
+            value={building ? "Available" : "Unavailable"}
+          />
+        </section>
+
+        <section className="mt-6 rounded-xl border bg-white p-5 shadow-sm">
+          <div className="mb-4">
+            <h2 className="text-xl font-semibold">Live Map</h2>
+            <p className="text-sm text-gray-500">
+              Real-time building location data
+            </p>
+          </div>
+
+          <BuildingLiveMap
+            placeId={getId(building?.place_id ?? building?.placeId) ?? id}
+            buildingId={id}
+            floors={buildingFloors}
+            anchors={anchors}
+            tags={tags}
+            zones={zones}
+          />
         </section>
 
         <section className="mt-6 rounded-xl border bg-white p-5 shadow-sm">
           <h2 className="text-xl font-semibold">Floor Data</h2>
-
           {buildingFloors.length === 0 ? (
             <p className="mt-4 text-sm text-gray-500">
               No floor data available.
@@ -139,9 +163,8 @@ export default async function BuildingPage({
                 const floorId =
                   getId(floor.id ?? floor.floor_id ?? floor.floorId) ?? index;
                 const floorName =
-                  getString(
-                    floor.name ?? floor.floor_name ?? floor.title,
-                  ) || `Floor ${index + 1}`;
+                  getString(floor.name ?? floor.floor_name ?? floor.title) ||
+                  `Floor ${index + 1}`;
 
                 return (
                   <div
@@ -183,13 +206,7 @@ function Stat({ label, value }: { label: string; value: string | number }) {
   );
 }
 
-function ApiStatus({
-  name,
-  available,
-}: {
-  name: string;
-  available: boolean;
-}) {
+function ApiStatus({ name, available }: { name: string; available: boolean }) {
   return (
     <div className="flex items-center justify-between rounded-lg border px-4 py-3">
       <span>{name}</span>
