@@ -1,5 +1,5 @@
 import Link from "next/link";
-import LiveMap from "./LiveMap";
+import LiveMap from "../../../components/map/LiveMap";
 
 type ApiRecord = Record<string, unknown>;
 type ApiResponse = ApiRecord[] | ApiRecord;
