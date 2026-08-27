@@ -1,14 +1,13 @@
 import type { NextConfig } from "next";
 
+const backendUrl = process.env.BACKEND_URL;
+
+if (!backendUrl) {
+  throw new Error("BACKEND_URL is not configured");
+}
+
 const nextConfig: NextConfig = {
   async rewrites() {
-    const backendUrl = process.env.BACKEND_URL;
-
-    if (!backendUrl) {
-      console.warn("[Next.js] BACKEND_URL is not configured");
-      return [];
-    }
-
     return [
       {
         source: "/api/:path*",
