@@ -24,12 +24,18 @@ type Anchor = {
 type Tag = Record<string, unknown> & {
   id?: number | string;
   floor_id?: number | string;
+  building?: number | string;
+  buildingId?: number | string;
+  floor?: number | string;
+  tagId?: number | string;
   x?: number | string | null;
   y?: number | string | null;
+  z?: number | string | null;
   label?: string;
   name?: string;
   status?: number;
   group_name?: string;
+  group_id?: number | string;
   firstname?: string;
   lastname?: string;
 };
@@ -37,6 +43,16 @@ type Tag = Record<string, unknown> & {
 type TagGroup = {
   groupName: string;
   members: Tag[];
+};
+
+type TimelineEvent = {
+  id: string;
+  tagId: string;
+  tagName: string;
+  event: string;
+  x: number;
+  y: number;
+  timestamp: string;
 };
 
 type Zone = {
@@ -170,6 +186,15 @@ function findTagUpdates(
         ? resolvedFloorId
         : undefined;
 
+    const rawTimestamp =
+      object.timestamp ??
+      object.time ??
+      object.unix_time ??
+      object.unixTime ??
+      object.lastSeenAt ??
+      object.date_now ??
+      object.created_at;
+
     updates.push({
       ...object,
       id: rawTagId,
@@ -178,6 +203,7 @@ function findTagUpdates(
       y,
       tagId: rawTagId,
       _socketEvent: eventName,
+      _eventTimestamp: rawTimestamp,
     });
   }
 
@@ -206,10 +232,93 @@ export default function LiveMap({
   const [lastUpdate, setLastUpdate] = useState<string | null>(null);
   const [messageCount, setMessageCount] = useState(0);
   const [socketTagGroups, setSocketTagGroups] = useState<TagGroup[]>([]);
+  const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
+  const [activeTagIds, setActiveTagIds] = useState<Set<string>>(new Set());
+  const [activeTagCheckReady, setActiveTagCheckReady] = useState(false);
 
   useEffect(() => {
     setTags(initialTags);
+    setActiveTagIds(new Set());
+    setActiveTagCheckReady(false);
   }, [initialTags, floor.id]);
+
+  // MongoDB is the source of truth for whether a tag is currently active.
+  // A tag remains visible while it keeps sending activity, even when it is
+  // stationary. It disappears after 10 seconds without a new position event.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function checkActiveTags() {
+      try {
+        const response = await fetch(
+          `http://localhost:4000/api/active-tags?buildingId=${encodeURIComponent(String(buildingId))}&floorId=${encodeURIComponent(String(floor.id))}`,
+          { cache: "no-store" }
+        );
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        if (cancelled) return;
+
+        const active = Array.isArray(data?.tags) ? data.tags : [];
+        const ids = new Set<string>();
+
+        setTags((current) => {
+          const next = [...current];
+
+          for (const activeTag of active) {
+            const tagId = activeTag?.tagId;
+            if (tagId === undefined || tagId === null) continue;
+            const id = String(tagId);
+            ids.add(id);
+
+            const index = next.findIndex((tag) =>
+              sameId(tag.id ?? tag.tagId ?? tag.tag_id, tagId)
+            );
+
+            const normalized: Tag = {
+              ...activeTag,
+              id: tagId,
+              tagId,
+              floor_id: activeTag.floorId ?? floor.id,
+              x: numberValue(activeTag.x),
+              y: numberValue(activeTag.y),
+            };
+
+            if (index >= 0) {
+              next[index] = { ...next[index], ...normalized };
+            } else {
+              next.push(normalized);
+            }
+          }
+
+          return next;
+        });
+
+        setActiveTagIds(ids);
+        setActiveTagCheckReady(true);
+      } catch (error) {
+        console.error("[TagMonitor] Active tag check failed:", error);
+      }
+    }
+
+    void checkActiveTags();
+    const timer = window.setInterval(() => void checkActiveTags(), 2000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [buildingId, floor.id]);
+
+  const visibleTags = useMemo(() => {
+    if (!activeTagCheckReady) return [];
+    return tags.filter((tag) =>
+      activeTagIds.has(String(tag.id ?? tag.tagId ?? tag.tag_id))
+    );
+  }, [tags, activeTagIds, activeTagCheckReady]);
 
   function getStringField(tag: Tag, ...keys: string[]): string {
     for (const key of keys) {
@@ -239,8 +348,83 @@ export default function LiveMap({
   }
 
   useEffect(() => {
-    setSocketTagGroups(buildTagGroups(tags));
-  }, [tags]);
+    setSocketTagGroups(buildTagGroups(visibleTags));
+  }, [visibleTags]);
+
+  function eventTime(value: unknown): string {
+    if (typeof value === "number") {
+      const milliseconds = value < 100000000000 ? value * 1000 : value;
+      const date = new Date(milliseconds);
+      if (!Number.isNaN(date.getTime())) return date.toISOString();
+    }
+
+    if (typeof value === "string" && value.trim()) {
+      const date = new Date(value);
+      if (!Number.isNaN(date.getTime())) return date.toISOString();
+    }
+
+    return new Date().toISOString();
+  }
+
+  async function saveTagEvents(updates: Tag[], eventName: string) {
+    const events = updates.map((tag) => ({
+      // UNAI RTLS payload uses `id`, `building`, `floor`, `timestamp`, `x`, `y`.
+      // Keep the normalized names in MongoDB, but preserve the original object.
+      tagId: String(tag.id ?? tag.tagId ?? tag.tag_id),
+      buildingId: String(tag.building ?? tag.buildingId ?? buildingId),
+      floorId: String(tag.floor ?? tag.floor_id ?? tag.floorId ?? floor.id),
+      groupId: tag.group_id ?? null,
+      groupName: tag.group_name ?? null,
+      tagName: tag.ui_display ?? tag.label ?? tag.name ?? null,
+      event: eventName || "position_update",
+      x: Number(tag.x),
+      y: Number(tag.y),
+      z: numberValue(tag.z),
+      timestamp: eventTime(tag._eventTimestamp ?? tag.timestamp),
+      rawData: tag,
+    }));
+
+    if (!events.length) return;
+
+    console.log("[MongoDB] Sending socket tag events:", events);
+
+    try {
+      const response = await fetch("http://localhost:4000/api/tag-events", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ events }),
+      });
+
+      const result = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(result?.error || `HTTP ${response.status}`);
+      }
+
+      console.log(`[MongoDB] Saved ${events.length} tag event(s)`);
+    } catch (error) {
+      console.error("[MongoDB] Failed to save tag event:", error);
+    }
+  }
+
+  function addTimelineEvents(updates: Tag[], eventName: string) {
+    const newEvents: TimelineEvent[] = updates.map((tag) => {
+      const tagId = String(tag.id ?? tag.tagId ?? "unknown");
+      const tagName = getStringField(tag, "label", "name", "tag_name", "tagName") || `Tag ${tagId}`;
+      return {
+        id: `${tagId}-${eventTime(tag._eventTimestamp)}-${Math.random()}`,
+        tagId,
+        tagName,
+        event: eventName,
+        x: Number(tag.x),
+        y: Number(tag.y),
+        timestamp: eventTime(tag._eventTimestamp),
+      };
+    });
+
+    if (newEvents.length > 0) {
+      setTimeline((current) => [...newEvents, ...current].slice(0, 100));
+    }
+  }
 
   useEffect(() => {
     let socket: SocketLike | null = null;
@@ -309,6 +493,8 @@ export default function LiveMap({
             });
 
             console.log("[UNAI RTLS] TAG GROUPS:", buildTagGroups(updates));
+            addTimelineEvents(updates, eventName);
+            void saveTagEvents(updates, eventName);
             setLastUpdate(new Date().toLocaleTimeString());
           };
 
@@ -533,7 +719,7 @@ export default function LiveMap({
             )}
           </div>
 
-          {tags.map((tag) => {
+          {visibleTags.map((tag) => {
             const realX = numberValue(tag.x);
             const realY = numberValue(tag.y);
             if (realX === null || realY === null) return null;
