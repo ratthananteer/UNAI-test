@@ -45,7 +45,8 @@ type Zone = ApiRecord & {
 };
 
 async function getApi(path: string): Promise<ApiResponse> {
-  const response = await fetch(`http://localhost:4000${path}`, {
+  // Use the Next.js /api proxy. Never call localhost:4000 from the browser/server page directly.
+  const response = await fetch(path, {
     cache: "no-store",
   });
 

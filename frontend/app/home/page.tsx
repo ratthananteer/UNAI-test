@@ -10,12 +10,30 @@ type Anchor = ApiRecord & { status?: number };
 type Tag = ApiRecord & { status?: number };
 
 async function getApi(path: string): Promise<ApiResponse> {
-  const response = await fetch(`http://localhost:4000${path}`, {
+  // Use Next.js proxy so the browser never connects directly to localhost:4000.
+  const response = await fetch(path, {
     cache: "no-store",
   });
 
   if (!response.ok) {
-    throw new Error(`Failed to fetch ${path}: HTTP ${response.status}`);
+    let details = "";
+    try {
+      const body: unknown = await response.json();
+      if (body && typeof body === "object") {
+        const record = body as Record<string, unknown>;
+        const message = record.error ?? record.message;
+        const upstream = record.details;
+        details = [message, upstream ? JSON.stringify(upstream) : ""]
+          .filter(Boolean)
+          .join(" — ");
+      }
+    } catch {
+      // The backend may return a non-JSON error body.
+    }
+
+    throw new Error(
+      `Failed to fetch ${path}: HTTP ${response.status}${details ? ` — ${details}` : ""}`,
+    );
   }
 
   return response.json() as Promise<ApiResponse>;
