@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: unai-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        sync: false
+      - key: UNAI_USERNAME
+        sync: false
+      - key: UNAI_PASSWORD
+        sync: false
+      - key: UNAI_SOCKET_URL
+        sync: false
+      - key: TAG_ALIVE_TIMEOUT_SECONDS
+        value: "10"
+      - key: TAG_SCREEN_INTERVAL_SECONDS
+        value: "2"
+
+  - type: web
+    name: unai-frontend
+    runtime: docker
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: ./frontend
+    envVars:
+      - key: BACKEND_URL
+        sync: false
