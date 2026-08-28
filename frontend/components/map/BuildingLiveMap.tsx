@@ -395,39 +395,39 @@ function BuildingTagHistory({
               if (!points) return null; const color = typeof zone.zone_color === "string" ? zone.zone_color : "#5dc6ba";
               return <polygon key={String(zone.id ?? zi)} points={points} fill={color} fillOpacity={0.2} stroke={color} strokeWidth={2} vectorEffect="non-scaling-stroke" />;
             })}
+            {historyByTag.map(([groupTagId, tagEvents], groupIndex) => {
+              const points = tagEvents
+                .map((event) => {
+                  const px = num(event.x);
+                  const py = num(event.y);
+                  if (px === null || py === null) return null;
+                  return `${ox + px * scale},${oy - py * scale}`;
+                })
+                .filter((point): point is string => point !== null)
+                .join(" ");
+
+              if (!points) return null;
+
+              const isSelected = tagId !== "" && groupTagId === tagId;
+              const stroke = isSelected
+                ? "#0ea5e9"
+                : `hsl(${(groupIndex * 137.5) % 360} 70% 45%)`;
+
+              return (
+                <polyline
+                  key={`history-line-${groupTagId}`}
+                  points={points}
+                  fill="none"
+                  stroke={stroke}
+                  strokeWidth={isSelected ? 4 : 2}
+                  strokeOpacity={isSelected ? 0.9 : 0.55}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  vectorEffect="non-scaling-stroke"
+                />
+              );
+            })}
           </svg>
-          {historyByTag.map(([groupTagId, tagEvents], groupIndex) => {
-            const points = tagEvents
-              .map((event) => {
-                const px = num(event.x);
-                const py = num(event.y);
-                if (px === null || py === null) return null;
-                return `${ox + px * scale},${oy - py * scale}`;
-              })
-              .filter((point): point is string => point !== null)
-              .join(" ");
-
-            if (!points) return null;
-
-            const isSelected = tagId !== "" && groupTagId === tagId;
-            const stroke = isSelected
-              ? "#ef4444"
-              : `hsl(${(groupIndex * 137.5) % 360} 70% 45%)`;
-
-            return (
-              <polyline
-                key={`history-line-${groupTagId}`}
-                points={points}
-                fill="none"
-                stroke={stroke}
-                strokeWidth={isSelected ? 4 : 2}
-                strokeOpacity={isSelected ? 0.9 : 0.55}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                vectorEffect="non-scaling-stroke"
-              />
-            );
-          })}
 
           {mapHistory.map((event, eventIndex) => {
             const px = num(event.x);
@@ -476,7 +476,11 @@ function BuildingTagHistory({
 
           {tagId && x !== null && y !== null && current?.floorId !== undefined && String(current.floorId) === String(selectedFloorId) && (
             <div
-              
+              className="pointer-events-none absolute z-40 h-8 w-8 -translate-x-1/2 -translate-y-1/2 rounded-full border-4 border-white bg-sky-600 shadow-lg ring-2 ring-sky-300"
+              style={{
+                left: `${Math.max(0, Math.min(100, ((ox + x * scale) / width) * 100))}%`,
+                top: `${Math.max(0, Math.min(100, ((oy - y * scale) / height) * 100))}%`,
+              }}
               title={`Current ${current.tagId} · ${x}, ${y}`}
             />
           )}
