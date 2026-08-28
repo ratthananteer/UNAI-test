@@ -1,5 +1,5 @@
 import Link from "next/link";
-import BuildingLiveMap from "../../../components/map/BuildingLiveMap";
+import { BuildingMapModes } from "../../../components/map/BuildingLiveMap";
 
 type DataItem = Record<string, unknown>;
 
@@ -130,23 +130,14 @@ export default async function BuildingPage({
           />
         </section>
 
-        <section className="mt-6 overflow-hidden rounded-xl border bg-white p-5 shadow-sm">
-          <div className="mb-4">
-            <h2 className="text-xl font-semibold">Live Map</h2>
-            <p className="text-sm text-gray-500">
-              Real-time building location data
-            </p>
-          </div>
-
-          <BuildingLiveMap
-            placeId={getId(building?.place_id ?? building?.placeId) ?? id}
-            buildingId={id}
-            floors={buildingFloors}
-            anchors={anchors}
-            tags={tags}
-            zones={zones}
-          />
-        </section>
+        <BuildingMapModes
+          placeId={getId(building?.place_id ?? building?.placeId) ?? id}
+          buildingId={id}
+          floors={buildingFloors}
+          anchors={anchors}
+          tags={tags}
+          zones={zones}
+        />
 
         <section className="mt-6 rounded-xl border bg-white p-5 shadow-sm">
           <h2 className="text-xl font-semibold">Floor Data</h2>
