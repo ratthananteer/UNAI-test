@@ -110,7 +110,7 @@ export default async function BuildingPage({
   return (
     <main className="min-h-screen bg-gray-50 p-6 text-gray-900">
       <div className="mx-auto max-w-7xl">
-        <Link href="/" className="text-sm text-blue-600 hover:underline">
+        <Link href="/home" className="text-sm text-blue-600 hover:underline">
           ← Back to Home
         </Link>
 
