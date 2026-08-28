@@ -101,7 +101,7 @@ export default function BuildingLiveMap({
     <section className="mt-6 overflow-hidden rounded-xl border bg-white shadow-sm">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b bg-white p-4">
         <div>
-          <h2 className="text-xl font-semibold">Live Map</h2>
+         
           <p className="text-sm text-gray-500">
             Real-time tag and anchor locations
           </p>
