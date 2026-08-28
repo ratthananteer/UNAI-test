@@ -476,11 +476,7 @@ function BuildingTagHistory({
 
           {tagId && x !== null && y !== null && current?.floorId !== undefined && String(current.floorId) === String(selectedFloorId) && (
             <div
-              className="pointer-events-none absolute z-40 h-8 w-8 -translate-x-1/2 -translate-y-1/2 rounded-full border-4 border-white bg-sky-600 shadow-lg ring-2 ring-sky-300"
-              style={{
-                left: `${Math.max(0, Math.min(100, ((ox + x * scale) / width) * 100))}%`,
-                top: `${Math.max(0, Math.min(100, ((oy - y * scale) / height) * 100))}%`,
-              }}
+             
               title={`Current ${current.tagId} · ${x}, ${y}`}
             />
           )}
