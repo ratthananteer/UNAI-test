@@ -1,5 +1,4 @@
 services:
-
   mongodb:
     image: mongo:8
     container_name: unai-mongodb
@@ -19,7 +18,21 @@ services:
     environment:
       NODE_ENV: development
       PORT: 4000
-      MONGODB_URI: mongodb+srv://ratthanan2560_db_user:5dxpsed23yWmUHHT@cluster0.gi5baxk.mongodb.net/
+      MONGODB_URI: ${MONGODB_URI}
+
+      ACCESS_TOKEN: ${ACCESS_TOKEN}
+      SOCKET_TOKEN: ${SOCKET_TOKEN}
+      ENCRYPT_TOPIC: ${ENCRYPT_TOPIC}
+
+      APIPLACE_URL: ${APIPLACE_URL}
+      APIBUILDING_URL: ${APIBUILDING_URL}
+      APIFLOOR_URL: ${APIFLOOR_URL}
+      APIANCHOR_URL: ${APIANCHOR_URL}
+      APIZONE_URL: ${APIZONE_URL}
+      APITAG_URL: ${APITAG_URL}
+
+      UNAI_USERNAME: ${UNAI_USERNAME}
+      UNAI_PASSWORD: ${UNAI_PASSWORD}
     depends_on:
       - mongodb
 
@@ -35,3 +48,4 @@ services:
 
 volumes:
   mongo_data:
+

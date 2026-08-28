@@ -73,9 +73,9 @@ function startTagMonitor() {
 
   void run();
   monitorTimer = setInterval(() => void run(), getIntervalMs());
-  console.log(
-    `[TagMonitor] Started: timeout=${getTimeoutMs() / 1000}s, interval=${getIntervalMs() / 1000}s`
-  );
+  // console.log(
+  //   `[TagMonitor] Started: timeout=${getTimeoutMs() / 1000}s, interval=${getIntervalMs() / 1000}s`
+  // );
 }
 
 function getActiveTags({ buildingId, floorId } = {}) {

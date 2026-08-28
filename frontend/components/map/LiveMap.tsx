@@ -397,7 +397,7 @@ export default function LiveMap({
 
     if (!events.length) return;
 
-    console.log("[MongoDB] Sending socket tag events:", events);
+    // console.log("[MongoDB] Sending socket tag events:", events);
 
     try {
       const response = await fetch("/api/tag-events", {
@@ -411,7 +411,7 @@ export default function LiveMap({
         throw new Error(result?.error || `HTTP ${response.status}`);
       }
 
-      console.log(`[MongoDB] Saved ${events.length} tag event(s)`);
+      // console.log(`[MongoDB] Saved ${events.length} tag event(s)`);
     } catch (error) {
       console.error("[MongoDB] Failed to save tag event:", error);
     }
@@ -484,7 +484,7 @@ export default function LiveMap({
           }) as SocketLike;
 
           const handlePosition = (payload: unknown, eventName: string) => {
-            console.log(`[UNAI RTLS] ${eventName}:`, payload);
+            // console.log(`[UNAI RTLS] ${eventName}:`, payload);
             setMessageCount((count) => count + 1);
 
             const updates = findTagUpdates(payload, eventName, floorID);
@@ -503,14 +503,14 @@ export default function LiveMap({
               return next;
             });
 
-            console.log("[UNAI RTLS] TAG GROUPS:", buildTagGroups(updates));
+            // console.log("[UNAI RTLS] TAG GROUPS:", buildTagGroups(updates));
             addTimelineEvents(updates, eventName);
             void saveTagEvents(updates, eventName);
             setLastUpdate(new Date().toLocaleTimeString());
           };
 
           const onAnchor = (payload: unknown) => {
-            console.log("[UNAI RTLS] anchor:", payload);
+            // console.log("[UNAI RTLS] anchor:", payload);
             setMessageCount((count) => count + 1);
           };
 
@@ -540,11 +540,11 @@ export default function LiveMap({
               },
             });
 
-            console.log("[UNAI RTLS] registered and joined:", {
-              tag: `${baseTopic}/tag`,
-              anchor: `${baseTopic}/anchor`,
-              alert: `${baseTopic}/alert`,
-            });
+            // console.log("[UNAI RTLS] registered and joined:", {
+            //   tag: `${baseTopic}/tag`,
+            //   anchor: `${baseTopic}/anchor`,
+            //   alert: `${baseTopic}/alert`,
+            // });
           };
 
           const onDisconnect = (reason: string) => {

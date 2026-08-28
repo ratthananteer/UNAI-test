@@ -58,7 +58,7 @@ router.post("/", async (req, res) => {
 
     const events = await TagEvent.insertMany(documents, { ordered: false });
 
-    console.log(`[TagEvent] Saved ${events.length} event(s)`);
+    //console.log(`[TagEvent] Saved ${events.length} event(s)`);
 
     return res.status(201).json({
       ok: true,
