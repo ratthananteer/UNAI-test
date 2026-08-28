@@ -1,3 +1,15 @@
+// BUILDING MAP CONTROLLER + HISTORY UI:
+// This component owns the Building page's floor selector and switches between
+// Live Map and Tag History modes. BuildingTagHistory loads saved tag positions,
+// filters them by floor/tag, draws historical paths and markers, and provides
+// timeline replay. The live mode passes normalized building data to LiveMap.
+//
+// Tag History concept:
+// - All Tags mode shows a limited history window per tag and can move backward.
+// - Selected Tag mode shows that tag's past positions up to the selected time.
+// - The current/default tag marker uses the Building live-map T + Tag ID style.
+// - Older positions are rendered as faded shadow positions.
+
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
@@ -238,7 +250,7 @@ function BuildingTagHistory({
   const [index, setIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [allHistoryIndex, setAllHistoryIndex] = useState(0);
-  const ALL_HISTORY_VISIBLE = 5;
+  const ALL_HISTORY_VISIBLE = 10;
 
   const selectedFloor = useMemo(() => floors.find((item) => String(floorId(item)) === String(selectedFloorId)), [floors, selectedFloorId]);
 
@@ -423,29 +435,48 @@ function BuildingTagHistory({
             if (px === null || py === null) return null;
 
             const isSelected = tagId !== "" && String(event.tagId) === tagId;
+            const tagEvents = historyByTag.find(([id]) => id === String(event.tagId))?.[1] ?? [];
+            const isLatestVisible = tagEvents[tagEvents.length - 1] === event;
             const isCurrent = isSelected && current?._id === event._id;
+            const isPastShadow = !isCurrent && !isLatestVisible;
             const left = Math.max(0, Math.min(100, ((ox + px * scale) / width) * 100));
             const top = Math.max(0, Math.min(100, ((oy - py * scale) / height) * 100));
+            const displayTagId = String(event.tagId ?? "—");
 
             return (
               <div
                 key={`history-point-${event._id ?? `${event.tagId}-${event.timestamp}-${eventIndex}`}`}
-                className={`absolute -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow ${
-                  isCurrent ? "z-30 h-8 w-8 bg-red-500" : isSelected ? "z-20 h-4 w-4 bg-red-400" : "z-10 h-3 w-3 bg-sky-500"
+                className={`absolute -translate-x-1/2 -translate-y-1/2 flex flex-col items-center transition-all duration-150 ${
+                  isCurrent ? "z-40" : isLatestVisible ? "z-30" : "z-10"
                 }`}
                 style={{ left: `${left}%`, top: `${top}%` }}
-                title={`${event.tagName || `Tag ${event.tagId}`} · ${event.timestamp} · X: ${px}, Y: ${py}`}
-              />
+                title={`${event.tagName || `Tag ${displayTagId}`} · ${isPastShadow ? "Past position" : isCurrent ? "Current position" : "Latest position"} · ${event.timestamp} · X: ${px}, Y: ${py}`}
+              >
+                <div
+                  className={`flex items-center justify-center rounded-full border-2 border-white font-bold text-white shadow-lg ${
+                    isCurrent
+                      ? "h-8 min-w-8 bg-sky-600 px-2 text-[9px] ring-2 ring-sky-300"
+                      : isPastShadow
+                        ? "h-5 min-w-5 bg-sky-500/20 px-1 text-[7px] opacity-45 shadow-[0_0_10px_rgba(14,165,233,0.25)]"
+                        : "h-8 min-w-8 bg-sky-600 px-2 text-[9px]"
+                  }`}
+                >
+                  {isPastShadow ? "" : "T"}
+                </div>
+                {!isPastShadow && (
+                  <span className={`mt-1 max-w-28 truncate rounded bg-white/95 px-1.5 py-0.5 font-semibold text-slate-700 shadow ${
+                    isCurrent ? "text-[10px] text-sky-700" : "text-[9px]"
+                  }`}>
+                    {displayTagId}
+                  </span>
+                )}
+              </div>
             );
           })}
 
           {tagId && x !== null && y !== null && current?.floorId !== undefined && String(current.floorId) === String(selectedFloorId) && (
             <div
-              className="pointer-events-none absolute z-40 h-8 w-8 -translate-x-1/2 -translate-y-1/2 rounded-full border-4 border-white bg-red-500 shadow-lg ring-2 ring-red-300"
-              style={{
-                left: `${Math.max(0, Math.min(100, ((ox + x * scale) / width) * 100))}%`,
-                top: `${Math.max(0, Math.min(100, ((oy - y * scale) / height) * 100))}%`,
-              }}
+              
               title={`Current ${current.tagId} · ${x}, ${y}`}
             />
           )}
@@ -466,8 +497,8 @@ function BuildingTagHistory({
         ) : (
           <div>
             <div className="mb-2 flex justify-between text-xs text-slate-500">
-              <span>All Tags History — 5 records per tag</span>
-              <span>5 records per tag</span>
+              <span>All Tags History — 10 records per tag</span>
+              <span>10 records per tag</span>
             </div>
             <input
               type="range"
@@ -480,7 +511,7 @@ function BuildingTagHistory({
               aria-label="All tags history timeline"
             />
             <p className="mt-1 text-xs text-slate-400">
-              Move the timeline left to see older history. Maximum 5 past records are shown for each tag.
+              Move the timeline left to see older history. Maximum 10 past records are shown for each tag.
             </p>
           </div>
         )}
