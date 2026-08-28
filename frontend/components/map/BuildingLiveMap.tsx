@@ -257,14 +257,20 @@ function BuildingTagHistory({
     [history, tagId],
   );
 
+  // When a tag is selected, only show positions up to the current
+  // timeline point. Future positions are hidden.
+  const visibleHistory = useMemo(
+    () => tagId ? selectedHistory.slice(0, index + 1) : history,
+    [history, selectedHistory, tagId, index],
+  );
+
   const mapHistory = useMemo(
-    () => history.filter((event) => {
+    () => visibleHistory.filter((event) => {
       if (event.x == null || event.y == null) return false;
       if (event.floorId == null || selectedFloorId == null) return false;
-      if (tagId && String(event.tagId ?? "") !== tagId) return false;
       return String(event.floorId) === String(selectedFloorId);
     }),
-    [history, selectedFloorId, tagId],
+    [visibleHistory, selectedFloorId],
   );
 
   const historyByTag = useMemo(() => {
@@ -296,7 +302,12 @@ function BuildingTagHistory({
     return () => { cancelled = true; };
   }, [buildingId]);
 
-  useEffect(() => { setIndex(0); setPlaying(false); }, [tagId]);
+  useEffect(() => {
+    setPlaying(false);
+    // Start at the latest known position: all past positions are visible,
+    // while positions after the selected timeline point are never shown.
+    setIndex(tagId ? Math.max(0, selectedHistory.length - 1) : 0);
+  }, [tagId, selectedHistory.length]);
 
   useEffect(() => {
     if (!playing || selectedHistory.length <= 1) return;
