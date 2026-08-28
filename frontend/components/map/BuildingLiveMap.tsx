@@ -237,6 +237,8 @@ function BuildingTagHistory({
   const [tagId, setTagId] = useState("");
   const [index, setIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [allHistoryIndex, setAllHistoryIndex] = useState(0);
+  const ALL_HISTORY_VISIBLE = 5;
 
   const selectedFloor = useMemo(() => floors.find((item) => String(floorId(item)) === String(selectedFloorId)), [floors, selectedFloorId]);
 
@@ -259,10 +261,26 @@ function BuildingTagHistory({
 
   // When a tag is selected, only show positions up to the current
   // timeline point. Future positions are hidden.
-  const visibleHistory = useMemo(
-    () => tagId ? selectedHistory.slice(0, index + 1) : history,
-    [history, selectedHistory, tagId, index],
-  );
+  const allHistoryMaxIndex = Math.max(0, history.length - ALL_HISTORY_VISIBLE);
+
+  const visibleHistory = useMemo(() => {
+    if (tagId) return selectedHistory.slice(0, index + 1);
+
+    const end = Math.min(allHistoryIndex + ALL_HISTORY_VISIBLE, history.length);
+    const upToCutoff = history.slice(0, end);
+    const grouped = new Map<string, HistoryEvent[]>();
+
+    for (const event of upToCutoff) {
+      const id = String(event.tagId ?? "unknown");
+      const list = grouped.get(id) ?? [];
+      list.push(event);
+      grouped.set(id, list);
+    }
+
+    return Array.from(grouped.values()).flatMap((tagEvents) =>
+      tagEvents.slice(-ALL_HISTORY_VISIBLE),
+    );
+  }, [history, selectedHistory, tagId, index, allHistoryIndex]);
 
   const mapHistory = useMemo(
     () => visibleHistory.filter((event) => {
@@ -307,7 +325,8 @@ function BuildingTagHistory({
     // Start at the latest known position: all past positions are visible,
     // while positions after the selected timeline point are never shown.
     setIndex(tagId ? Math.max(0, selectedHistory.length - 1) : 0);
-  }, [tagId, selectedHistory.length]);
+    setAllHistoryIndex(allHistoryMaxIndex);
+  }, [tagId, selectedHistory.length, allHistoryMaxIndex]);
 
   useEffect(() => {
     if (!playing || selectedHistory.length <= 1) return;
@@ -352,7 +371,7 @@ function BuildingTagHistory({
         <span className="ml-auto text-xs text-slate-500">
           {tagId
             ? (selectedHistory.length ? `${index + 1} / ${selectedHistory.length}` : "No history for this tag")
-            : `${mapHistory.length} history points · All tags`}
+            : `${mapHistory.length} history points · All tags · max 5/tag`}
         </span>
       </div>
       <div className="overflow-auto bg-slate-100 p-4">
@@ -445,9 +464,25 @@ function BuildingTagHistory({
             aria-label="Selected tag history timeline"
           />
         ) : (
-          <p className="text-xs text-slate-500">
-            Showing all {mapHistory.length} history points on {String(selectedFloor.name ?? "this floor")}. Select a tag above to show only that tag and replay its history.
-          </p>
+          <div>
+            <div className="mb-2 flex justify-between text-xs text-slate-500">
+              <span>All Tags History — 5 records per tag</span>
+              <span>5 records per tag</span>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={allHistoryMaxIndex}
+              value={Math.min(allHistoryIndex, allHistoryMaxIndex)}
+              onChange={(e) => { setPlaying(false); setAllHistoryIndex(Number(e.target.value)); }}
+              disabled={allHistoryMaxIndex <= 0}
+              className="w-full"
+              aria-label="All tags history timeline"
+            />
+            <p className="mt-1 text-xs text-slate-400">
+              Move the timeline left to see older history. Maximum 5 past records are shown for each tag.
+            </p>
+          </div>
         )}
       </div>
     </div>
