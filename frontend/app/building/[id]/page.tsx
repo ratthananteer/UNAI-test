@@ -63,19 +63,16 @@ export default async function BuildingPage({
 }) {
   const { id } = await params;
 
-  const [
-    buildingResponse,
-    floorResponse,
-    anchorResponse,
-    tagResponse,
-    zoneResponse,
-  ] = await Promise.all([
-    getApi("/api/v1/get_all_building"),
-    getApi("/api/floors"),
-    getApi("/api/anchor"),
-    getApi("/api/tag"),
-    getApi("/api/zone"),
-  ]);
+  // Fetch independent APIs in parallel. The backend requests are kept
+  // server-side so the browser does not wait on five separate connections.
+  const [buildingResponse, floorResponse, anchorResponse, tagResponse, zoneResponse] =
+    await Promise.all([
+      getApi("/api/v1/get_all_building"),
+      getApi("/api/floors"),
+      getApi("/api/anchor"),
+      getApi("/api/tag"),
+      getApi("/api/zone"),
+    ]);
 
   const buildings = buildingResponse;
   const floors = floorResponse;
@@ -133,7 +130,7 @@ export default async function BuildingPage({
           />
         </section>
 
-        <section className="mt-6 rounded-xl border bg-white p-5 shadow-sm">
+        <section className="mt-6 overflow-hidden rounded-xl border bg-white p-5 shadow-sm">
           <div className="mb-4">
             <h2 className="text-xl font-semibold">Live Map</h2>
             <p className="text-sm text-gray-500">
