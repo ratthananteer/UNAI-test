@@ -216,6 +216,7 @@ export default function LiveMap({
   floor,
   anchors,
   tags: initialTags,
+  tagIdFilter = "",
   zones,
 }: {
   placeId: number | string;
@@ -223,6 +224,7 @@ export default function LiveMap({
   floor: Floor;
   anchors: Anchor[];
   tags: Tag[];
+  tagIdFilter?: string;
   zones: Zone[];
 }) {
   const [tags, setTags] = useState<Tag[]>(initialTags);
@@ -315,10 +317,19 @@ export default function LiveMap({
 
   const visibleTags = useMemo(() => {
     if (!activeTagCheckReady) return [];
-    return tags.filter((tag) =>
+
+    const filter = tagIdFilter.trim();
+    const activeTags = tags.filter((tag) =>
       activeTagIds.has(String(tag.id ?? tag.tagId ?? tag.tag_id))
     );
-  }, [tags, activeTagIds, activeTagCheckReady]);
+
+    if (!filter) return activeTags;
+
+    return activeTags.filter((tag) => {
+      const id = tag.id ?? tag.tagId ?? tag.tag_id;
+      return id !== undefined && String(id) === filter;
+    });
+  }, [tags, activeTagIds, activeTagCheckReady, tagIdFilter]);
 
   function getStringField(tag: Tag, ...keys: string[]): string {
     for (const key of keys) {
