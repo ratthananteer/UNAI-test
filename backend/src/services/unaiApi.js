@@ -13,8 +13,8 @@ async function fetchFromApi(url, errorMessage, retryAfterUnauthorized = true) {
     },
   });
 
-  if (response.status === 401 && retryAfterUnauthorized) {
-    console.warn(`[UNAI AUTH] ${errorMessage} returned 401. Generating a new access token...`);
+  if ((response.status === 401 || response.status === 403) && retryAfterUnauthorized) {
+    console.warn(`[UNAI AUTH] ${errorMessage} returned ${response.status}. Generating a new access token...`);
     await refreshAccessToken();
     return fetchFromApi(url, errorMessage, false);
   }
@@ -43,8 +43,8 @@ async function generateSocketTopic(floorID) {
     body,
   });
 
-  if (response.status === 401) {
-    console.warn("[UNAI AUTH] /gen_encrypt_topic returned 401. Generating a new access token...");
+  if (response.status === 401 || response.status === 403) {
+    console.warn(`[UNAI AUTH] /gen_encrypt_topic returned ${response.status}. Generating a new access token...`);
     await refreshAccessToken();
 
     response = await fetch(url, {

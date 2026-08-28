@@ -2,6 +2,11 @@ const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "..", "..", ".env") });
 
 let refreshPromise = null;
+let accessTokenExpiresAt = 0;
+
+// Keep a small safety window so we never intentionally use a token that is
+// about to expire. The UNAI token is currently requested for 60 minutes.
+const TOKEN_REFRESH_SKEW_MS = 2 * 60 * 1000;
 
 async function generateAccessToken() {
   const username = process.env.UNAI_USERNAME;
@@ -47,12 +52,25 @@ async function generateAccessToken() {
   }
 
   process.env.ACCESS_TOKEN = accessToken;
+
+  // The token request above asks UNAI for 60 minutes. Keep the expiry in
+  // memory so a long-running Render process refreshes it before expiry.
+  accessTokenExpiresAt = Date.now() + 60 * 60 * 1000;
+
   console.log("[UNAI AUTH] Access token refreshed successfully.");
   return accessToken;
 }
 
 async function getAccessToken() {
-  if (process.env.ACCESS_TOKEN) return process.env.ACCESS_TOKEN;
+  const token = process.env.ACCESS_TOKEN;
+  const stillValid = token && Date.now() < accessTokenExpiresAt - TOKEN_REFRESH_SKEW_MS;
+
+  if (stillValid) return token;
+
+  // Clear an expired in-memory token before generating a replacement.
+  if (token) {
+    process.env.ACCESS_TOKEN = "";
+  }
 
   if (!refreshPromise) {
     refreshPromise = generateAccessToken().finally(() => {
@@ -64,6 +82,11 @@ async function getAccessToken() {
 }
 
 async function refreshAccessToken() {
+  // Always replace the current token when an API explicitly reports that it
+  // is unauthorized. Do not return the expired token from getAccessToken().
+  process.env.ACCESS_TOKEN = "";
+  accessTokenExpiresAt = 0;
+
   if (!refreshPromise) {
     refreshPromise = generateAccessToken().finally(() => {
       refreshPromise = null;
