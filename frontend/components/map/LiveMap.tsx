@@ -1,3 +1,10 @@
+// LIVE RTLS MAP:
+// Displays the current floor image, zones, anchors, and active tags.
+// It periodically asks the backend which tags are still active and connects
+// to UNAI RTLS Socket.IO for real-time position updates. Socket events are
+// normalized, shown on the map, grouped in the UI, and saved to MongoDB so the
+// Building Tag History feature can replay them later.
+
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
@@ -74,6 +81,21 @@ type SocketLike = {
   emit: (event: string, ...args: any[]) => void;
   disconnect: () => void;
 };
+
+// Keep one browser Socket.IO connection per floor. This is important in
+// Next.js development because React Strict Mode mounts/effect-cleans/mounts a
+// client component again. Creating a new UNAI connection on every effect run
+// can trip UNAI's connection-attempt rate limiter even when the user only
+// opened the page once.
+let sharedSocket: SocketLike | null = null;
+let sharedSocketKey = "";
+let sharedSocketDisconnectTimer: number | null = null;
+let sharedSocketRateLimitedUntil = 0;
+let sharedSocketTokenPromise: Promise<string> | null = null;
+let sharedSocketTokenKey = "";
+
+const SOCKET_RATE_LIMIT_COOLDOWN_MS = 60_000;
+const SOCKET_CLEANUP_GRACE_MS = 1_500;
 
 function numberValue(value: unknown) {
   const n = Number(value);
@@ -397,7 +419,7 @@ export default function LiveMap({
 
     if (!events.length) return;
 
-    // console.log("[MongoDB] Sending socket tag events:", events);
+    console.log("[MongoDB] Sending socket tag events:", events);
 
     try {
       const response = await fetch("/api/tag-events", {
@@ -411,7 +433,7 @@ export default function LiveMap({
         throw new Error(result?.error || `HTTP ${response.status}`);
       }
 
-      // console.log(`[MongoDB] Saved ${events.length} tag event(s)`);
+      console.log(`[MongoDB] Saved ${events.length} tag event(s)`);
     } catch (error) {
       console.error("[MongoDB] Failed to save tag event:", error);
     }
@@ -446,27 +468,80 @@ export default function LiveMap({
       const floorID = floor.id;
       if (floorID === undefined || floorID === null) return;
 
+      const socketKey = `${String(placeId)}:${String(buildingId)}:${String(floorID)}`;
+
       try {
+        if (sharedSocketDisconnectTimer !== null) {
+          window.clearTimeout(sharedSocketDisconnectTimer);
+          sharedSocketDisconnectTimer = null;
+        }
+
+        // Reuse an already connected/connecting socket for this exact floor.
+        // This prevents duplicate handshakes when React remounts the component.
+        if (sharedSocket && sharedSocketKey === socketKey) {
+          socket = sharedSocket;
+          setSocketState(sharedSocket.connected ? "connected" : "connecting");
+          setSocketInfo(
+            sharedSocket.connected
+              ? `Connected as ${sharedSocket.id ?? "socket"}. Reusing UNAI connection.`
+              : "Reusing the existing UNAI RTLS connection..."
+          );
+          return;
+        }
+
+        if (sharedSocket && sharedSocketKey !== socketKey) {
+          sharedSocket.disconnect();
+          sharedSocket = null;
+          sharedSocketKey = "";
+        }
+
+        // Never hammer the UNAI socket endpoint while it is rate-limiting us.
+        // The server-side rate limit cannot be cleared by JavaScript; waiting
+        // here prevents a page/floor change from extending the lockout.
+        if (Date.now() < sharedSocketRateLimitedUntil) {
+          const remaining = Math.ceil((sharedSocketRateLimitedUntil - Date.now()) / 1000);
+          setSocketState("error");
+          setSocketInfo(`UNAI temporarily rate-limited socket connections. Please wait about ${remaining}s before retrying.`);
+          return;
+        }
+
         setSocketState("loading");
         setSocketInfo(`Getting socket token for floor ${String(floorID)}...`);
 
-        const response = await fetch("/api/socket-topic", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ floorID }),
-        });
-        const credentials = await response.json();
-        if (!response.ok) throw new Error(credentials?.error || `HTTP ${response.status}`);
-        if (!credentials.socket_token) {
-          throw new Error("Socket API did not return socket_token");
+        // Generate the floor socket token only once while a request is in
+        // flight. Multiple component mounts must not request multiple tokens.
+        if (!sharedSocketTokenPromise || sharedSocketTokenKey !== socketKey) {
+          sharedSocketTokenKey = socketKey;
+          sharedSocketTokenPromise = fetch("/api/socket-topic", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ floorID }),
+          }).then(async (response) => {
+            const credentials = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(credentials?.error || `HTTP ${response.status}`);
+            }
+            if (!credentials.socket_token) {
+              throw new Error("Socket API did not return socket_token");
+            }
+            return String(credentials.socket_token);
+          });
         }
 
+        const socketToken = await sharedSocketTokenPromise;
         if (cancelled) return;
+
         setSocketInfo("Socket token received. Connecting to UNAI RTLS...");
         setSocketState("connecting");
 
         const connectWithIo = (ioFactory: any) => {
           if (cancelled) return;
+
+          if (sharedSocket && sharedSocketKey === socketKey) {
+            socket = sharedSocket;
+            setSocketState(sharedSocket.connected ? "connected" : "connecting");
+            return;
+          }
 
           // UNAI RTLS Socket.IO protocol:
           // Host: https://socket.lailab.online
@@ -474,17 +549,21 @@ export default function LiveMap({
           // Auth: ?token=<socket_token>
           socket = ioFactory("https://socket.lailab.online", {
             path: "/ble/location",
-            query: { token: credentials.socket_token },
+            query: { token: socketToken },
             transports: ["websocket"],
-            // Do not automatically retry a rejected connection. The UNAI
-            // server rate-limits repeated attempts with "Too many connection
-            // attempts". A page reload/fresh token can start a new attempt.
+            // IMPORTANT: never let Socket.IO retry a rejected UNAI handshake.
+            // Reconnect loops are what trigger "Too many connection attempts".
             reconnection: false,
-            forceNew: true,
+            // Do not force a brand-new Manager. Reuse the Socket.IO Manager
+            // where possible and also guard the socket at module level above.
+            forceNew: false,
           }) as SocketLike;
 
+          sharedSocket = socket;
+          sharedSocketKey = socketKey;
+
           const handlePosition = (payload: unknown, eventName: string) => {
-            // console.log(`[UNAI RTLS] ${eventName}:`, payload);
+            console.log(`[UNAI RTLS] ${eventName}:`, payload);
             setMessageCount((count) => count + 1);
 
             const updates = findTagUpdates(payload, eventName, floorID);
@@ -503,14 +582,14 @@ export default function LiveMap({
               return next;
             });
 
-            // console.log("[UNAI RTLS] TAG GROUPS:", buildTagGroups(updates));
+            console.log("[UNAI RTLS] TAG GROUPS:", buildTagGroups(updates));
             addTimelineEvents(updates, eventName);
             void saveTagEvents(updates, eventName);
             setLastUpdate(new Date().toLocaleTimeString());
           };
 
           const onAnchor = (payload: unknown) => {
-            // console.log("[UNAI RTLS] anchor:", payload);
+            console.log("[UNAI RTLS] anchor:", payload);
             setMessageCount((count) => count + 1);
           };
 
@@ -540,11 +619,11 @@ export default function LiveMap({
               },
             });
 
-            // console.log("[UNAI RTLS] registered and joined:", {
-            //   tag: `${baseTopic}/tag`,
-            //   anchor: `${baseTopic}/anchor`,
-            //   alert: `${baseTopic}/alert`,
-            // });
+            console.log("[UNAI RTLS] registered and joined:", {
+              tag: `${baseTopic}/tag`,
+              anchor: `${baseTopic}/anchor`,
+              alert: `${baseTopic}/alert`,
+            });
           };
 
           const onDisconnect = (reason: string) => {
@@ -560,13 +639,24 @@ export default function LiveMap({
             const message = error?.message ?? String(error);
             console.error("[UNAI RTLS] connect_error", message);
             setSocketState("error");
-            setSocketInfo(
-              message.includes("Too many connection attempts")
-                ? "UNAI is rate-limiting connection attempts. Automatic reconnect is disabled; refresh after the rate limit clears."
-                : `Socket connection error: ${message}`
-            );
 
-            // Explicitly stop the manager after a rejected handshake so there
+            const rateLimited = /too many connection attempts|rate.?limit/i.test(message);
+            if (rateLimited) {
+              // Do not immediately reconnect or request another socket token.
+              // UNAI's limiter is server-side, so repeated attempts only make
+              // the lockout last longer.
+              sharedSocketRateLimitedUntil = Date.now() + SOCKET_RATE_LIMIT_COOLDOWN_MS;
+              setSocketInfo("UNAI is rate-limiting socket connections. No automatic reconnect will be attempted for 60 seconds.");
+            } else {
+              setSocketInfo(`Socket connection error: ${message}`);
+            }
+
+            if (sharedSocket === socket) {
+              sharedSocket = null;
+              sharedSocketKey = "";
+            }
+
+            // Explicitly stop the Manager after a rejected handshake so there
             // is no hidden reconnect loop.
             socket?.disconnect();
           };
@@ -621,10 +711,29 @@ export default function LiveMap({
     return () => {
       cancelled = true;
       window.clearTimeout(connectTimer);
-      socket?.off("connect");
-      socket?.off("disconnect");
-      socket?.off("connect_error");
-      socket?.disconnect();
+
+      // Do not immediately disconnect here. React Strict Mode intentionally
+      // runs effect cleanup followed by a second setup in development. A short
+      // grace period lets the second setup reuse the same socket instead of
+      // creating another UNAI handshake and triggering rate limiting.
+      if (sharedSocket === socket) {
+        sharedSocketDisconnectTimer = window.setTimeout(() => {
+          if (sharedSocket === socket) {
+            socket?.off("connect");
+            socket?.off("disconnect");
+            socket?.off("connect_error");
+            socket?.disconnect();
+            sharedSocket = null;
+            sharedSocketKey = "";
+          }
+          sharedSocketDisconnectTimer = null;
+        }, SOCKET_CLEANUP_GRACE_MS);
+      } else {
+        socket?.off("connect");
+        socket?.off("disconnect");
+        socket?.off("connect_error");
+      }
+
       if (script?.parentNode) script.parentNode.removeChild(script);
     };
   }, [placeId, buildingId, floor.id]);
