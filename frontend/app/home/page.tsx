@@ -1,13 +1,48 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type ApiRecord = Record<string, unknown>;
 type ApiResponse = ApiRecord[] | ApiRecord;
 
 type Anchor = ApiRecord & { status?: number };
-type Tag = ApiRecord & { status?: number };
+type Tag = ApiRecord & { status?: number; lastSeen?: string };
+
+type TagSocketFloor = string;
+
+type HomeSocket = {
+  id?: string;
+  on: (event: string, handler: (...args: any[]) => void) => void;
+  off: (event: string, handler?: (...args: any[]) => void) => void;
+  emit: (event: string, ...args: any[]) => void;
+  disconnect: () => void;
+};
+
+// Recursively find tag objects inside the different payload shapes sent by UNAI RTLS.
+function findSocketTags(value: unknown, result: { id: string; lastSeen: string }[] = []) {
+  if (!value || typeof value !== "object") return result;
+  if (Array.isArray(value)) {
+    value.forEach((item) => findSocketTags(item, result));
+    return result;
+  }
+
+  const object = value as Record<string, unknown>;
+  const rawId = object.tagId ?? object.tag_id ?? object.tagID ?? object.id;
+  const hasPosition = object.x !== undefined || object.y !== undefined;
+
+  if (rawId !== undefined && (typeof rawId === "string" || typeof rawId === "number") && hasPosition) {
+    // Online status is based on when THIS browser receives the socket event,
+    // not on a possibly old timestamp inside the RTLS payload.
+    result.push({ id: String(rawId), lastSeen: new Date().toISOString() });
+  }
+
+  Object.values(object).forEach((child) => {
+    if (child && typeof child === "object") findSocketTags(child, result);
+  });
+
+  return result;
+}
 
 async function getApi(path: string): Promise<ApiResponse> {
   // Use Next.js proxy so the browser never connects directly to localhost:4000.
@@ -67,6 +102,14 @@ export default function Home() {
   const [buildingData, setBuildingData] = useState<ApiResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Keep the Home Socket.IO connections outside React state so status updates
+  // do not recreate the socket connection.
+  const homeSockets = useRef<HomeSocket[]>([]);
+  // One Socket.IO connection is shared by all floors to avoid opening
+  // multiple connections to the RTLS server and triggering its rate limit.
+  const homeSocket = useRef<HomeSocket | null>(null);
+  const socketStarted = useRef(false);
+  const [socketFloorIds, setSocketFloorIds] = useState<TagSocketFloor[]>([]);
   const [panelVisibility, setPanelVisibility] = useState({
     stats: true,
     tags: true,
@@ -100,17 +143,58 @@ export default function Home() {
       setError(null);
 
       try {
-        const [anchors, tags, places, buildings] = await Promise.all([
+        // Authentication is handled by the backend lazily. Do not call
+        // /api/auth/token from the browser: every real UNAI API request already
+        // obtains/reuses the backend token, and the token must never be exposed
+        // to the frontend.
+        const [anchors, tags, places, buildings, floors] = await Promise.all([
           getApi("/api/anchor"),
+          // /api/tag supplies the tag list/details only. Socket.IO below is
+          // responsible for the live ONLINE/OFFLINE status.
           getApi("/api/tag"),
           getApi("/api/v1/get_all_place"),
           getApi("/api/v1/get_all_building"),
+          // Use the floor endpoint to discover Socket.IO rooms. The tag API
+          // does not reliably include a floor ID, which previously left
+          // socketFloorIds empty and prevented the Home socket from starting.
+          getApi("/api/floors"),
         ]);
 
         if (cancelled) return;
 
         setAnchorData(anchors);
-        setTagData(tags);
+        // The API's old status value is deliberately ignored. Tags start as
+        // OFFLINE/unknown until a live Socket.IO event is received.
+        const initialTagItems: Tag[] = getItems(tags).map((tag) => ({
+          ...tag,
+          status: 0,
+        }));
+        setTagData(initialTagItems);
+        // Build the Socket.IO floor list from the dedicated floor API rather
+        // than from tags. The tag response can omit floorId, while /api/floors
+        // is specifically responsible for returning floor records.
+        const floorItems = getItems(floors);
+        const floorIds = Array.from(
+          new Set(
+            floorItems
+              .map(
+                (floor) =>
+                  floor.id ??
+                  floor.floorId ??
+                  floor.floor_id ??
+                  floor.floorID,
+              )
+              .filter(
+                (id) =>
+                  (typeof id === "string" || typeof id === "number") &&
+                  String(id) !== "",
+              )
+              .map(String),
+          ),
+        );
+
+        console.log("[UNAI HOME][SOCKET] Floor IDs found from /api/floors:", floorIds);
+        setSocketFloorIds(floorIds);
         setPlaceData(places);
         setBuildingData(buildings);
       } catch (err) {
@@ -140,6 +224,165 @@ export default function Home() {
   const offlineAnchors = anchors.filter((anchor) => anchor.status === 0).length;
   const aliveTags = tags.filter((tag) => tag.status === 1).length;
   const offlineTags = tags.length - aliveTags;
+
+  // LIVE TAG STATUS FOR HOME:
+  // - Keep /api/tag only for the initial tag list.
+  // - Get a socket token from our backend for each floor represented by the tags.
+  // - Join the same UNAI RTLS tag room used by the Building live map.
+  // - Every received tag position marks that tag ONLINE and updates lastSeen.
+  // - If no socket update arrives for 10 seconds, mark the tag OFFLINE.
+  useEffect(() => {
+    if (!socketFloorIds.length || socketStarted.current) return;
+
+    const floorIds = socketFloorIds;
+    socketStarted.current = true;
+    let cancelled = false;
+    let script: HTMLScriptElement | null = null;
+
+    const handleTagPayload = (payload: unknown) => {
+      const updates = findSocketTags(payload);
+      if (!updates.length) {
+        console.log(
+          "[UNAI HOME][SOCKET] Event received, but no tag position was found.",
+        );
+        return;
+      }
+
+      console.log("[UNAI HOME][SOCKET] TAG UPDATE:", updates);
+
+      setTagData((current) => {
+        if (!current) return current;
+        const updateMap = new Map(updates.map((update) => [update.id, update.lastSeen]));
+
+        return getItems(current).map((tag) => {
+          const id = tag.id ?? tag.tagId ?? tag.tag_id;
+          const lastSeen = id !== undefined ? updateMap.get(String(id)) : undefined;
+          return lastSeen ? { ...tag, status: 1, lastSeen } : tag;
+        });
+      });
+    };
+
+    const startSockets = async (ioFactory: any) => {
+      if (cancelled || !floorIds.length || homeSocket.current) return;
+
+      // Request one socket token for the first floor and use one shared
+      // Socket.IO connection for every floor. Multiple RTLS connections were
+      // causing "Too many connection attempts" from the socket server.
+      const tokenFloorId = floorIds[0];
+
+      try {
+        console.log(`[UNAI HOME][SOCKET] Requesting shared token using floor: ${tokenFloorId}`);
+
+        const response = await fetch("/api/socket-topic", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ floorID: tokenFloorId }),
+        });
+        const credentials = await response.json();
+
+        console.log(
+          `[UNAI HOME][SOCKET] Token response: HTTP ${response.status}`,
+        );
+
+        if (!response.ok || !credentials?.socket_token) {
+          console.error("[UNAI HOME] Shared socket token failed:", credentials?.error);
+          return;
+        }
+
+        console.log("[UNAI HOME][SOCKET] Shared token received");
+
+        if (cancelled) return;
+
+        console.log("[UNAI HOME][SOCKET] Creating ONE shared connection...");
+
+        const socket = ioFactory("https://socket.lailab.online", {
+          path: "/ble/location",
+          query: { token: credentials.socket_token },
+          transports: ["websocket"],
+          reconnection: false,
+          forceNew: true,
+        }) as HomeSocket;
+
+        homeSocket.current = socket;
+        homeSockets.current = [socket];
+
+        const handleTag = (payload: unknown) => {
+          console.log("[UNAI HOME][SOCKET] EVENT", payload);
+          handleTagPayload(payload);
+        };
+
+        socket.on("tag", handleTag);
+        socket.on("clientBox", handleTag);
+        socket.on("sensor", handleTag);
+        socket.on("message", handleTag);
+
+        socket.on("connect", () => {
+          console.log("[UNAI HOME][SOCKET] CONNECTED", {
+            socketId: socket.id,
+            floors: floorIds,
+          });
+
+          // Register once, then join the tag room for every floor through the
+          // same socket connection.
+          socket.emit("/register", { customId: "home" });
+
+          for (const floorId of floorIds) {
+            const baseTopic = `unai/*/*/${floorId}`;
+            console.log(`[UNAI HOME][SOCKET] Joining topic: ${baseTopic}/tag`);
+            socket.emit("/join", `${baseTopic}/tag`);
+          }
+        });
+
+        socket.on("connect_error", (socketError: unknown) => {
+          console.error("[UNAI HOME][SOCKET] CONNECT ERROR:", socketError);
+        });
+
+        socket.on("disconnect", (reason: unknown) => {
+          console.warn("[UNAI HOME][SOCKET] DISCONNECTED:", reason);
+          homeSocket.current = null;
+        });
+      } catch (socketError) {
+        console.error("[UNAI HOME] Shared socket setup failed:", socketError);
+      }
+    };
+
+    const existingIo = (window as any).io;
+    if (typeof existingIo === "function") {
+      void startSockets(existingIo);
+    } else {
+      script = document.createElement("script");
+      script.src = "https://cdn.socket.io/4.8.1/socket.io.min.js";
+      script.async = true;
+      script.onload = () => {
+        const ioFactory = (window as any).io;
+        if (typeof ioFactory === "function") void startSockets(ioFactory);
+      };
+      script.onerror = () => console.error("[UNAI HOME] Could not load Socket.IO client.");
+      document.head.appendChild(script);
+    }
+
+    const statusTimer = window.setInterval(() => {
+      const cutoff = Date.now() - 10000;
+      setTagData((current) => {
+        if (!current) return current;
+        return getItems(current).map((tag) => {
+          const lastSeen = tag.lastSeen;
+          const time = typeof lastSeen === "string" ? new Date(lastSeen).getTime() : 0;
+          return { ...tag, status: time > cutoff ? 1 : 0 };
+        });
+      });
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(statusTimer);
+      homeSockets.current.forEach((socket) => socket.disconnect());
+      homeSockets.current = [];
+      homeSocket.current = null;
+      if (script?.parentNode) script.parentNode.removeChild(script);
+      socketStarted.current = false;
+    };
+  }, [socketFloorIds]);
 
   return (
     <main className="min-h-screen bg-slate-50 text-slate-900">
@@ -193,7 +436,7 @@ export default function Home() {
           {panelVisibility.tags && (
             <DataListCard
               title="Tags"
-              subtitle="/api/tag"
+              subtitle="/api/tag + Socket.IO"
               icon="T"
               iconClass="bg-sky-50 text-sky-600"
               items={tags.map((tag, index) => ({
@@ -243,7 +486,8 @@ export default function Home() {
                 <ApiBadge text="GET /api/v1/get_all_place" />
                 <ApiBadge text="GET /api/v1/get_all_building" />
                 <ApiBadge text="GET /api/anchor" />
-                <ApiBadge text="GET /api/tag" />
+                <ApiBadge text="GET /api/tag · initial tags" />
+                <ApiBadge text="Socket.IO · live tag status" />
               </div>
             </div>
           </section>

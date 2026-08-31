@@ -1,3 +1,10 @@
+// UNAI AUTH SERVICE:
+// Generates access tokens from the configured UNAI username/password.
+// Tokens are kept in memory through process.env.ACCESS_TOKEN and refreshed
+// before expiry or immediately after an authenticated API request returns 401/403.
+// `refreshPromise` prevents several simultaneous requests from generating
+// several tokens at the same time.
+
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "..", "..", ".env") });
 
@@ -16,49 +23,83 @@ async function generateAccessToken() {
     throw new Error("UNAI_USERNAME and UNAI_PASSWORD must be configured in .env");
   }
 
-  const response = await fetch("https://rtls.lailab.online/auth/gen_token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      username,
-      password,
-      token_expire_time_in_minute: "60",
-      refresh_token_expire_time_in_minute: "60",
-      socket_token_type: "rs256",
-    }),
+  const requestBody = new URLSearchParams({
+    username,
+    password,
+    token_expire_time_in_minute: "60",
+    refresh_token_expire_time_in_minute: "60",
+    socket_token_type: "rs256",
   });
 
-  const body = await response.text().catch(() => "");
-  let data;
-  try {
-    data = JSON.parse(body);
-  } catch {
-    data = null;
-  }
+  // UNAI deployments have used both the root auth route and the /api auth
+  // route. A 404 means the route is not mounted on that deployment, so try
+  // the known route variants before failing the request.
+  const authUrls = [
+    "https://rtls.lailab.online/auth/gen_token",
+    "https://rtls.lailab.online/auth/gen_token/",
+    "https://rtls.lailab.online/api/auth/gen_token",
+    "https://rtls.lailab.online/api/auth/gen_token/",
+  ];
 
-  const accessToken =
-    data?.access_token ??
-    data?.accessToken ??
-    data?.token ??
-    data?.data?.access_token ??
-    data?.data?.accessToken ??
-    data?.data?.token;
+  let lastStatus = 500;
+  let lastBody = "";
 
-  if (!response.ok || !accessToken) {
+  for (const url of authUrls) {
+    let response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: requestBody,
+      });
+    } catch (requestError) {
+      console.warn(`[UNAI AUTH] Request failed for ${url}:`, requestError);
+      continue;
+    }
+
+    const body = await response.text().catch(() => "");
+    let data;
+    try {
+      data = JSON.parse(body);
+    } catch {
+      data = null;
+    }
+
+    const accessToken =
+      data?.access_token ??
+      data?.accessToken ??
+      data?.token ??
+      data?.data?.access_token ??
+      data?.data?.accessToken ??
+      data?.data?.token;
+
+    if (response.ok && accessToken) {
+      process.env.ACCESS_TOKEN = accessToken;
+      accessTokenExpiresAt = Date.now() + 60 * 60 * 1000;
+      console.log(`[UNAI AUTH] Access token refreshed successfully via ${url}`);
+      return accessToken;
+    }
+
+    lastStatus = response.status;
+    lastBody = body;
+
+    // A 404 is specifically a route mismatch. Continue to the next known
+    // route instead of immediately breaking the Home page.
+    if (response.status === 404) {
+      console.warn(`[UNAI AUTH] ${url} returned 404; trying the next auth route.`);
+      continue;
+    }
+
     const error = new Error(`Failed to generate UNAI access token: HTTP ${response.status}`);
     error.status = response.status;
     error.body = body;
     throw error;
   }
 
-  process.env.ACCESS_TOKEN = accessToken;
-
-  // The token request above asks UNAI for 60 minutes. Keep the expiry in
-  // memory so a long-running Render process refreshes it before expiry.
-  accessTokenExpiresAt = Date.now() + 60 * 60 * 1000;
-
-  console.log("[UNAI AUTH] Access token refreshed successfully.");
-  return accessToken;
+  const error = new Error(`Failed to generate UNAI access token: HTTP ${lastStatus}`);
+  error.status = lastStatus;
+  error.body = lastBody;
+  throw error;
 }
 
 async function getAccessToken() {
@@ -96,4 +137,4 @@ async function refreshAccessToken() {
   return refreshPromise;
 }
 
-module.exports = { getAccessToken, refreshAccessToken };
+module.exports = { getAccessToken, refreshAccessToken, generateAccessToken };

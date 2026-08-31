@@ -1,3 +1,11 @@
+// BACKEND STARTUP FLOW:
+// 1. Load environment variables from backend/.env.
+// 2. Connect to MongoDB.
+// 3. Synchronize static RTLS data into the MongoDB cache.
+// 4. Start the tag activity monitor.
+// 5. Start Express and expose all /api routes.
+// This file is the main server bootstrap for the Node.js backend.
+
 const path = require("path");
 require("dotenv").config({
   path: path.join(__dirname, "..", ".env"),
@@ -5,7 +13,8 @@ require("dotenv").config({
 
 const { connectMongo } = require("./services/mongo.js");
 const { startTagMonitor } = require("./services/tagMonitor.js");
-const { syncStaticData } = require("./services/staticDataCache.js");
+// Static data is synchronized on demand from the Home page/API.
+// Do not authenticate with UNAI during backend startup.
 const express = require("express");
 const cors = require("cors");
 const apiRoutes = require("./routes/api");
@@ -20,17 +29,6 @@ app.use("/api", apiRoutes);
 async function startServer() {
   try {
     await connectMongo();
-
-    // Populate/update static building configuration on startup. The web
-    // endpoints remain cache-first, so normal page loads use MongoDB.
-    try {
-      console.log("[StaticData] Startup sync checking Place/Building/Floor/Zone...");
-      const result = await syncStaticData();
-      console.log("[StaticData] Startup sync complete:", result);
-    } catch (error) {
-      // Do not prevent Render from starting if UNAI is temporarily unavailable.
-      console.error("[StaticData] Startup sync failed; server will use existing MongoDB cache:", error.message);
-    }
 
     startTagMonitor();
 

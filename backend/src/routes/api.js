@@ -1,8 +1,16 @@
+// MAIN API ROUTES:
+// Defines the backend HTTP endpoints used by the frontend.
+// Static data routes use MongoDB cache-first loading; live RTLS endpoints
+// proxy through the UNAI authentication/API service; tag history and active-tag
+// endpoints use MongoDB data. All routes are mounted under /api in src/server.js.
+
 const express = require("express");
 const { fetchFromApi, generateSocketTopic } = require("../services/unaiApi");
+const { generateAccessToken } = require("../services/unaiAuth");
 const tagEventsRouter = require("./tagEvents");
 const { getActiveTags, refreshActiveTags } = require("../services/tagMonitor");
 const { getCachedOrFetch, refreshStaticData } = require("../services/staticDataCache");
+const TagEvent = require("../models/TagEvent");
 
 const router = express.Router();
 
@@ -10,6 +18,23 @@ const router = express.Router();
 // platform can verify that the HTTP server is reachable.
 router.get("/health", (req, res) => {
   res.json({ ok: true, service: "unai-backend" });
+});
+
+// Home-page authentication: token generation is lazy and is NOT performed
+// during Node.js startup. The generated token stays in backend memory and is
+// reused by authenticated UNAI API/socket requests. The token is never sent
+// back to the browser.
+router.post("/auth/token", async (req, res) => {
+  try {
+    await generateAccessToken();
+    return res.json({ ok: true, message: "UNAI access token generated" });
+  } catch (error) {
+    console.error("/api/auth/token error:", error);
+    return res.status(error.status || 500).json({
+      error: error.message || "Failed to generate UNAI access token",
+      details: error.body || undefined,
+    });
+  }
 });
 
 function proxyGet(path, envName, errorMessage) {
@@ -84,6 +109,51 @@ router.post("/sync-static-data", async (req, res) => {
 cachedProxyGet("/floors", "floor", "APIFLOOR_URL", "Failed to get floors");
 proxyGet("/anchor", "APIANCHOR_URL", "Failed to get anchors");
 proxyGet("/tag", "APITAG_URL", "Failed to get tags");
+
+// Home-page tag data comes directly from MongoDB.
+// For each tag, keep only its newest saved TagEvent and calculate its current
+// online/offline state from the same timeout used by the tag monitor.
+router.get("/db-tags", async (req, res) => {
+  try {
+    const timeoutSeconds = Number(process.env.TAG_ALIVE_TIMEOUT_SECONDS) || 10;
+    const timeoutDate = new Date(Date.now() - timeoutSeconds * 1000);
+
+    const latest = await TagEvent.aggregate([
+      { $sort: { timestamp: -1 } },
+      {
+        $group: {
+          _id: "$tagId",
+          latest: { $first: "$$ROOT" },
+        },
+      },
+      { $sort: { "latest.timestamp": -1 } },
+    ]);
+
+    const tags = latest.map(({ latest: event }) => ({
+      id: event.tagId,
+      tagId: event.tagId,
+      name: event.tagName || `Tag ${event.tagId}`,
+      tagName: event.tagName,
+      buildingId: event.buildingId,
+      floorId: event.floorId,
+      groupId: event.groupId,
+      groupName: event.groupName,
+      x: event.x,
+      y: event.y,
+      z: event.z,
+      lastSeen: event.timestamp,
+      status: event.timestamp >= timeoutDate ? 1 : 0,
+    }));
+
+    return res.json(tags);
+  } catch (error) {
+    console.error("/api/db-tags error:", error);
+    return res.status(500).json({
+      error: "Failed to load tags from MongoDB",
+      details: error.message,
+    });
+  }
+});
 cachedProxyGet("/zone", "zone", "APIZONE_URL", "Failed to get zones");
 cachedProxyGet("/v1/get_all_place", "place", "APIPLACE_URL", "Failed to get places");
 cachedProxyGet("/v1/get_all_building", "building", "APIBUILDING_URL", "Failed to get buildings");
