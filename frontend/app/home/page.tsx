@@ -7,7 +7,19 @@ type ApiRecord = Record<string, unknown>;
 type ApiResponse = ApiRecord[] | ApiRecord;
 
 type Anchor = ApiRecord & { status?: number };
-type Tag = ApiRecord & { status?: number; lastSeen?: string };
+type Tag = ApiRecord & {
+  status?: number;
+  lastSeen?: string;
+  tagId?: string | number;
+  tagName?: string | null;
+  buildingId?: string | number | null;
+  floorId?: string | number | null;
+  groupId?: string | number | null;
+  groupName?: string | null;
+  x?: number | null;
+  y?: number | null;
+  z?: number | null;
+};
 
 
 async function getApi(path: string): Promise<ApiResponse> {
@@ -110,7 +122,9 @@ export default function Home() {
         // Live positioning is intentionally handled only by the Building page.
         const [anchors, tags, places, buildings] = await Promise.all([
           getApi("/api/anchor"),
-          getApi("/api/tag"),
+          // Current tag location/status comes from MongoDB. This endpoint uses
+          // the newest TagEvent for every tag, so Home never needs Socket.IO.
+          getApi("/api/db-tags"),
           getApi("/api/v1/get_all_place"),
           getApi("/api/v1/get_all_building"),
         ]);
@@ -151,6 +165,30 @@ export default function Home() {
   const aliveTags = tags.filter((tag) => tag.status === 1).length;
   const offlineTags = tags.length - aliveTags;
 
+  const buildingNameById = new Map(
+    buildings.map((building, index) => [
+      String(building.id ?? building.building_id ?? building.buildingId ?? index),
+      getName(building, `Building ${index + 1}`),
+    ]),
+  );
+
+  const tagGroups = Array.from(
+    tags.reduce((groups, tag, index) => {
+      const groupKey = String(tag.groupId ?? tag.groupName ?? "ungrouped");
+      const groupName = tag.groupName || (groupKey === "ungrouped" ? "Ungrouped" : `Group ${groupKey}`);
+      const existing = groups.get(groupKey) ?? { id: groupKey, name: groupName, tags: [] as Tag[] };
+      existing.tags.push(tag);
+      groups.set(groupKey, existing);
+      return groups;
+    }, new Map<string, { id: string; name: string; tags: Tag[] }>()),
+  ).map(([, group]) => group);
+
+  const locationText = (tag: Tag) => {
+    const building = tag.buildingId == null ? "Unknown building" : (buildingNameById.get(String(tag.buildingId)) ?? `Building ${tag.buildingId}`);
+    const floor = tag.floorId == null ? "Unknown floor" : `Floor ${tag.floorId}`;
+    const coordinates = tag.x != null && tag.y != null ? ` · X ${tag.x}, Y ${tag.y}` : "";
+    return `${building} · ${floor}${coordinates}`;
+  };
 
   return (
     <main className="min-h-screen bg-slate-50 text-slate-900">
@@ -208,9 +246,10 @@ export default function Home() {
               icon="T"
               iconClass="bg-sky-50 text-sky-600"
               items={tags.map((tag, index) => ({
-                id: tag.id,
+                id: tag.tagId ?? tag.id,
                 name: getName(tag, `Tag ${index + 1}`),
                 status: tag.status === 1 ? "ONLINE" : "OFFLINE",
+                detail: locationText(tag),
               }))}
             />
           )}
@@ -242,6 +281,61 @@ export default function Home() {
             />
           )}
         </section>
+
+        {panelVisibility.tags && (
+          <section className="mt-6 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+            <div className="mb-5 flex flex-col gap-1">
+              <h2 className="text-xl font-semibold text-slate-900">Tag Groups & Locations</h2>
+              <p className="text-sm text-slate-400">Current location from the latest MongoDB TagEvent — no Home socket connection.</p>
+            </div>
+
+            {tagGroups.length === 0 ? (
+              <EmptyState text="No tag groups available in MongoDB." />
+            ) : (
+              <div className="grid gap-4 lg:grid-cols-2">
+                {tagGroups.map((group) => (
+                  <div key={group.id} className="overflow-hidden rounded-2xl border border-slate-200">
+                    <div className="flex items-center justify-between border-b bg-slate-50 px-4 py-3">
+                      <div>
+                        <h3 className="font-semibold text-slate-800">{group.name}</h3>
+                        <p className="text-xs text-slate-400">{group.tags.length} tag{group.tags.length === 1 ? "" : "s"}</p>
+                      </div>
+                      <span className="rounded-full bg-cyan-50 px-2.5 py-1 text-xs font-semibold text-cyan-700">LOCATION</span>
+                    </div>
+                    <div className="max-h-80 space-y-2 overflow-y-auto p-3">
+                      {group.tags.map((tag, index) => {
+                        const id = String(tag.tagId ?? tag.id ?? index);
+                        const online = tag.status === 1;
+                        return (
+                          <div key={id} className="rounded-xl border border-slate-100 bg-white p-3 shadow-sm">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="truncate text-sm font-semibold text-slate-800">
+                                  {tag.tagName || getName(tag, `Tag ${id}`)}
+                                </p>
+                                <p className="text-xs text-slate-400">ID: {id}</p>
+                              </div>
+                              <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-bold ${online ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>
+                                {online ? "ONLINE" : "OFFLINE"}
+                              </span>
+                            </div>
+                            <div className="mt-3 flex items-center gap-2 text-xs text-slate-500">
+                              <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-cyan-50 text-cyan-600">⌖</span>
+                              <span className="min-w-0 truncate">{locationText(tag)}</span>
+                            </div>
+                            {tag.lastSeen && (
+                              <p className="mt-2 text-[11px] text-slate-400">Last seen: {new Date(tag.lastSeen).toLocaleString()}</p>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
 
         {panelVisibility.api && (
           <section className="mt-6 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
@@ -298,7 +392,7 @@ function DataListCard({
   subtitle: string;
   icon: string;
   iconClass: string;
-  items: { id?: unknown; name: string; status?: string }[];
+  items: { id?: unknown; name: string; status?: string; detail?: string }[];
   linkPrefix?: string;
 }) {
   const listId = `${title.toLowerCase()}-datalist`;
@@ -341,6 +435,7 @@ function DataListCard({
                     <div className="min-w-0">
                       <p className="truncate text-sm font-semibold text-slate-700">{item.name}</p>
                       <p className="text-xs text-slate-400">ID: {String(item.id ?? "—")}</p>
+                      {item.detail && <p className="mt-1 truncate text-xs text-slate-500">{item.detail}</p>}
                     </div>
                   </div>
                   {item.status && (

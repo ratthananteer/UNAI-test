@@ -460,6 +460,91 @@ export default function LiveMap({
   }
 
   useEffect(() => {
+    // UNAI Socket.IO is now owned by the Node.js backend. The browser only
+    // polls the backend's MongoDB-backed active-tag endpoint. This prevents
+    // every Building tab/floor from creating a separate UNAI connection.
+    const backendRealtimeTimer = window.setInterval(async () => {
+      try {
+        const response = await fetch(
+          `/api/active-tags?buildingId=${encodeURIComponent(String(buildingId))}&floorId=${encodeURIComponent(String(floor.id))}`,
+          { cache: "no-store" },
+        );
+        if (!response.ok) return;
+
+        const data = await response.json();
+        const active = Array.isArray(data?.tags) ? data.tags : [];
+        const ids = new Set<string>();
+
+        setTags((current) => {
+          const next = [...current];
+          for (const activeTag of active) {
+            if (activeTag?.tagId == null) continue;
+            const id = String(activeTag.tagId);
+            ids.add(id);
+            const index = next.findIndex((tag) =>
+              sameId(tag.id ?? tag.tagId ?? tag.tag_id, activeTag.tagId),
+            );
+            const normalized: Tag = {
+              ...activeTag,
+              id: activeTag.tagId,
+              tagId: activeTag.tagId,
+              floor_id: activeTag.floorId ?? floor.id,
+              x: numberValue(activeTag.x),
+              y: numberValue(activeTag.y),
+            };
+            if (index >= 0) next[index] = { ...next[index], ...normalized };
+            else next.push(normalized);
+          }
+          return next;
+        });
+
+        setActiveTagIds(ids);
+        setActiveTagCheckReady(true);
+        setSocketState("connected");
+        setSocketInfo("Realtime data is supplied by the backend Socket Manager.");
+        if (active.length > 0) setLastUpdate(new Date().toLocaleTimeString());
+      } catch (error) {
+        console.error("[UNAI RTLS] Backend realtime check failed:", error);
+      }
+    }, 2000);
+
+    // Run immediately instead of waiting for the first interval tick.
+    void (async () => {
+      try {
+        const response = await fetch(
+          `/api/active-tags?buildingId=${encodeURIComponent(String(buildingId))}&floorId=${encodeURIComponent(String(floor.id))}`,
+          { cache: "no-store" },
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        const active = Array.isArray(data?.tags) ? data.tags : [];
+        const ids = new Set<string>(active.map((tag: Tag) => String(tag.tagId ?? tag.id ?? "")));
+        setTags((current) => {
+          const next = [...current];
+          for (const activeTag of active) {
+            const index = next.findIndex((tag) => sameId(tag.id ?? tag.tagId ?? tag.tag_id, activeTag.tagId));
+            const normalized: Tag = { ...activeTag, id: activeTag.tagId, tagId: activeTag.tagId, floor_id: activeTag.floorId ?? floor.id, x: numberValue(activeTag.x), y: numberValue(activeTag.y) };
+            if (index >= 0) next[index] = { ...next[index], ...normalized };
+            else next.push(normalized);
+          }
+          return next;
+        });
+        setActiveTagIds(ids);
+        setActiveTagCheckReady(true);
+        setSocketState("connected");
+        setSocketInfo("Realtime data is supplied by the backend Socket Manager.");
+      } catch (error) {
+        console.error("[UNAI RTLS] Initial backend realtime check failed:", error);
+        setSocketState("error");
+        setSocketInfo("Backend realtime data is unavailable.");
+      }
+    })();
+
+    return () => window.clearInterval(backendRealtimeTimer);
+
+    /* Legacy direct-browser socket implementation kept below for reference.
+       It is intentionally unreachable: UNAI connections are now managed by
+       the backend Socket Manager above. */
     let socket: SocketLike | null = null;
     let cancelled = false;
     let script: HTMLScriptElement | null = null;
