@@ -139,36 +139,7 @@ export default async function BuildingPage({
           zones={zones}
         />
 
-        <section className="mt-6 rounded-xl border bg-white p-5 shadow-sm">
-          <h2 className="text-xl font-semibold">Floor Data</h2>
-          {buildingFloors.length === 0 ? (
-            <p className="mt-4 text-sm text-gray-500">
-              No floor data available.
-            </p>
-          ) : (
-            <div className="mt-4 flex gap-2 overflow-x-auto pb-2">
-              {buildingFloors.map((floor, index) => {
-                const floorId =
-                  getId(floor.id ?? floor.floor_id ?? floor.floorId) ?? index;
-                const floorName =
-                  getString(floor.name ?? floor.floor_name ?? floor.title) ||
-                  `Floor ${index + 1}`;
-
-                return (
-                  <div
-                    key={String(floorId)}
-                    className="min-w-32 rounded-lg border px-4 py-3"
-                  >
-                    <div className="font-medium">{floorName}</div>
-                    <div className="text-xs text-gray-500">
-                      ID: {String(floorId)}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </section>
+  
 
         <section className="mt-6 rounded-xl border bg-white p-5 shadow-sm">
           <h2 className="text-xl font-semibold">API Status</h2>

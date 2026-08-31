@@ -8,6 +8,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { subscribeUnaiRealtime } from "../../lib/unaiRealtime";
 
 type Floor = {
   id?: number | string;
@@ -252,7 +253,7 @@ export default function LiveMap({
   const [tags, setTags] = useState<Tag[]>(initialTags);
   const [showAnchors, setShowAnchors] = useState(true);
   const [socketState, setSocketState] = useState<SocketState>("loading");
-  const [socketInfo, setSocketInfo] = useState("Starting real-time connection...");
+  const [socketInfo, setSocketInfo] = useState("Loading realtime tag data from backend...");
   const [lastUpdate, setLastUpdate] = useState<string | null>(null);
   const [messageCount, setMessageCount] = useState(0);
   const [socketTagGroups, setSocketTagGroups] = useState<TagGroup[]>([]);
@@ -261,9 +262,17 @@ export default function LiveMap({
   const [activeTagCheckReady, setActiveTagCheckReady] = useState(false);
 
   useEffect(() => {
+    // Keep the server-provided positions visible immediately. A background
+    // poll must replace these positions, not temporarily hide them.
     setTags(initialTags);
-    setActiveTagIds(new Set());
-    setActiveTagCheckReady(false);
+    setActiveTagIds(
+      new Set(
+        initialTags
+          .map((tag) => String(tag.id ?? tag.tagId ?? tag.tag_id ?? ""))
+          .filter(Boolean),
+      ),
+    );
+    setActiveTagCheckReady(true);
   }, [initialTags, floor.id]);
 
   // MongoDB is the source of truth for whether a tag is currently active.
@@ -286,7 +295,51 @@ export default function LiveMap({
         const data = await response.json();
         if (cancelled) return;
 
-        const active = Array.isArray(data?.tags) ? data.tags : [];
+        let active = Array.isArray(data?.tags) ? data.tags : [];
+
+        // The live endpoint is backed by the monitor cache. If that cache is
+        // empty (for example immediately after a backend restart), fall back
+        // to the same MongoDB TagEvent source used by Tag History. This makes
+        // the map render the latest known position instead of waiting forever
+        // for a new socket event.
+        if (active.length === 0) {
+          try {
+            const historyResponse = await fetch(
+              `/api/tag-events?buildingId=${encodeURIComponent(String(buildingId))}&limit=500`,
+              { cache: "no-store" },
+            );
+            if (historyResponse.ok) {
+              const historyData = await historyResponse.json();
+              const history = Array.isArray(historyData) ? historyData : Array.isArray(historyData?.events) ? historyData.events : [];
+              const latestByTag = new Map<string, any>();
+              for (const event of history) {
+                if (event?.tagId == null || event?.x == null || event?.y == null) continue;
+                const key = String(event.tagId);
+                const previous = latestByTag.get(key);
+                if (!previous || new Date(event.timestamp).getTime() > new Date(previous.timestamp).getTime()) {
+                  latestByTag.set(key, event);
+                }
+              }
+              active = [...latestByTag.values()]
+                .filter((event: any) => event.floorId == null || sameId(event.floorId, floor.id))
+                .map((event: any) => ({
+                  ...event,
+                  id: event.tagId,
+                  tagId: event.tagId,
+                  floorId: event.floorId ?? floor.id,
+                  floor_id: event.floorId ?? floor.id,
+                  buildingId: event.buildingId ?? buildingId,
+                  x: numberValue(event.x),
+                  y: numberValue(event.y),
+                  lastSeen: event.timestamp,
+                  status: "STALE",
+                }));
+            }
+          } catch (historyError) {
+            console.error("[Building LiveMap] MongoDB history fallback failed:", historyError);
+          }
+        }
+
         const ids = new Set<string>();
 
         setTags((current) => {
@@ -321,7 +374,13 @@ export default function LiveMap({
           return next;
         });
 
-        setActiveTagIds(ids);
+        // An empty response can happen while the backend is refreshing its
+        // cache. Never clear the currently rendered tags because of that
+        // transient empty result. Replace them only when fresh tag data is
+        // actually returned.
+        if (active.length > 0) {
+          setActiveTagIds(ids);
+        }
         setActiveTagCheckReady(true);
       } catch (error) {
         console.error("[TagMonitor] Active tag check failed:", error);
@@ -460,9 +519,66 @@ export default function LiveMap({
   }
 
   useEffect(() => {
-    // UNAI Socket.IO is now owned by the Node.js backend. The browser only
-    // polls the backend's MongoDB-backed active-tag endpoint. This prevents
-    // every Building tab/floor from creating a separate UNAI connection.
+    // Realtime connection is owned by the app-level UNAI realtime manager.
+    // Pages subscribe to the same connection instead of creating their own
+    // Socket.IO handshake. This is the main protection against UNAI rate limits.
+    const unsubscribeRealtime = subscribeUnaiRealtime({
+      placeId,
+      buildingId,
+      floorId: floor.id ?? "",
+      onStatus: ({ state, message, socketId }) => {
+        if (state === "connected") {
+          setSocketState("connected");
+          setSocketInfo(socketId ? `${message} Socket: ${socketId}` : message);
+        } else if (state === "connecting") {
+          setSocketState("connecting");
+          setSocketInfo(message);
+        } else if (state === "rate_limited") {
+          setSocketState("error");
+          setSocketInfo(message);
+        } else if (state === "error") {
+          setSocketState("error");
+          setSocketInfo(message);
+        } else {
+          setSocketState("disconnected");
+          setSocketInfo(message);
+        }
+      },
+      onTag: ({ payload, eventName }) => {
+        console.log(`[UNAI RTLS] ${eventName}:`, payload);
+        setMessageCount((count) => count + 1);
+        const updates = findTagUpdates(payload, eventName, floor.id);
+        if (!updates.length) return;
+
+        setTags((current) => {
+          const next = [...current];
+          for (const update of updates) {
+            const tagId = update.id ?? update.tagId ?? update.tag_id;
+            const index = next.findIndex((tag) =>
+              sameId(tag.id ?? tag.tagId ?? tag.tag_id, tagId),
+            );
+            if (index >= 0) next[index] = { ...next[index], ...update };
+            else next.push(update);
+          }
+          return next;
+        });
+
+        setActiveTagIds((current) => {
+          const next = new Set(current);
+          updates.forEach((tag) => {
+            const id = tag.id ?? tag.tagId ?? tag.tag_id;
+            if (id !== undefined && id !== null) next.add(String(id));
+          });
+          return next;
+        });
+        addTimelineEvents(updates, eventName);
+        void saveTagEvents(updates, eventName);
+        setLastUpdate(new Date().toLocaleTimeString());
+      },
+    });
+
+    // Keep the existing backend/MongoDB fallback polling below for resilience,
+    // but it is no longer responsible for opening or reconnecting a UNAI socket.
     const backendRealtimeTimer = window.setInterval(async () => {
       try {
         const response = await fetch(
@@ -498,10 +614,16 @@ export default function LiveMap({
           return next;
         });
 
-        setActiveTagIds(ids);
+        // Keep the last known tags on screen while this poll has no fresh
+        // data. The next non-empty response will update their positions.
+        if (active.length > 0) {
+          setActiveTagIds(ids);
+        }
         setActiveTagCheckReady(true);
         setSocketState("connected");
-        setSocketInfo("Realtime data is supplied by the backend Socket Manager.");
+        setSocketInfo(active.length > 0
+          ? "Tag positions updated from the backend."
+          : "Showing last known tag positions while waiting for the next update.");
         if (active.length > 0) setLastUpdate(new Date().toLocaleTimeString());
       } catch (error) {
         console.error("[UNAI RTLS] Backend realtime check failed:", error);
@@ -517,8 +639,31 @@ export default function LiveMap({
         );
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
-        const active = Array.isArray(data?.tags) ? data.tags : [];
-        const ids = new Set<string>(active.map((tag: Tag) => String(tag.tagId ?? tag.id ?? "")));
+        let active = Array.isArray(data?.tags) ? data.tags : [];
+
+        // Initial render fallback: use the latest MongoDB TagEvent when the
+        // active-tag monitor has not populated yet.
+        if (active.length === 0) {
+          const historyResponse = await fetch(
+            `/api/tag-events?buildingId=${encodeURIComponent(String(buildingId))}&limit=500`,
+            { cache: "no-store" },
+          );
+          if (historyResponse.ok) {
+            const historyData = await historyResponse.json();
+            const history = Array.isArray(historyData) ? historyData : Array.isArray(historyData?.events) ? historyData.events : [];
+            const latestByTag = new Map<string, any>();
+            for (const event of history) {
+              if (event?.tagId == null || event?.x == null || event?.y == null) continue;
+              const key = String(event.tagId);
+              const previous = latestByTag.get(key);
+              if (!previous || new Date(event.timestamp).getTime() > new Date(previous.timestamp).getTime()) latestByTag.set(key, event);
+            }
+            active = [...latestByTag.values()]
+              .filter((event: any) => event.floorId == null || sameId(event.floorId, floor.id))
+              .map((event: any) => ({ ...event, id: event.tagId, tagId: event.tagId, floorId: event.floorId ?? floor.id, floor_id: event.floorId ?? floor.id, buildingId: event.buildingId ?? buildingId, x: numberValue(event.x), y: numberValue(event.y), status: "STALE", lastSeen: event.timestamp }));
+          }
+        }
+        const ids = new Set<string>(active.map((tag: Tag) => String(tag.tagId ?? tag.id ?? "")).filter(Boolean));
         setTags((current) => {
           const next = [...current];
           for (const activeTag of active) {
@@ -529,10 +674,16 @@ export default function LiveMap({
           }
           return next;
         });
-        setActiveTagIds(ids);
+        // Do not clear visible tags when the initial backend request is
+        // temporarily empty. Keep the positions supplied by the page/API.
+        if (active.length > 0) {
+          setActiveTagIds(ids);
+        }
         setActiveTagCheckReady(true);
         setSocketState("connected");
-        setSocketInfo("Realtime data is supplied by the backend Socket Manager.");
+        setSocketInfo(active.length > 0
+          ? "Tag positions updated from the backend."
+          : "Showing last known tag positions while waiting for the next update.");
       } catch (error) {
         console.error("[UNAI RTLS] Initial backend realtime check failed:", error);
         setSocketState("error");
@@ -540,11 +691,16 @@ export default function LiveMap({
       }
     })();
 
-    return () => window.clearInterval(backendRealtimeTimer);
+    // IMPORTANT: do not execute the legacy direct-browser connection below.
+    // The shared manager above is now the only place allowed to open UNAI.
+    // Keep the old implementation in this file temporarily so rollback is easy,
+    // but return before it can execute.
+    return () => {
+      window.clearInterval(backendRealtimeTimer);
+      unsubscribeRealtime();
+    };
 
-    /* Legacy direct-browser socket implementation kept below for reference.
-       It is intentionally unreachable: UNAI connections are now managed by
-       the backend Socket Manager above. */
+    /* Legacy direct-browser UNAI Socket.IO connection (disabled). */
     let socket: SocketLike | null = null;
     let cancelled = false;
     let script: HTMLScriptElement | null = null;
@@ -795,6 +951,7 @@ export default function LiveMap({
 
     return () => {
       cancelled = true;
+      window.clearInterval(backendRealtimeTimer);
       window.clearTimeout(connectTimer);
 
       // Do not immediately disconnect here. React Strict Mode intentionally
@@ -875,6 +1032,7 @@ export default function LiveMap({
 
           <div className="absolute inset-0 z-20 pointer-events-none">
             <button
+            suppressHydrationWarning
             type="button"
             onClick={() => setShowAnchors((current) => !current)}
             aria-pressed={showAnchors}
@@ -944,7 +1102,7 @@ export default function LiveMap({
         <div className="mb-2 flex items-center justify-between">
           <div>
             <h2 className="text-sm font-bold text-slate-800">Tag Groups</h2>
-            <p className="text-xs text-slate-400">Grouped from real-time Socket.IO tag data</p>
+            <p className="text-xs text-slate-400">Grouped from realtime tag data supplied by the backend</p>
           </div>
           <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-500">
             {socketTagGroups.length} group{socketTagGroups.length === 1 ? "" : "s"}
@@ -953,7 +1111,7 @@ export default function LiveMap({
 
         {socketTagGroups.length === 0 ? (
           <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 p-5 text-center text-sm text-slate-400">
-            Waiting for tag data from Socket.IO...
+            Waiting for tag data from backend...
           </div>
         ) : (
           <div className="max-h-44 space-y-1.5 overflow-y-auto pr-1">

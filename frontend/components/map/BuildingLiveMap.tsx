@@ -72,6 +72,7 @@ export default function BuildingLiveMap({
     onFloorChange?.(value);
   };
   const [tagIdFilter, setTagIdFilter] = useState("");
+  const [followedTagId, setFollowedTagId] = useState("");
 
   const selectedFloor = useMemo(() => {
     return usableFloors.find((floor) => String(floorId(floor)) === String(selectedFloorId));
@@ -137,19 +138,38 @@ export default function BuildingLiveMap({
             type="text"
             inputMode="numeric"
             value={tagIdFilter}
-            onChange={(event) => setTagIdFilter(event.target.value)}
-            placeholder="All tags"
-            className="w-36 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-            aria-label="Filter map by tag ID"
+            onChange={(event) => setTagIdFilter(event.target.value.replace(/\D/g, ""))}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                const id = tagIdFilter.trim();
+                if (id) setFollowedTagId(id);
+              }
+            }}
+            placeholder="Tag ID"
+            className="w-28 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+            aria-label="Enter tag ID to follow"
           />
-          {tagIdFilter.trim() && (
+          <button
+            type="button"
+            disabled={!tagIdFilter.trim()}
+            onClick={() => setFollowedTagId(tagIdFilter.trim())}
+            className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            Follow
+          </button>
+          {(tagIdFilter.trim() || followedTagId) && (
             <button
               type="button"
-              onClick={() => setTagIdFilter("")}
+              onClick={() => { setTagIdFilter(""); setFollowedTagId(""); }}
               className="rounded-lg border border-slate-300 px-2.5 py-2 text-xs font-medium text-slate-600 hover:bg-slate-50"
             >
-              Clear
+              Show All
             </button>
+          )}
+          {followedTagId && (
+            <span className="rounded-full bg-blue-100 px-2.5 py-1 text-xs font-semibold text-blue-700">
+              Following Tag {followedTagId}
+            </span>
           )}
 
           <select
@@ -176,7 +196,7 @@ export default function BuildingLiveMap({
         floor={liveFloor}
         anchors={liveAnchors}
         tags={liveTags as Parameters<typeof LiveMap>[0]["tags"]}
-        tagIdFilter={tagIdFilter}
+        tagIdFilter={followedTagId}
         zones={liveZones}
       />
     </section>
@@ -198,6 +218,15 @@ export function BuildingMapModes({
   tags: Item[];
   zones: Item[];
 }) {
+  // Delay the interactive map subtree until the first client effect. This
+  // prevents browser extensions from changing form/button attributes between
+  // the server HTML and React hydration (for example `fdprocessedid`).
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
   const validFloors = useMemo(() => floors.filter((item) => floorId(item) !== undefined), [floors]);
   const [mode, setMode] = useState<"live" | "history">("live");
   const [selectedFloorId, setSelectedFloorId] = useState<string | number | undefined>(floorId(validFloors[0]));
@@ -209,6 +238,17 @@ export function BuildingMapModes({
       if (first !== undefined) setSelectedFloorId(first);
     }
   }, [validFloors, selectedFloorId]);
+
+  if (!mounted) {
+    return (
+      <section className="mt-6 overflow-hidden rounded-xl border bg-white shadow-sm">
+        <div className="flex min-h-20 items-center justify-center border-b p-4">
+          <span className="text-sm text-slate-500">Loading building map...</span>
+        </div>
+        <div className="min-h-24" />
+      </section>
+    );
+  }
 
   return (
     <section className="mt-6 overflow-hidden rounded-xl border bg-white shadow-sm">
@@ -247,6 +287,7 @@ function BuildingTagHistory({
   type HistoryEvent = { _id?: string; tagId?: string | number; tagName?: string | null; floorId?: string | number | null; x?: number | null; y?: number | null; timestamp: string; event?: string };
   const [events, setEvents] = useState<HistoryEvent[]>([]);
   const [tagId, setTagId] = useState("");
+  const [followedTagId, setFollowedTagId] = useState("");
   const [index, setIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [allHistoryIndex, setAllHistoryIndex] = useState(0);
@@ -372,7 +413,18 @@ function BuildingTagHistory({
   return (
     <div>
       <div className="flex flex-wrap items-center gap-3 border-b p-4">
-        <select value={tagId} onChange={(e) => { setTagId(e.target.value); setIndex(0); setPlaying(false); }} className="rounded-lg border px-3 py-2 text-sm" aria-label="Select one tag">
+        <input
+          value={followedTagId}
+          onChange={(e) => setFollowedTagId(e.target.value.replace(/\D/g, ""))}
+          onKeyDown={(e) => { if (e.key === "Enter") setTagId(followedTagId.trim()); }}
+          placeholder="Tag ID"
+          inputMode="numeric"
+          className="w-28 rounded-lg border px-3 py-2 text-sm"
+          aria-label="Enter tag ID to follow"
+        />
+        <button type="button" disabled={!followedTagId.trim()} onClick={() => setTagId(followedTagId.trim())} className="rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-40">Follow</button>
+        {tagId && <button type="button" onClick={() => { setTagId(""); setFollowedTagId(""); }} className="rounded-lg border px-3 py-2 text-sm">Show All</button>}
+        <select value={tagId} onChange={(e) => { setTagId(e.target.value); setFollowedTagId(e.target.value); setIndex(0); setPlaying(false); }} className="rounded-lg border px-3 py-2 text-sm" aria-label="Select one tag">
           <option value="">All Tags — show all history</option>
           {Array.from(new Map(events.filter((e) => e.tagId !== undefined).map((e) => [String(e.tagId), e.tagName ? `${e.tagName} (${e.tagId})` : String(e.tagId)])).entries()).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
         </select>
@@ -476,7 +528,11 @@ function BuildingTagHistory({
 
           {tagId && x !== null && y !== null && current?.floorId !== undefined && String(current.floorId) === String(selectedFloorId) && (
             <div
-             
+              className="pointer-events-none absolute z-40 h-8 w-8 -translate-x-1/2 -translate-y-1/2 rounded-full border-4 border-white bg-sky-600 shadow-lg ring-2 ring-sky-300"
+              style={{
+                left: `${Math.max(0, Math.min(100, ((ox + x * scale) / width) * 100))}%`,
+                top: `${Math.max(0, Math.min(100, ((oy - y * scale) / height) * 100))}%`,
+              }}
               title={`Current ${current.tagId} · ${x}, ${y}`}
             />
           )}
