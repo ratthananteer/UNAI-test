@@ -10,6 +10,7 @@ type Anchor = ApiRecord & { status?: number };
 type Tag = ApiRecord & {
   status?: number;
   lastSeen?: string;
+  statusText?: "ONLINE" | "OFFLINE";
   tagId?: string | number;
   tagName?: string | null;
   buildingId?: string | number | null;
@@ -71,6 +72,21 @@ function getItems(data: ApiResponse): ApiRecord[] {
 
 function getName(item: ApiRecord, fallback: string) {
   return String(item.name ?? item.title ?? item.code ?? fallback);
+}
+
+function formatLastSeen(value?: string): string {
+  if (!value) return "Never";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Unknown";
+
+  const seconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return date.toLocaleString();
 }
 
 export default function Home() {
@@ -152,6 +168,30 @@ export default function Home() {
 
     return () => {
       cancelled = true;
+    };
+  }, []);
+
+  // Refresh only the tag status/lastSeen data. Static place/building/anchor data
+  // stays on the initial load, while MongoDB TagMonitor updates tag freshness.
+  useEffect(() => {
+    let cancelled = false;
+
+    const refreshTagStatus = async () => {
+      try {
+        const data = await getApi("/api/db-tags");
+        if (!cancelled) setTagData(getItems(data) as Tag[]);
+      } catch (err) {
+        if (!cancelled) console.error("[UNAI HOME] Tag status refresh failed:", err);
+      }
+    };
+
+    const timer = window.setInterval(() => {
+      void refreshTagStatus();
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
     };
   }, []);
 
@@ -249,7 +289,7 @@ export default function Home() {
                 id: tag.tagId ?? tag.id,
                 name: getName(tag, `Tag ${index + 1}`),
                 status: tag.status === 1 ? "ONLINE" : "OFFLINE",
-                detail: locationText(tag),
+                detail: `${locationText(tag)} · Last seen: ${formatLastSeen(tag.lastSeen)}`,
               }))}
             />
           )}
@@ -323,9 +363,10 @@ export default function Home() {
                               <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-cyan-50 text-cyan-600">⌖</span>
                               <span className="min-w-0 truncate">{locationText(tag)}</span>
                             </div>
-                            {tag.lastSeen && (
-                              <p className="mt-2 text-[11px] text-slate-400">Last seen: {new Date(tag.lastSeen).toLocaleString()}</p>
-                            )}
+                            <p className="mt-2 text-[11px] text-slate-400">
+                              Last seen: {formatLastSeen(tag.lastSeen)}
+                              {tag.lastSeen ? ` · ${new Date(tag.lastSeen).toLocaleString()}` : ""}
+                            </p>
                           </div>
                         );
                       })}

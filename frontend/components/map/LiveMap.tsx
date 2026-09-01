@@ -27,7 +27,7 @@ type Anchor = {
   status?: number;
 };
 
-type Tag = Record<string, unknown> & {
+export type LiveMapTag = Record<string, unknown> & {
   id?: number | string;
   floor_id?: number | string;
   building?: number | string;
@@ -46,6 +46,7 @@ type Tag = Record<string, unknown> & {
   lastname?: string;
 };
 
+type Tag = LiveMapTag;
 type TagGroup = { groupName: string; members: Tag[] };
 
 type TimelineEvent = {
@@ -186,6 +187,17 @@ function parsePolygon(value: unknown): [number, number][] {
   }
 }
 
+export type LiveMapProps = {
+  placeId: number | string;
+  buildingId: number | string;
+  floor: Floor;
+  anchors: Anchor[];
+  tags: Tag[];
+  tagIdFilter?: string;
+  onTagSelect?: (tag: Tag) => void;
+  zones: Zone[];
+};
+
 export default function LiveMap({
   placeId,
   buildingId,
@@ -193,16 +205,9 @@ export default function LiveMap({
   anchors,
   tags: initialTags,
   tagIdFilter = "",
+  onTagSelect,
   zones,
-}: {
-  placeId: number | string;
-  buildingId: number | string;
-  floor: Floor;
-  anchors: Anchor[];
-  tags: Tag[];
-  tagIdFilter?: string;
-  zones: Zone[];
-}) {
+}: LiveMapProps) {
   const [tags, setTags] = useState<Tag[]>(() => initialTags.filter((tag) => !isAssetTag(tag)));
   const [showAnchors, setShowAnchors] = useState(true);
   const [socketState, setSocketState] = useState<SocketState>("loading");
@@ -472,7 +477,7 @@ export default function LiveMap({
           const updates = findTagUpdates(payload, eventName, floor.id, assetTagIdsRef.current);
           if (!updates.length) return;
 
-          
+          console.log(`[UNAI RTLS] ${eventName}:`, updates);
           setMessageCount((count) => count + 1);
 
           setTags((current) => {
@@ -691,15 +696,17 @@ export default function LiveMap({
             const { px, py } = toPixel(realX, realY, floor);
             const tagName = String(tag.label ?? tag.name ?? tag.ui_display ?? `Tag ${tag.id ?? ""}`);
             return (
-              <div
+              <button
                 key={`tag-${String(tag.id ?? tag.tagId)}`}
+                type="button"
+                onClick={() => onTagSelect?.(tag)}
                 title={`${tagName} · X: ${realX} · Y: ${realY}`}
                 className="absolute z-10 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center transition-[left,top] duration-150"
                 style={{ left: `${(px / width) * 100}%`, top: `${(py / height) * 100}%` }}
               >
                 <div className="flex h-8 min-w-8 items-center justify-center rounded-full border-2 border-white bg-sky-600 px-2 text-[9px] font-bold text-white shadow-lg">T</div>
                 <span className="mt-1 max-w-28 truncate rounded bg-white/95 px-1.5 py-0.5 text-[9px] font-semibold text-slate-700 shadow">{tagName}</span>
-              </div>
+              </button>
             );
           })}
         </div>

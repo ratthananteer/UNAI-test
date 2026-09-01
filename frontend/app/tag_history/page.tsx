@@ -377,6 +377,28 @@ export default function TagHistoryPage() {
 
   const currentMapUrl = mapImageUrl(currentFloor?.map_path ?? null);
 
+  const pathTrail = useMemo(() => {
+    if (!currentFloor || !selectedTagEvents.length) return [];
+
+    const width = currentFloor.map_width;
+    const height = currentFloor.map_height;
+    const originX = currentFloor.origin_x;
+    const originY = currentFloor.origin_y;
+    const pixelMeter = currentFloor.pixel_meter;
+
+    return selectedTagEvents.slice(0, historyIndex + 1).map((event) => {
+      const x = Number(event.x);
+      const y = Number(event.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+
+      if (width != null && height != null && originX != null && originY != null && pixelMeter != null && pixelMeter > 0) {
+        return { x: originX + x * pixelMeter, y: originY - y * pixelMeter };
+      }
+
+      return { x, y };
+    }).filter((point): point is { x: number; y: number } => point !== null);
+  }, [currentFloor, selectedTagEvents, historyIndex]);
+
   const tagPosition = useMemo(() => {
     if (!currentEvent || currentEvent.x == null || currentEvent.y == null || !currentFloor) {
       return null;
@@ -554,7 +576,33 @@ export default function TagHistoryPage() {
                         />
                       );
                     })}
+
+                    {pathTrail.length > 1 && (
+                      <polyline
+                        points={pathTrail.map((point) => `${point.x},${point.y}`).join(" ")}
+                        fill="none"
+                        stroke="#0ea5e9"
+                        strokeWidth={4}
+                        strokeOpacity={0.8}
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        vectorEffect="non-scaling-stroke"
+                      />
+                    )}
                   </svg>
+
+                  {pathTrail.map((point, pointIndex) => {
+                    if (pointIndex === pathTrail.length - 1) return null;
+                    const left = ((point.x / (currentFloor.map_width ?? 1600)) * 100);
+                    const top = ((point.y / (currentFloor.map_height ?? 900)) * 100);
+                    return (
+                      <span
+                        key={`trail-${pointIndex}`}
+                        className="pointer-events-none absolute z-[5] h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-sky-400/45"
+                        style={{ left: `${Math.max(0, Math.min(100, left))}%`, top: `${Math.max(0, Math.min(100, top))}%` }}
+                      />
+                    );
+                  })}
 
                   {tagPosition && (
                     <div
@@ -606,7 +654,7 @@ export default function TagHistoryPage() {
               >
                 {playing
                   ? "Pause"
-                  : historyIndex >= events.length - 1
+                  : historyIndex >= selectedTagEvents.length - 1
                     ? "Replay"
                     : "Play"}
               </button>
@@ -620,8 +668,9 @@ export default function TagHistoryPage() {
               >
                 Start
               </button>
-              <div className="ml-auto text-xs text-slate-500">
-                {selectedTagEvents.length ? `${historyIndex + 1} / ${selectedTagEvents.length}` : "0 / 0"}
+              <div className="ml-auto text-right text-xs text-slate-500">
+                <div>{selectedTagEvents.length ? `${historyIndex + 1} / ${selectedTagEvents.length}` : "0 / 0"}</div>
+                {pathTrail.length > 1 && <div className="text-[10px] text-sky-600">Path: {pathTrail.length} points</div>}
               </div>
             </div>
 

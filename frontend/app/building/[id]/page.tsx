@@ -1,3 +1,8 @@
+// BUILDING DETAIL PAGE:
+// Receives a building ID from the URL, loads building/floor/anchor/tag/zone
+// data from the backend, finds the requested building, and passes all of the
+// related data into BuildingMapModes for the Live Map and Tag History views.
+
 import Link from "next/link";
 import { BuildingMapModes } from "../../../components/map/BuildingLiveMap";
 
@@ -110,7 +115,7 @@ export default async function BuildingPage({
   return (
     <main className="min-h-screen bg-gray-50 p-6 text-gray-900">
       <div className="mx-auto max-w-7xl">
-        <Link href="/home" className="text-sm text-blue-600 hover:underline">
+        <Link href="/" className="text-sm text-blue-600 hover:underline">
           ← Back to Home
         </Link>
 
@@ -139,7 +144,7 @@ export default async function BuildingPage({
           zones={zones}
         />
 
-  
+        
 
         <section className="mt-6 rounded-xl border bg-white p-5 shadow-sm">
           <h2 className="text-xl font-semibold">API Status</h2>

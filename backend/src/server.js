@@ -1,11 +1,3 @@
-// BACKEND STARTUP FLOW:
-// 1. Load environment variables from backend/.env.
-// 2. Connect to MongoDB.
-// 3. Synchronize static RTLS data into the MongoDB cache.
-// 4. Start the tag activity monitor.
-// 5. Start Express and expose all /api routes.
-// This file is the main server bootstrap for the Node.js backend.
-
 const path = require("path");
 require("dotenv").config({
   path: path.join(__dirname, "..", ".env"),

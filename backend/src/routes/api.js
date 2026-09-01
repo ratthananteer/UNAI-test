@@ -291,6 +291,7 @@ router.get("/db-tags", async (req, res) => {
       z: event.z,
       lastSeen: event.timestamp,
       status: event.timestamp >= timeoutDate ? 1 : 0,
+      statusText: event.timestamp >= timeoutDate ? "ONLINE" : "OFFLINE",
     }));
 
     return res.json(tags);

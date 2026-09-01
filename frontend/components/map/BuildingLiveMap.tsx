@@ -13,7 +13,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import LiveMap from "./LiveMap";
+import LiveMap, { type LiveMapTag } from "./LiveMap";
 
 type Item = Record<string, unknown>;
 
@@ -73,6 +73,32 @@ export default function BuildingLiveMap({
   };
   const [tagIdFilter, setTagIdFilter] = useState("");
   const [followedTagId, setFollowedTagId] = useState("");
+  const [userSearch, setUserSearch] = useState("");
+  const [selectedUserTagId, setSelectedUserTagId] = useState("");
+
+  const getUserName = (tag: Item): string => {
+    const first = str(tag.firstname ?? tag.first_name ?? tag.firstName, "").trim();
+    const last = str(tag.lastname ?? tag.last_name ?? tag.lastName, "").trim();
+    return [first, last].filter(Boolean).join(" ").trim() ||
+      str(tag.ui_display ?? tag.label ?? tag.name ?? tag.tag_name ?? tag.tagName, "").trim() ||
+      `Tag ${String(tag.id ?? tag.tagId ?? "")}`;
+  };
+
+  const searchableTags = useMemo(() => {
+    const query = userSearch.trim().toLowerCase();
+    if (selectedFloorId === undefined) return [];
+    const candidates = tags.filter((tag: Item) => belongsToFloor(tag, selectedFloorId));
+    if (!query) return candidates.slice(0, 8);
+    return candidates.filter((tag: Item) => {
+      const id = String(tag.id ?? tag.tagId ?? tag.tag_id ?? "");
+      return getUserName(tag).toLowerCase().includes(query) || id.includes(query);
+    }).slice(0, 8);
+  }, [tags, selectedFloorId, userSearch]);
+
+  const selectedUser = useMemo(() => {
+    if (!selectedUserTagId) return undefined;
+    return tags.find((tag: Item) => String(tag.id ?? tag.tagId ?? tag.tag_id) === selectedUserTagId);
+  }, [tags, selectedUserTagId]);
 
   const selectedFloor = useMemo(() => {
     return usableFloors.find((floor) => String(floorId(floor)) === String(selectedFloorId));
@@ -130,6 +156,44 @@ export default function BuildingLiveMap({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <label htmlFor="building-user-search" className="text-sm font-medium text-slate-600">
+            User
+          </label>
+          <div className="relative">
+            <input
+              id="building-user-search"
+              type="text"
+              value={userSearch}
+              onChange={(event) => setUserSearch(event.target.value)}
+              placeholder="Search user..."
+              className="w-44 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+              autoComplete="off"
+            />
+            {userSearch.trim() && searchableTags.length > 0 && (
+              <div className="absolute left-0 top-full z-[60] mt-1 w-64 overflow-hidden rounded-xl border border-slate-200 bg-white p-1 shadow-xl">
+                {searchableTags.map((tag: Item) => {
+                  const id = String(tag.id ?? tag.tagId ?? tag.tag_id ?? "");
+                  return (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => {
+                        setSelectedUserTagId(id);
+                        setFollowedTagId(id);
+                        setTagIdFilter(id);
+                        setUserSearch(getUserName(tag));
+                      }}
+                      className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-slate-50"
+                    >
+                      <span className="min-w-0 truncate text-sm font-semibold text-slate-700">{getUserName(tag)}</span>
+                      <span className="ml-2 shrink-0 text-[10px] text-slate-400">#{id}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
           <label htmlFor="building-tag-filter" className="text-sm font-medium text-slate-600">
             Tag ID
           </label>
@@ -152,7 +216,13 @@ export default function BuildingLiveMap({
           <button
             type="button"
             disabled={!tagIdFilter.trim()}
-            onClick={() => setFollowedTagId(tagIdFilter.trim())}
+            onClick={() => {
+              const id = tagIdFilter.trim();
+              setFollowedTagId(id);
+              setSelectedUserTagId(id);
+              const match = tags.find((tag: Item) => String(tag.id ?? tag.tagId ?? tag.tag_id) === id);
+              if (match) setUserSearch(getUserName(match));
+            }}
             className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-40"
           >
             Follow
@@ -160,7 +230,7 @@ export default function BuildingLiveMap({
           {(tagIdFilter.trim() || followedTagId) && (
             <button
               type="button"
-              onClick={() => { setTagIdFilter(""); setFollowedTagId(""); }}
+              onClick={() => { setTagIdFilter(""); setFollowedTagId(""); setUserSearch(""); setSelectedUserTagId(""); }}
               className="rounded-lg border border-slate-300 px-2.5 py-2 text-xs font-medium text-slate-600 hover:bg-slate-50"
             >
               Show All
@@ -190,13 +260,38 @@ export default function BuildingLiveMap({
         </div>
       </div>
 
-      <LiveMap
+      {selectedUser && (
+        <div className="mx-4 mb-3 rounded-2xl border border-blue-100 bg-blue-50/70 p-4">
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-wide text-blue-500">Selected User</p>
+                <h3 className="mt-1 text-lg font-bold text-slate-800">{getUserName(selectedUser)}</h3>
+                <p className="mt-1 text-xs text-slate-500">Tag ID: {String(selectedUser.id ?? selectedUser.tagId ?? selectedUser.tag_id ?? "—")}</p>
+              </div>
+              <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs">
+                <span className="text-slate-500">Status <strong className={selectedUser.status === 1 ? "text-emerald-600" : "text-rose-600"}>{selectedUser.status === 1 ? "ONLINE" : "OFFLINE"}</strong></span>
+                <span className="text-slate-500">Group <strong className="text-slate-700">{str(selectedUser.group_name ?? selectedUser.groupName, "—")}</strong></span>
+                <span className="text-slate-500">Position <strong className="text-slate-700">X {str(selectedUser.x, "—")}, Y {str(selectedUser.y, "—")}</strong></span>
+                <span className="text-slate-500">Last seen <strong className="text-slate-700">{formatLastSeenValue(selectedUser.lastSeen ?? selectedUser.last_seen ?? selectedUser.lastSeenAt)}</strong></span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <LiveMap
         placeId={placeId}
         buildingId={buildingId}
         floor={liveFloor}
         anchors={liveAnchors}
         tags={liveTags as Parameters<typeof LiveMap>[0]["tags"]}
         tagIdFilter={followedTagId}
+        onTagSelect={(tag: LiveMapTag) => {
+          const id = String(tag.id ?? tag.tagId ?? tag.tag_id ?? "");
+          setSelectedUserTagId(id);
+          setFollowedTagId(id);
+          setTagIdFilter(id);
+          setUserSearch(getUserName(tag));
+        }}
         zones={liveZones}
       />
     </section>
@@ -310,6 +405,7 @@ function BuildingTagHistory({
   const [followedTagId, setFollowedTagId] = useState("");
   const [index, setIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [showHeatmap, setShowHeatmap] = useState(false);
   const [allHistoryIndex, setAllHistoryIndex] = useState(0);
   const ALL_HISTORY_VISIBLE = 10;
 
@@ -376,6 +472,35 @@ function BuildingTagHistory({
   }, [mapHistory]);
 
   const current = selectedHistory[index];
+
+  // Aggregate recorded positions into small floor-coordinate cells. Higher
+  // counts mean the tag(s) spent more recorded samples in that area.
+  const heatmapPoints = useMemo(() => {
+    if (!showHeatmap) return [];
+    const bins = new Map<string, { x: number; y: number; count: number }>();
+    const binSize = 20;
+
+    for (const event of history) {
+      if (event.x == null || event.y == null || event.floorId == null) continue;
+      if (selectedFloorId == null || String(event.floorId) !== String(selectedFloorId)) continue;
+      if (tagId && String(event.tagId ?? "") !== tagId) continue;
+      const x = num(event.x);
+      const y = num(event.y);
+      if (x === null || y === null) continue;
+      const bx = Math.floor(x / binSize) * binSize + binSize / 2;
+      const by = Math.floor(y / binSize) * binSize + binSize / 2;
+      const key = `${bx}:${by}`;
+      const existing = bins.get(key);
+      if (existing) existing.count += 1;
+      else bins.set(key, { x: bx, y: by, count: 1 });
+    }
+
+    const maxCount = Math.max(1, ...Array.from(bins.values()).map((point) => point.count));
+    return Array.from(bins.values()).map((point) => ({
+      ...point,
+      intensity: point.count / maxCount,
+    }));
+  }, [history, selectedFloorId, tagId, showHeatmap]);
 
   useEffect(() => {
     let cancelled = false;
@@ -448,6 +573,13 @@ function BuildingTagHistory({
           <option value="">All Tags — show all history</option>
           {Array.from(new Map(events.filter((e) => e.tagId !== undefined).map((e) => [String(e.tagId), `${tagNames.get(String(e.tagId)) || e.tagName || `Tag ${e.tagId}`} (${e.tagId})`])).entries()).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
         </select>
+        <button
+          type="button"
+          onClick={() => setShowHeatmap((value) => !value)}
+          className={`rounded-lg px-3 py-2 text-sm font-medium ${showHeatmap ? "bg-orange-500 text-white" : "border bg-white text-slate-700"}`}
+        >
+          {showHeatmap ? "Hide Heatmap" : "Heatmap"}
+        </button>
         <select value={String(selectedFloorId ?? "")} onChange={(e) => onFloorChange(e.target.value)} className="rounded-lg border px-3 py-2 text-sm" aria-label="Select floor">
           {validFloorOptions(floors).map(([id, name]) => <option key={id} value={id}>{name}</option>)}
         </select>
@@ -461,6 +593,27 @@ function BuildingTagHistory({
       <div className="overflow-auto bg-slate-100 p-4">
         <div className="relative mx-auto max-w-[1000px] overflow-hidden rounded-xl border bg-white" style={{ aspectRatio: `${width}/${height}` }}>
           {map && <img src={map} alt={String(selectedFloor.name ?? "Floor map")} className="absolute inset-0 h-full w-full object-fill" />}
+
+          {showHeatmap && heatmapPoints.map((point) => {
+            const left = ((ox + point.x * scale) / width) * 100;
+            const top = ((oy - point.y * scale) / height) * 100;
+            const size = 24 + point.intensity * 44;
+            return (
+              <span
+                key={`heat-${point.x}-${point.y}`}
+                className="pointer-events-none absolute z-[2] -translate-x-1/2 -translate-y-1/2 rounded-full bg-red-500/30 blur-md"
+                style={{
+                  left: `${Math.max(0, Math.min(100, left))}%`,
+                  top: `${Math.max(0, Math.min(100, top))}%`,
+                  width: `${size}px`,
+                  height: `${size}px`,
+                  opacity: 0.25 + point.intensity * 0.65,
+                }}
+                title={`${point.count} position records`}
+              />
+            );
+          })}
+
           <svg className="absolute inset-0 h-full w-full" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
             {zones.filter((zone) => { const zid = valueId(zone.floor_id ?? zone.floorId ?? zone.floorID); return zid === undefined || String(zid) === String(selectedFloorId); }).map((zone, zi) => {
               const points = polygon(zone.polygon_data).map((point: unknown) => { if (!Array.isArray(point) || point.length < 2) return null; const px = num(point[0]); const py = num(point[1]); if (px === null || py === null) return null; return `${ox + px * scale},${oy - py * scale}`; }).filter((v: string | null): v is string => v !== null).join(" ");
@@ -546,16 +699,8 @@ function BuildingTagHistory({
             );
           })}
 
-          {tagId && x !== null && y !== null && current?.floorId !== undefined && String(current.floorId) === String(selectedFloorId) && (
-            <div
-              className="pointer-events-none absolute z-40 h-8 w-8 -translate-x-1/2 -translate-y-1/2 rounded-full border-4 border-white bg-sky-600 shadow-lg ring-2 ring-sky-300"
-              style={{
-                left: `${Math.max(0, Math.min(100, ((ox + x * scale) / width) * 100))}%`,
-                top: `${Math.max(0, Math.min(100, ((oy - y * scale) / height) * 100))}%`,
-              }}
-              title={`Current ${userNameOf(current)} · ${x}, ${y}`}
-            />
-          )}
+          {tagId && x !== null && y !== null && current?.floorId !== undefined && String(current.floorId) === String(selectedFloorId)  
+            }
         </div>
       </div>
       <div className="border-t bg-white p-4">
@@ -598,6 +743,18 @@ function BuildingTagHistory({
 
 function validFloorOptions(floors: Item[]): [string, string][] {
   return floors.flatMap((item) => { const id = floorId(item); if (id === undefined) return []; return [[String(id), str(item.name ?? item.floor_name ?? item.title, `Floor ${String(id)}`)]] as [string, string][]; });
+}
+
+function formatLastSeenValue(value: unknown): string {
+  if (!value) return "Never";
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) return "Unknown";
+  const seconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  return date.toLocaleString();
 }
 
 function valueId(value: unknown): string | number | undefined {
