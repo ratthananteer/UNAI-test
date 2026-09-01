@@ -232,6 +232,8 @@ export default function TagHistoryPage() {
   const [tagId, setTagId] = useState("");
   const [buildingId, setBuildingId] = useState("");
   const [floorId, setFloorId] = useState("");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
   const [loading, setLoading] = useState(true);
   const [mapLoading, setMapLoading] = useState(true);
   const [error, setError] = useState("");
@@ -297,7 +299,9 @@ export default function TagHistoryPage() {
       if (tagId.trim()) params.set("tagId", tagId.trim());
       if (buildingId.trim()) params.set("buildingId", buildingId.trim());
       if (floorId.trim()) params.set("floorId", floorId.trim());
-      params.set("limit", "500");
+      if (fromDate) params.set("from", new Date(fromDate).toISOString());
+      if (toDate) params.set("to", new Date(toDate).toISOString());
+      params.set("limit", "5000");
 
       const response = await fetch(`/api/tag-events?${params.toString()}`, {
         cache: "no-store",
@@ -458,7 +462,7 @@ export default function TagHistoryPage() {
           </button>
         </div>
 
-        <div className="mb-6 grid gap-3 rounded-xl bg-white p-4 shadow-sm md:grid-cols-4">
+        <div className="mb-6 grid gap-3 rounded-xl bg-white p-4 shadow-sm md:grid-cols-2 lg:grid-cols-4">
           <select
             value={tagId}
             onChange={(e) => {
@@ -486,6 +490,24 @@ export default function TagHistoryPage() {
             placeholder="Floor ID"
             className="rounded-lg border px-3 py-2 text-sm"
           />
+          <label className="text-xs text-slate-500">
+            From
+            <input
+              type="datetime-local"
+              value={fromDate}
+              onChange={(e) => setFromDate(e.target.value)}
+              className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-slate-900"
+            />
+          </label>
+          <label className="text-xs text-slate-500">
+            To
+            <input
+              type="datetime-local"
+              value={toDate}
+              onChange={(e) => setToDate(e.target.value)}
+              className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-slate-900"
+            />
+          </label>
           <button
             onClick={() => void loadHistory()}
             className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
