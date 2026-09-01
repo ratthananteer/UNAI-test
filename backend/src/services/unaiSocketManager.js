@@ -1,5 +1,7 @@
 const { io } = require("socket.io-client");
 const { generateSocketTopic } = require("./unaiApi");
+const TagEvent = require("../models/TagEvent");
+const { getAssetTagIds, isAssetOrKnownAsset } = require("./assetFilter");
 
 let socket = null;
 let started = false;
@@ -8,6 +10,8 @@ let reconnectTimer = null;
 let reconnectAttempt = 0;
 let cooldownUntil = 0;
 let currentTopics = [];
+const lastSavedPositions = new Map();
+let saveQueue = Promise.resolve();
 
 const SOCKET_URL = process.env.UNAI_SOCKET_URL || "https://socket.lailab.online";
 const SOCKET_PATH = process.env.UNAI_SOCKET_PATH || "/ble/location";
@@ -93,6 +97,50 @@ function filterAssetPayload(value) {
   return result;
 }
 
+function numberValue(value) { const n = Number(value); return Number.isFinite(n) ? n : null; }
+
+function timestampValue(value) {
+  if (typeof value === "number") { const date = new Date(value < 100000000000 ? value * 1000 : value); if (!Number.isNaN(date.getTime())) return date; }
+  if (typeof value === "string" && value.trim()) { const date = new Date(value); if (!Number.isNaN(date.getTime())) return date; }
+  return new Date();
+}
+
+function collectLocationRecords(value, output = []) {
+  if (!value || typeof value !== "object") return output;
+  if (Array.isArray(value)) { value.forEach((item) => collectLocationRecords(item, output)); return output; }
+  const object = value;
+  const tagId = object.tagId ?? object.tag_id ?? object.tagID ?? object.tag?.id ?? object.tag?.tagId ?? object.tag?.tag_id;
+  const x = numberValue(object.x ?? object.pos_x ?? object.position_x ?? object.location_x);
+  const y = numberValue(object.y ?? object.pos_y ?? object.position_y ?? object.location_y);
+  if (tagId !== undefined && tagId !== null && x !== null && y !== null) {
+    output.push({ ...object, tagId: String(tagId), x, y, z: numberValue(object.z ?? object.pos_z ?? object.position_z ?? object.location_z), timestamp: timestampValue(object.timestamp ?? object.time ?? object.unix_time ?? object.unixTime ?? object.lastSeenAt ?? object.date_now ?? object.created_at) });
+  }
+  Object.values(object).forEach((child) => { if (child && typeof child === "object") collectLocationRecords(child, output); });
+  return output;
+}
+
+function enqueueHistorySave(records, topic) {
+  if (!records.length) return;
+  saveQueue = saveQueue.then(async () => {
+    const assetTagIds = await getAssetTagIds();
+    const documents = [];
+    const now = Date.now();
+    for (const record of records) {
+      if (isAssetOrKnownAsset(record, assetTagIds) || assetTagIds.has(String(record.tagId))) continue;
+      const key = String(record.tagId);
+      const previous = lastSavedPositions.get(key);
+      const positionChanged = !previous || previous.x !== record.x || previous.y !== record.y || previous.floorId !== String(topic.floorId);
+      const enoughTimePassed = !previous || now - previous.savedAt >= 2000;
+      if (!positionChanged && !enoughTimePassed) continue;
+      documents.push({ tagId: key, buildingId: topic.buildingId == null ? null : String(topic.buildingId), floorId: topic.floorId == null ? null : String(topic.floorId), groupId: record.groupId ?? record.group_id ?? null, groupName: record.groupName ?? record.group_name ?? null, tagName: record.tagName ?? record.tag_name ?? record.name ?? record.label ?? null, event: "position_update", status: "ALIVE", movementStatus: positionChanged ? "MOVING" : "STATIONARY", x: record.x, y: record.y, z: record.z, timestamp: record.timestamp, rawData: record });
+      lastSavedPositions.set(key, { x: record.x, y: record.y, floorId: String(topic.floorId), savedAt: now });
+    }
+    if (!documents.length) return;
+    await TagEvent.insertMany(documents, { ordered: false });
+    log(`HISTORY SAVED count=${documents.length} floor=${topic.floorId}`);
+  }).catch((error) => log("HISTORY SAVE ERROR:", error?.message || error));
+}
+
 function handleTagPayload(payload, topic) {
   // This backend socket manager is another possible logging boundary. Never
   // print or forward an object whose usage_type is ASSET.
@@ -100,10 +148,13 @@ function handleTagPayload(payload, topic) {
   if (filteredPayload === undefined) return;
   if (Array.isArray(filteredPayload) && filteredPayload.length === 0) return;
 
+  const records = collectLocationRecords(filteredPayload);
+  enqueueHistorySave(records, topic);
+
   log("TAG UPDATE", {
     floorId: topic.floorId,
     buildingId: topic.buildingId,
-    payload: filteredPayload,
+    count: records.length,
   });
 }
 
@@ -111,8 +162,8 @@ function subscribeTopic(topic) {
   const tagTopic = `unai/${topic.encryptTopic}/tag`;
   const anchorTopic = `unai/${topic.encryptTopic}/anchor`;
 
-  socket.emit("join", tagTopic);
-  socket.emit("join", anchorTopic);
+  socket.emit("/join", tagTopic);
+  socket.emit("/join", anchorTopic);
   socket.emit("init_unai_location_tag", { topic: topic.encryptTopic });
   socket.emit("init_unai_location_anchor", { topic: topic.encryptTopic });
 
@@ -142,8 +193,10 @@ function connect() {
   socket = io(SOCKET_URL, {
     path: SOCKET_PATH,
     transports: ["websocket"],
+    query: { token },
     auth: { token, socket_token: token },
     reconnection: false,
+    forceNew: false,
     timeout: 10_000,
   });
 
@@ -152,6 +205,7 @@ function connect() {
     cooldownUntil = 0;
     setState("CONNECTED");
     log(`Connected id=${socket.id}`);
+    socket.emit("/register", { customId: "backend_history_collector" });
     currentTopics.forEach(subscribeTopic);
   });
 
@@ -177,6 +231,9 @@ function connect() {
     currentTopics.forEach((topic) => handleTagPayload(payload, topic));
   });
   socket.on("tag", (payload) => {
+    currentTopics.forEach((topic) => handleTagPayload(payload, topic));
+  });
+  socket.on("message", (payload) => {
     currentTopics.forEach((topic) => handleTagPayload(payload, topic));
   });
   socket.on("init_unai_location_tag", (payload) => {
@@ -225,6 +282,7 @@ async function start(options = {}) {
 
 function stop() {
   started = false;
+  lastSavedPositions.clear();
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = null;
   cooldownUntil = 0;

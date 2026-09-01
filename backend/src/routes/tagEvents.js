@@ -124,6 +124,16 @@ router.get("/", async (req, res) => {
 
     if (req.query.buildingId) filter.buildingId = String(req.query.buildingId);
     if (req.query.floorId) filter.floorId = String(req.query.floorId);
+    if (req.query.from) {
+      const from = new Date(String(req.query.from));
+      if (Number.isNaN(from.getTime())) return res.status(400).json({ error: "Invalid from date" });
+      filter.timestamp = { ...(filter.timestamp || {}), $gte: from };
+    }
+    if (req.query.to) {
+      const to = new Date(String(req.query.to));
+      if (Number.isNaN(to.getTime())) return res.status(400).json({ error: "Invalid to date" });
+      filter.timestamp = { ...(filter.timestamp || {}), $lte: to };
+    }
     if (req.query.tagId) {
       const requestedTagId = String(req.query.tagId);
       if (assetTagIds.has(requestedTagId)) {
@@ -134,8 +144,8 @@ router.get("/", async (req, res) => {
 
     const requestedLimit = Number(req.query.limit);
     const limit = Number.isFinite(requestedLimit)
-      ? Math.min(Math.max(requestedLimit, 1), 500)
-      : 100;
+      ? Math.min(Math.max(requestedLimit, 1), 5000)
+      : 500;
 
     const events = await TagEvent.find(filter)
       .sort({ timestamp: -1 })
