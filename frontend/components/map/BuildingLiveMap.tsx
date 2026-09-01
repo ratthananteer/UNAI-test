@@ -265,7 +265,7 @@ export function BuildingMapModes({
       {mode === "live" ? (
         <BuildingLiveMap placeId={placeId} buildingId={buildingId} floors={floors} anchors={anchors} tags={tags} zones={zones} selectedFloorId={selectedFloorId} onFloorChange={setSelectedFloorId} />
       ) : (
-        <BuildingTagHistory buildingId={buildingId} floors={floors} zones={zones} selectedFloorId={selectedFloorId} onFloorChange={setSelectedFloorId} />
+        <BuildingTagHistory buildingId={buildingId} floors={floors} tags={tags} zones={zones} selectedFloorId={selectedFloorId} onFloorChange={setSelectedFloorId} />
       )}
     </section>
   );
@@ -274,12 +274,14 @@ export function BuildingMapModes({
 function BuildingTagHistory({
   buildingId,
   floors,
+  tags,
   zones,
   selectedFloorId,
   onFloorChange,
 }: {
   buildingId: string | number;
   floors: Item[];
+  tags: Item[];
   zones: Item[];
   selectedFloorId?: string | number;
   onFloorChange: (id: string | number) => void;
@@ -287,6 +289,24 @@ function BuildingTagHistory({
   type HistoryEvent = { _id?: string; tagId?: string | number; tagName?: string | null; floorId?: string | number | null; x?: number | null; y?: number | null; timestamp: string; event?: string };
   const [events, setEvents] = useState<HistoryEvent[]>([]);
   const [tagId, setTagId] = useState("");
+
+  const tagNames = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const tag of tags) {
+      const id = tag.id ?? tag.tagId ?? tag.tag_id;
+      if (id == null) continue;
+      const first = str(tag.firstname ?? tag.first_name ?? tag.firstName, "").trim();
+      const last = str(tag.lastname ?? tag.last_name ?? tag.lastName, "").trim();
+      const name = [first, last].filter(Boolean).join(" ").trim() ||
+        str(tag.ui_display ?? tag.label ?? tag.name ?? tag.tag_name ?? tag.tagName, "").trim();
+      if (name) map.set(String(id), name);
+    }
+    return map;
+  }, [tags]);
+
+  function userNameOf(event: HistoryEvent): string {
+    return tagNames.get(String(event.tagId ?? "")) || event.tagName || String(event.tagId ?? "");
+  }
   const [followedTagId, setFollowedTagId] = useState("");
   const [index, setIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -426,7 +446,7 @@ function BuildingTagHistory({
         {tagId && <button type="button" onClick={() => { setTagId(""); setFollowedTagId(""); }} className="rounded-lg border px-3 py-2 text-sm">Show All</button>}
         <select value={tagId} onChange={(e) => { setTagId(e.target.value); setFollowedTagId(e.target.value); setIndex(0); setPlaying(false); }} className="rounded-lg border px-3 py-2 text-sm" aria-label="Select one tag">
           <option value="">All Tags — show all history</option>
-          {Array.from(new Map(events.filter((e) => e.tagId !== undefined).map((e) => [String(e.tagId), e.tagName ? `${e.tagName} (${e.tagId})` : String(e.tagId)])).entries()).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+          {Array.from(new Map(events.filter((e) => e.tagId !== undefined).map((e) => [String(e.tagId), `${tagNames.get(String(e.tagId)) || e.tagName || `Tag ${e.tagId}`} (${e.tagId})`])).entries()).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
         </select>
         <select value={String(selectedFloorId ?? "")} onChange={(e) => onFloorChange(e.target.value)} className="rounded-lg border px-3 py-2 text-sm" aria-label="Select floor">
           {validFloorOptions(floors).map(([id, name]) => <option key={id} value={id}>{name}</option>)}
@@ -493,7 +513,7 @@ function BuildingTagHistory({
             const isPastShadow = !isCurrent && !isLatestVisible;
             const left = Math.max(0, Math.min(100, ((ox + px * scale) / width) * 100));
             const top = Math.max(0, Math.min(100, ((oy - py * scale) / height) * 100));
-            const displayTagId = String(event.tagId ?? "—");
+            const displayUserName = userNameOf(event);
 
             return (
               <div
@@ -502,7 +522,7 @@ function BuildingTagHistory({
                   isCurrent ? "z-40" : isLatestVisible ? "z-30" : "z-10"
                 }`}
                 style={{ left: `${left}%`, top: `${top}%` }}
-                title={`${event.tagName || `Tag ${displayTagId}`} · ${isPastShadow ? "Past position" : isCurrent ? "Current position" : "Latest position"} · ${event.timestamp} · X: ${px}, Y: ${py}`}
+                title={`${displayUserName} · ${isPastShadow ? "Past position" : isCurrent ? "Current position" : "Latest position"} · ${event.timestamp} · X: ${px}, Y: ${py}`}
               >
                 <div
                   className={`flex items-center justify-center rounded-full border-2 border-white font-bold text-white shadow-lg ${
@@ -519,7 +539,7 @@ function BuildingTagHistory({
                   <span className={`mt-1 max-w-28 truncate rounded bg-white/95 px-1.5 py-0.5 font-semibold text-slate-700 shadow ${
                     isCurrent ? "text-[10px] text-sky-700" : "text-[9px]"
                   }`}>
-                    {displayTagId}
+                    {displayUserName}
                   </span>
                 )}
               </div>
@@ -533,7 +553,7 @@ function BuildingTagHistory({
                 left: `${Math.max(0, Math.min(100, ((ox + x * scale) / width) * 100))}%`,
                 top: `${Math.max(0, Math.min(100, ((oy - y * scale) / height) * 100))}%`,
               }}
-              title={`Current ${current.tagId} · ${x}, ${y}`}
+              title={`Current ${userNameOf(current)} · ${x}, ${y}`}
             />
           )}
         </div>

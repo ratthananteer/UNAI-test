@@ -1,3 +1,8 @@
+// STANDALONE TAG HISTORY PAGE:
+// Loads saved TagEvent records from MongoDB through /api/tag-events.
+// Users can filter by tag/building/floor, view the matching database floor map,
+// and replay a selected tag's historical positions with the timeline controls.
+
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
@@ -16,6 +21,9 @@ type HistoryEvent = {
   y?: number | null;
   z?: number | null;
   timestamp: string;
+  rawData?: Record<string, unknown>;
+  firstname?: string;
+  lastname?: string;
 };
 
 type FloorMap = {
@@ -101,6 +109,53 @@ function getFloorMap(item: Item): FloorMap | null {
   };
 }
 
+type TagMetadata = Item & {
+  tagId?: string | number;
+  id?: string | number;
+  firstname?: string;
+  lastname?: string;
+  first_name?: string;
+  last_name?: string;
+  firstName?: string;
+  lastName?: string;
+  ui_display?: string;
+  label?: string;
+  name?: string;
+  tag_name?: string;
+  tagName?: string;
+};
+
+function collectTagMetadata(value: unknown, output: Map<string, TagMetadata> = new Map()): Map<string, TagMetadata> {
+  if (!value || typeof value !== "object") return output;
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectTagMetadata(item, output));
+    return output;
+  }
+  const item = value as TagMetadata;
+  const id = item.tagId ?? item.tag_id ?? item.tagID ?? item.id;
+  if (id !== undefined && id !== null) output.set(String(id), item);
+  Object.values(item).forEach((child) => {
+    if (child && typeof child === "object") collectTagMetadata(child, output);
+  });
+  return output;
+}
+
+function tagUserName(tag: TagMetadata | undefined): string {
+  if (!tag) return "";
+  const first = String(tag.firstname ?? tag.first_name ?? tag.firstName ?? "").trim();
+  const last = String(tag.lastname ?? tag.last_name ?? tag.lastName ?? "").trim();
+  return [first, last].filter(Boolean).join(" ").trim() || String(tag.ui_display ?? tag.label ?? tag.name ?? tag.tag_name ?? tag.tagName ?? "").trim();
+}
+
+function userNameOf(event: HistoryEvent, tagMetadata: Map<string, TagMetadata>): string {
+  const liveName = tagUserName(tagMetadata.get(String(event.tagId)));
+  if (liveName) return liveName;
+  const raw = event.rawData ?? {};
+  const first = String(event.firstname ?? raw.firstname ?? raw.first_name ?? raw.firstName ?? "").trim();
+  const last = String(event.lastname ?? raw.lastname ?? raw.last_name ?? raw.lastName ?? "").trim();
+  return [first, last].filter(Boolean).join(" ").trim() || String(event.tagName ?? event.tagId);
+}
+
 function floorIdOf(event: HistoryEvent): string | number | undefined {
   return valueId(event.floorId);
 }
@@ -171,6 +226,7 @@ function zoneFloorId(zone: Item): string | number | undefined {
 
 export default function TagHistoryPage() {
   const [events, setEvents] = useState<HistoryEvent[]>([]);
+  const [tagMetadata, setTagMetadata] = useState<Map<string, TagMetadata>>(new Map());
   const [floors, setFloors] = useState<FloorMap[]>([]);
   const [zones, setZones] = useState<Item[]>([]);
   const [tagId, setTagId] = useState("");
@@ -181,6 +237,21 @@ export default function TagHistoryPage() {
   const [error, setError] = useState("");
   const [playing, setPlaying] = useState(false);
   const [historyIndex, setHistoryIndex] = useState(0);
+
+  async function loadTagMetadata() {
+    try {
+      // Use the exact same /api/tag source that BuildingPage passes to LiveMap.
+      const response = await fetch("/api/tag", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data: unknown = await response.json();
+      const metadata = collectTagMetadata(data);
+      console.log(`[TagHistory] Loaded ${metadata.size} tag records from /api/tag`);
+      setTagMetadata(metadata);
+    } catch (error) {
+      console.error("[TagHistory] Failed to load tag metadata:", error);
+      setTagMetadata(new Map());
+    }
+  }
 
   async function loadMapData() {
     setMapLoading(true);
@@ -254,17 +325,17 @@ export default function TagHistoryPage() {
   }
 
   useEffect(() => {
-    void Promise.all([loadHistory(), loadMapData()]);
+    void Promise.all([loadHistory(), loadMapData(), loadTagMetadata()]);
   }, []);
 
   const availableTags = useMemo(() => {
     const map = new Map<string, string>();
     for (const event of events) {
       const id = String(event.tagId ?? "").trim();
-      if (id) map.set(id, event.tagName ? `${event.tagName} (${id})` : id);
+      if (id) map.set(id, `${userNameOf(event, tagMetadata)} (${id})`);
     }
     return Array.from(map.entries()).map(([id, label]) => ({ id, label }));
-  }, [events]);
+  }, [events, tagMetadata]);
 
   const selectedTagEvents = useMemo(() => {
     if (!tagId.trim()) return [];
@@ -358,7 +429,7 @@ export default function TagHistoryPage() {
             </p>
           </div>
           <button
-            onClick={() => void Promise.all([loadHistory(), loadMapData()])}
+            onClick={() => void Promise.all([loadHistory(), loadMapData(), loadTagMetadata()])}
             className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700"
           >
             Refresh
@@ -419,7 +490,7 @@ export default function TagHistoryPage() {
               {currentEvent && (
                 <div className="text-right text-sm">
                   <div className="font-medium">
-                    {currentEvent.tagName || currentEvent.tagId}
+                    Tag ID: {currentEvent.tagId}
                   </div>
                   <div className="text-slate-500">
                     {new Date(currentEvent.timestamp).toLocaleString()}
@@ -487,13 +558,16 @@ export default function TagHistoryPage() {
 
                   {tagPosition && (
                     <div
-                      className="absolute z-10 h-6 w-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-4 border-white bg-red-500 shadow-lg"
+                      className="absolute z-10 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center transition-[left,top] duration-150"
                       style={{
                         left: `${tagPosition.left}%`,
                         top: `${tagPosition.top}%`,
                       }}
-                      title={`${currentEvent?.tagId}: ${currentEvent?.x}, ${currentEvent?.y}`}
-                    />
+                      title={`Tag ID: ${currentEvent?.tagId} · X: ${currentEvent?.x}, Y: ${currentEvent?.y}`}
+                    >
+                      <div className="flex h-8 min-w-8 items-center justify-center rounded-full border-2 border-white bg-sky-600 px-2 text-[9px] font-bold text-white shadow-lg ring-2 ring-sky-300">T</div>
+                      <span className="mt-1 max-w-28 truncate rounded bg-white/95 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700 shadow">{userNameOf(currentEvent, tagMetadata)}</span>
+                    </div>
                   )}
                 </div>
               </div>
@@ -507,7 +581,8 @@ export default function TagHistoryPage() {
 
             {currentEvent && (
               <div className="absolute bottom-4 left-4 rounded-lg bg-white/90 px-3 py-2 text-xs shadow">
-                <div className="font-medium">Tag: {currentEvent.tagId}</div>
+                <div className="font-medium">User: {userNameOf(currentEvent, tagMetadata)}</div>
+                <div className="text-slate-500">Tag ID: {currentEvent.tagId}</div>
                 <div>
                   X: {currentEvent.x ?? "-"} · Y: {currentEvent.y ?? "-"}
                   {currentEvent.z != null ? ` · Z: ${currentEvent.z}` : ""}
@@ -620,8 +695,7 @@ export default function TagHistoryPage() {
                     {new Date(event.timestamp).toLocaleString()}
                   </td>
                   <td className="px-4 py-3 font-medium">
-                    {event.tagName || event.tagId}
-                    <div className="text-xs text-slate-400">ID: {event.tagId}</div>
+                    <div className="text-slate-800">{userNameOf(event, tagMetadata)}</div>
                   </td>
                   <td className="px-4 py-3">{event.buildingId ?? "-"}</td>
                   <td className="px-4 py-3">{event.floorId ?? "-"}</td>
