@@ -1,7 +1,8 @@
-const TagEvent = require("../models/TagEvent");
+// ACTIVE TAG MONITOR:
+// Periodically checks recent TagEvent records in MongoDB.
+// ASSET events are excluded from the active-tag cache.
 
-const DEFAULT_TIMEOUT_MS = 10_000;
-const DEFAULT_INTERVAL_MS = 2_000;
+const TagEvent = require("../models/TagEvent");
 
 let monitorTimer = null;
 let latestActiveTags = new Map();
@@ -22,10 +23,16 @@ function getIntervalMs() {
 async function refreshActiveTags() {
   const timeoutDate = new Date(Date.now() - getTimeoutMs());
 
+  // Existing ASSET events may already be in MongoDB. Exclude them before
+  // grouping so an old Asset record can never become the latest tag position.
   const latest = await TagEvent.aggregate([
     {
       $match: {
-        timestamp: { $gte: timeoutDate },
+        $nor: [
+          { "rawData.usage_type": { $regex: /^asset$/i } },
+          { "rawData.usageType": { $regex: /^asset$/i } },
+          { "rawData.usage.type": { $regex: /^asset$/i } },
+        ],
       },
     },
     { $sort: { timestamp: -1 } },
@@ -41,6 +48,9 @@ async function refreshActiveTags() {
 
   for (const item of latest) {
     const event = item.latest;
+    const eventTime = new Date(event.timestamp).getTime();
+    const isAlive = Number.isFinite(eventTime) && eventTime >= timeoutDate.getTime();
+
     next.set(String(event.tagId), {
       tagId: String(event.tagId),
       buildingId: event.buildingId,
@@ -52,7 +62,7 @@ async function refreshActiveTags() {
       groupName: event.groupName,
       tagName: event.tagName,
       lastSeen: event.timestamp,
-      status: "ALIVE",
+      status: isAlive ? "ALIVE" : "STALE",
     });
   }
 
@@ -73,9 +83,9 @@ function startTagMonitor() {
 
   void run();
   monitorTimer = setInterval(() => void run(), getIntervalMs());
-  // console.log(
-  //   `[TagMonitor] Started: timeout=${getTimeoutMs() / 1000}s, interval=${getIntervalMs() / 1000}s`
-  // );
+  console.log(
+    `[TagMonitor] Started: timeout=${getTimeoutMs() / 1000}s, interval=${getIntervalMs() / 1000}s`
+  );
 }
 
 function getActiveTags({ buildingId, floorId } = {}) {

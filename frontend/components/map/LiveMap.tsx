@@ -1,13 +1,11 @@
-// LIVE RTLS MAP:
-// Displays the current floor image, zones, anchors, and active tags.
-// It periodically asks the backend which tags are still active and connects
-// to UNAI RTLS Socket.IO for real-time position updates. Socket events are
-// normalized, shown on the map, grouped in the UI, and saved to MongoDB so the
-// Building Tag History feature can replay them later.
+// LIVE RTLS MAP
+// Displays the current floor image, zones, anchors, active tags and realtime data.
+// UNAI Socket.IO is owned by lib/unaiRealtime. This component intentionally has
+// no direct Socket.IO connection or reconnect timer.
 
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { subscribeUnaiRealtime } from "../../lib/unaiRealtime";
 
 type Floor = {
@@ -48,10 +46,7 @@ type Tag = Record<string, unknown> & {
   lastname?: string;
 };
 
-type TagGroup = {
-  groupName: string;
-  members: Tag[];
-};
+type TagGroup = { groupName: string; members: Tag[] };
 
 type TimelineEvent = {
   id: string;
@@ -72,49 +67,109 @@ type Zone = {
 
 type SocketState = "loading" | "connecting" | "connected" | "error" | "disconnected";
 
-type SocketLike = {
-  id?: string;
-  connected?: boolean;
-  on: (event: string, handler: (...args: any[]) => void) => void;
-  off: (event: string, handler?: (...args: any[]) => void) => void;
-  onAny?: (handler: (event: string, ...args: any[]) => void) => void;
-  offAny?: (handler: (event: string, ...args: any[]) => void) => void;
-  emit: (event: string, ...args: any[]) => void;
-  disconnect: () => void;
-};
-
-// Keep one browser Socket.IO connection per floor. This is important in
-// Next.js development because React Strict Mode mounts/effect-cleans/mounts a
-// client component again. Creating a new UNAI connection on every effect run
-// can trip UNAI's connection-attempt rate limiter even when the user only
-// opened the page once.
-let sharedSocket: SocketLike | null = null;
-let sharedSocketKey = "";
-let sharedSocketDisconnectTimer: number | null = null;
-let sharedSocketRateLimitedUntil = 0;
-let sharedSocketTokenPromise: Promise<string> | null = null;
-let sharedSocketTokenKey = "";
-
-const SOCKET_RATE_LIMIT_COOLDOWN_MS = 60_000;
-const SOCKET_CLEANUP_GRACE_MS = 1_500;
-
-function numberValue(value: unknown) {
+function numberValue(value: unknown): number | null {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
 
-function sameId(a: unknown, b: unknown) {
+function sameId(a: unknown, b: unknown): boolean {
   return String(a) === String(b);
 }
 
-function imageUrl(path: unknown) {
+function isAssetTag(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  const usageType =
+    item.usage_type ??
+    item.usageType ??
+    (item.usage && typeof item.usage === "object"
+      ? (item.usage as Record<string, unknown>).type
+      : undefined);
+  return String(usageType ?? "").trim().toUpperCase() === "ASSET";
+}
+
+function collectObjects(value: unknown, output: Record<string, unknown>[] = []): Record<string, unknown>[] {
+  if (!value || typeof value !== "object") return output;
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectObjects(item, output));
+    return output;
+  }
+
+  const object = value as Record<string, unknown>;
+  output.push(object);
+  [
+    object.data,
+    object.item,
+    object.result,
+    object.payload,
+    object.tag,
+    object.tags,
+    object.location,
+    object.positions,
+  ].forEach((child) => {
+    if (child && typeof child === "object") collectObjects(child, output);
+  });
+  return output;
+}
+
+function findTagUpdates(
+  payload: unknown,
+  eventName: string,
+  floorId: unknown,
+  assetTagIds: Set<string>,
+): Tag[] {
+  const updates: Tag[] = [];
+
+  for (const object of collectObjects(payload)) {
+    if (isAssetTag(object)) continue;
+
+    const rawTagId = object.tagId ?? object.tag_id ?? object.tagID ?? object.id;
+    if (rawTagId === undefined || rawTagId === null) continue;
+    if (assetTagIds.has(String(rawTagId))) continue;
+
+    const x = numberValue(object.x ?? object.pos_x ?? object.position_x ?? object.location_x);
+    const y = numberValue(object.y ?? object.pos_y ?? object.position_y ?? object.location_y);
+    if (x === null || y === null) continue;
+
+    const payloadFloor = object.floorId ?? object.floor_id ?? object.floor ?? object.floorID;
+    if (payloadFloor !== undefined && !sameId(payloadFloor, floorId)) continue;
+
+    const resolvedFloorId = payloadFloor !== undefined ? payloadFloor : floorId;
+    const normalizedFloorId =
+      typeof resolvedFloorId === "string" || typeof resolvedFloorId === "number"
+        ? resolvedFloorId
+        : undefined;
+
+    updates.push({
+      ...object,
+      id: rawTagId as number | string,
+      tagId: rawTagId as number | string,
+      floor_id: normalizedFloorId,
+      x,
+      y,
+      _socketEvent: eventName,
+      _eventTimestamp:
+        object.timestamp ??
+        object.time ??
+        object.unix_time ??
+        object.unixTime ??
+        object.lastSeenAt ??
+        object.date_now ??
+        object.created_at,
+    });
+  }
+
+  return updates;
+}
+
+function imageUrl(path: unknown): string | null {
   if (!path) return null;
   const value = String(path);
   if (value.startsWith("http://") || value.startsWith("https://")) return value;
   return `https://rtls.lailab.online/${value.replace(/^\//, "")}`;
 }
 
-function toPixel(realX: number, realY: number, floor: Floor) {
+function toPixel(realX: number, realY: number, floor: Floor): { px: number; py: number } {
   const scale = numberValue(floor.pixel_meter) ?? 1;
   const originX = numberValue(floor.origin_x) ?? 0;
   const originY = numberValue(floor.origin_y) ?? 0;
@@ -129,108 +184,6 @@ function parsePolygon(value: unknown): [number, number][] {
   } catch {
     return [];
   }
-}
-
-function collectObjects(value: unknown, output: Record<string, unknown>[] = []) {
-  if (!value || typeof value !== "object") return output;
-  if (Array.isArray(value)) {
-    value.forEach((item) => collectObjects(item, output));
-    return output;
-  }
-
-  const object = value as Record<string, unknown>;
-  output.push(object);
-  [object.data, object.item, object.result, object.payload, object.tag, object.tags, object.location, object.positions]
-    .forEach((child) => {
-      if (child && typeof child === "object") collectObjects(child, output);
-    });
-  return output;
-}
-
-function findTagUpdates(
-  payload: unknown,
-  eventName: string,
-  floorId: unknown
-): Tag[] {
-  const objects = collectObjects(payload);
-  const updates: Tag[] = [];
-
-  for (const object of objects) {
-    const rawTagId =
-      object.tagId ??
-      object.tag_id ??
-      object.tagID ??
-      object.id;
-
-    const x = numberValue(
-      object.x ??
-        object.pos_x ??
-        object.position_x ??
-        object.location_x
-    );
-
-    const y = numberValue(
-      object.y ??
-        object.pos_y ??
-        object.position_y ??
-        object.location_y
-    );
-
-    const payloadFloor =
-      object.floorId ??
-      object.floor_id ??
-      object.floor ??
-      object.floorID;
-
-    if (rawTagId === undefined || x === null || y === null) {
-      continue;
-    }
-
-    if (
-      typeof rawTagId !== "string" &&
-      typeof rawTagId !== "number"
-    ) {
-      continue;
-    }
-
-    if (
-      payloadFloor !== undefined &&
-      !sameId(payloadFloor, floorId)
-    ) {
-      continue;
-    }
-
-    const resolvedFloorId =
-      payloadFloor !== undefined ? payloadFloor : floorId;
-
-    const normalizedFloorId =
-      typeof resolvedFloorId === "string" ||
-      typeof resolvedFloorId === "number"
-        ? resolvedFloorId
-        : undefined;
-
-    const rawTimestamp =
-      object.timestamp ??
-      object.time ??
-      object.unix_time ??
-      object.unixTime ??
-      object.lastSeenAt ??
-      object.date_now ??
-      object.created_at;
-
-    updates.push({
-      ...object,
-      id: rawTagId,
-      floor_id: normalizedFloorId,
-      x,
-      y,
-      tagId: rawTagId,
-      _socketEvent: eventName,
-      _eventTimestamp: rawTimestamp,
-    });
-  }
-
-  return updates;
 }
 
 export default function LiveMap({
@@ -250,167 +203,36 @@ export default function LiveMap({
   tagIdFilter?: string;
   zones: Zone[];
 }) {
-  const [tags, setTags] = useState<Tag[]>(initialTags);
+  const [tags, setTags] = useState<Tag[]>(() => initialTags.filter((tag) => !isAssetTag(tag)));
   const [showAnchors, setShowAnchors] = useState(true);
   const [socketState, setSocketState] = useState<SocketState>("loading");
-  const [socketInfo, setSocketInfo] = useState("Loading realtime tag data from backend...");
+  const [socketInfo, setSocketInfo] = useState("Loading realtime tag data...");
   const [lastUpdate, setLastUpdate] = useState<string | null>(null);
   const [messageCount, setMessageCount] = useState(0);
   const [socketTagGroups, setSocketTagGroups] = useState<TagGroup[]>([]);
   const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
   const [activeTagIds, setActiveTagIds] = useState<Set<string>>(new Set());
   const [activeTagCheckReady, setActiveTagCheckReady] = useState(false);
+  const assetTagIdsRef = useRef<Set<string>>(new Set());
+  const assetTagIdsReadyRef = useRef(false);
+  // Do not accept backend active-tag data until the authoritative Asset ID
+  // denylist has loaded. Socket payloads can omit usage_type, so this guard
+  // prevents an Asset from briefly appearing during startup.
 
+  // Keep initial/API tags available immediately, but never allow an Asset into state.
   useEffect(() => {
-    // Keep the server-provided positions visible immediately. A background
-    // poll must replace these positions, not temporarily hide them.
-    setTags(initialTags);
+    const safeInitialTags = initialTags.filter((tag) => !isAssetTag(tag));
+    setTags(safeInitialTags);
     setActiveTagIds(
       new Set(
-        initialTags
+        safeInitialTags
           .map((tag) => String(tag.id ?? tag.tagId ?? tag.tag_id ?? ""))
           .filter(Boolean),
       ),
     );
-    setActiveTagCheckReady(true);
+    // activeTagCheckReady is intentionally controlled by the Asset denylist
+    // loader below, not by initial API data.
   }, [initialTags, floor.id]);
-
-  // MongoDB is the source of truth for whether a tag is currently active.
-  // A tag remains visible while it keeps sending activity, even when it is
-  // stationary. It disappears after 10 seconds without a new position event.
-  useEffect(() => {
-    let cancelled = false;
-
-    async function checkActiveTags() {
-      try {
-        const response = await fetch(
-          `/api/active-tags?buildingId=${encodeURIComponent(String(buildingId))}&floorId=${encodeURIComponent(String(floor.id))}`,
-          { cache: "no-store" }
-        );
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-
-        const data = await response.json();
-        if (cancelled) return;
-
-        let active = Array.isArray(data?.tags) ? data.tags : [];
-
-        // The live endpoint is backed by the monitor cache. If that cache is
-        // empty (for example immediately after a backend restart), fall back
-        // to the same MongoDB TagEvent source used by Tag History. This makes
-        // the map render the latest known position instead of waiting forever
-        // for a new socket event.
-        if (active.length === 0) {
-          try {
-            const historyResponse = await fetch(
-              `/api/tag-events?buildingId=${encodeURIComponent(String(buildingId))}&limit=500`,
-              { cache: "no-store" },
-            );
-            if (historyResponse.ok) {
-              const historyData = await historyResponse.json();
-              const history = Array.isArray(historyData) ? historyData : Array.isArray(historyData?.events) ? historyData.events : [];
-              const latestByTag = new Map<string, any>();
-              for (const event of history) {
-                if (event?.tagId == null || event?.x == null || event?.y == null) continue;
-                const key = String(event.tagId);
-                const previous = latestByTag.get(key);
-                if (!previous || new Date(event.timestamp).getTime() > new Date(previous.timestamp).getTime()) {
-                  latestByTag.set(key, event);
-                }
-              }
-              active = [...latestByTag.values()]
-                .filter((event: any) => event.floorId == null || sameId(event.floorId, floor.id))
-                .map((event: any) => ({
-                  ...event,
-                  id: event.tagId,
-                  tagId: event.tagId,
-                  floorId: event.floorId ?? floor.id,
-                  floor_id: event.floorId ?? floor.id,
-                  buildingId: event.buildingId ?? buildingId,
-                  x: numberValue(event.x),
-                  y: numberValue(event.y),
-                  lastSeen: event.timestamp,
-                  status: "STALE",
-                }));
-            }
-          } catch (historyError) {
-            console.error("[Building LiveMap] MongoDB history fallback failed:", historyError);
-          }
-        }
-
-        const ids = new Set<string>();
-
-        setTags((current) => {
-          const next = [...current];
-
-          for (const activeTag of active) {
-            const tagId = activeTag?.tagId;
-            if (tagId === undefined || tagId === null) continue;
-            const id = String(tagId);
-            ids.add(id);
-
-            const index = next.findIndex((tag) =>
-              sameId(tag.id ?? tag.tagId ?? tag.tag_id, tagId)
-            );
-
-            const normalized: Tag = {
-              ...activeTag,
-              id: tagId,
-              tagId,
-              floor_id: activeTag.floorId ?? floor.id,
-              x: numberValue(activeTag.x),
-              y: numberValue(activeTag.y),
-            };
-
-            if (index >= 0) {
-              next[index] = { ...next[index], ...normalized };
-            } else {
-              next.push(normalized);
-            }
-          }
-
-          return next;
-        });
-
-        // An empty response can happen while the backend is refreshing its
-        // cache. Never clear the currently rendered tags because of that
-        // transient empty result. Replace them only when fresh tag data is
-        // actually returned.
-        if (active.length > 0) {
-          setActiveTagIds(ids);
-        }
-        setActiveTagCheckReady(true);
-      } catch (error) {
-        console.error("[TagMonitor] Active tag check failed:", error);
-      }
-    }
-
-    void checkActiveTags();
-    const timer = window.setInterval(() => void checkActiveTags(), 2000);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [buildingId, floor.id]);
-
-  const visibleTags = useMemo(() => {
-    if (!activeTagCheckReady) return [];
-
-    const filter = tagIdFilter.trim();
-    const activeTags = tags.filter((tag) =>
-      activeTagIds.has(String(tag.id ?? tag.tagId ?? tag.tag_id))
-    );
-
-    if (!filter) return activeTags;
-
-    return activeTags.filter((tag) => {
-      const id = tag.id ?? tag.tagId ?? tag.tag_id;
-      return id !== undefined && String(id) === filter;
-    });
-  }, [tags, activeTagIds, activeTagCheckReady, tagIdFilter]);
 
   function getStringField(tag: Tag, ...keys: string[]): string {
     for (const key of keys) {
@@ -423,8 +245,8 @@ export default function LiveMap({
 
   function buildTagGroups(tagList: Tag[]): TagGroup[] {
     const groups = new Map<string, Tag[]>();
-
     for (const tag of tagList) {
+      if (isAssetTag(tag)) continue;
       const groupName =
         getStringField(tag, "group_name", "groupName", "group", "group_name_en") ||
         "Ungrouped";
@@ -432,36 +254,26 @@ export default function LiveMap({
       members.push(tag);
       groups.set(groupName, members);
     }
-
-    return Array.from(groups.entries()).map(([groupName, members]) => ({
-      groupName,
-      members,
-    }));
+    return Array.from(groups.entries()).map(([groupName, members]) => ({ groupName, members }));
   }
-
-  useEffect(() => {
-    setSocketTagGroups(buildTagGroups(visibleTags));
-  }, [visibleTags]);
 
   function eventTime(value: unknown): string {
     if (typeof value === "number") {
-      const milliseconds = value < 100000000000 ? value * 1000 : value;
-      const date = new Date(milliseconds);
+      const date = new Date(value < 100000000000 ? value * 1000 : value);
       if (!Number.isNaN(date.getTime())) return date.toISOString();
     }
-
     if (typeof value === "string" && value.trim()) {
       const date = new Date(value);
       if (!Number.isNaN(date.getTime())) return date.toISOString();
     }
-
     return new Date().toISOString();
   }
 
-  async function saveTagEvents(updates: Tag[], eventName: string) {
-    const events = updates.map((tag) => ({
-      // UNAI RTLS payload uses `id`, `building`, `floor`, `timestamp`, `x`, `y`.
-      // Keep the normalized names in MongoDB, but preserve the original object.
+  async function saveTagEvents(updates: Tag[], eventName: string): Promise<void> {
+    const safeUpdates = updates.filter((tag) => !isAssetTag(tag));
+    if (!safeUpdates.length) return;
+
+    const events = safeUpdates.map((tag) => ({
       tagId: String(tag.id ?? tag.tagId ?? tag.tag_id),
       buildingId: String(tag.building ?? tag.buildingId ?? buildingId),
       floorId: String(tag.floor ?? tag.floor_id ?? tag.floorId ?? floor.id),
@@ -476,509 +288,302 @@ export default function LiveMap({
       rawData: tag,
     }));
 
-    if (!events.length) return;
-
-    console.log("[MongoDB] Sending socket tag events:", events);
-
     try {
       const response = await fetch("/api/tag-events", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ events }),
       });
-
-      const result = await response.json().catch(() => null);
+      const result: unknown = await response.json().catch(() => null);
       if (!response.ok) {
-        throw new Error(result?.error || `HTTP ${response.status}`);
+        const message =
+          result && typeof result === "object" && "error" in result
+            ? String((result as { error?: unknown }).error ?? `HTTP ${response.status}`)
+            : `HTTP ${response.status}`;
+        throw new Error(message);
       }
-
-      console.log(`[MongoDB] Saved ${events.length} tag event(s)`);
     } catch (error) {
       console.error("[MongoDB] Failed to save tag event:", error);
     }
   }
 
-  function addTimelineEvents(updates: Tag[], eventName: string) {
-    const newEvents: TimelineEvent[] = updates.map((tag) => {
-      const tagId = String(tag.id ?? tag.tagId ?? "unknown");
-      const tagName = getStringField(tag, "label", "name", "tag_name", "tagName") || `Tag ${tagId}`;
-      return {
-        id: `${tagId}-${eventTime(tag._eventTimestamp)}-${Math.random()}`,
-        tagId,
-        tagName,
-        event: eventName,
-        x: Number(tag.x),
-        y: Number(tag.y),
-        timestamp: eventTime(tag._eventTimestamp),
-      };
-    });
+  function addTimelineEvents(updates: Tag[], eventName: string): void {
+    const newEvents: TimelineEvent[] = updates
+      .filter((tag) => !isAssetTag(tag))
+      .map((tag) => {
+        const tagId = String(tag.id ?? tag.tagId ?? "unknown");
+        const tagName = getStringField(tag, "label", "name", "tag_name", "tagName") || `Tag ${tagId}`;
+        return {
+          id: `${tagId}-${eventTime(tag._eventTimestamp)}-${Date.now()}`,
+          tagId,
+          tagName,
+          event: eventName,
+          x: Number(tag.x),
+          y: Number(tag.y),
+          timestamp: eventTime(tag._eventTimestamp),
+        };
+      });
 
-    if (newEvents.length > 0) {
-      setTimeline((current) => [...newEvents, ...current].slice(0, 100));
-    }
+    if (newEvents.length) setTimeline((current) => [...newEvents, ...current].slice(0, 100));
   }
 
+  // Active-tag polling. This is a browser interval, so its type is the return
+  // type of window.setInterval and it is always cleared only after null-checking.
   useEffect(() => {
-    // Realtime connection is owned by the app-level UNAI realtime manager.
-    // Pages subscribe to the same connection instead of creating their own
-    // Socket.IO handshake. This is the main protection against UNAI rate limits.
-    const unsubscribeRealtime = subscribeUnaiRealtime({
-      placeId,
-      buildingId,
-      floorId: floor.id ?? "",
-      onStatus: ({ state, message, socketId }) => {
-        if (state === "connected") {
-          setSocketState("connected");
-          setSocketInfo(socketId ? `${message} Socket: ${socketId}` : message);
-        } else if (state === "connecting") {
-          setSocketState("connecting");
-          setSocketInfo(message);
-        } else if (state === "rate_limited") {
-          setSocketState("error");
-          setSocketInfo(message);
-        } else if (state === "error") {
-          setSocketState("error");
-          setSocketInfo(message);
-        } else {
-          setSocketState("disconnected");
-          setSocketInfo(message);
-        }
-      },
-      onTag: ({ payload, eventName }) => {
-        console.log(`[UNAI RTLS] ${eventName}:`, payload);
-        setMessageCount((count) => count + 1);
-        const updates = findTagUpdates(payload, eventName, floor.id);
-        if (!updates.length) return;
+    let cancelled = false;
+    let activePollTimer: number | null = null;
 
-        setTags((current) => {
-          const next = [...current];
-          for (const update of updates) {
-            const tagId = update.id ?? update.tagId ?? update.tag_id;
-            const index = next.findIndex((tag) =>
-              sameId(tag.id ?? tag.tagId ?? tag.tag_id, tagId),
-            );
-            if (index >= 0) next[index] = { ...next[index], ...update };
-            else next.push(update);
-          }
-          return next;
-        });
+    async function checkActiveTags(): Promise<void> {
+      // The active-tag API may contain a tag whose Socket payload has no
+      // usage_type. Wait until we have the authoritative Asset ID denylist.
+      if (!assetTagIdsReadyRef.current) return;
 
-        setActiveTagIds((current) => {
-          const next = new Set(current);
-          updates.forEach((tag) => {
-            const id = tag.id ?? tag.tagId ?? tag.tag_id;
-            if (id !== undefined && id !== null) next.add(String(id));
-          });
-          return next;
-        });
-        addTimelineEvents(updates, eventName);
-        void saveTagEvents(updates, eventName);
-        setLastUpdate(new Date().toLocaleTimeString());
-      },
-    });
-
-    // Keep the existing backend/MongoDB fallback polling below for resilience,
-    // but it is no longer responsible for opening or reconnecting a UNAI socket.
-    const backendRealtimeTimer = window.setInterval(async () => {
-      try {
-        const response = await fetch(
-          `/api/active-tags?buildingId=${encodeURIComponent(String(buildingId))}&floorId=${encodeURIComponent(String(floor.id))}`,
-          { cache: "no-store" },
-        );
-        if (!response.ok) return;
-
-        const data = await response.json();
-        const active = Array.isArray(data?.tags) ? data.tags : [];
-        const ids = new Set<string>();
-
-        setTags((current) => {
-          const next = [...current];
-          for (const activeTag of active) {
-            if (activeTag?.tagId == null) continue;
-            const id = String(activeTag.tagId);
-            ids.add(id);
-            const index = next.findIndex((tag) =>
-              sameId(tag.id ?? tag.tagId ?? tag.tag_id, activeTag.tagId),
-            );
-            const normalized: Tag = {
-              ...activeTag,
-              id: activeTag.tagId,
-              tagId: activeTag.tagId,
-              floor_id: activeTag.floorId ?? floor.id,
-              x: numberValue(activeTag.x),
-              y: numberValue(activeTag.y),
-            };
-            if (index >= 0) next[index] = { ...next[index], ...normalized };
-            else next.push(normalized);
-          }
-          return next;
-        });
-
-        // Keep the last known tags on screen while this poll has no fresh
-        // data. The next non-empty response will update their positions.
-        if (active.length > 0) {
-          setActiveTagIds(ids);
-        }
-        setActiveTagCheckReady(true);
-        setSocketState("connected");
-        setSocketInfo(active.length > 0
-          ? "Tag positions updated from the backend."
-          : "Showing last known tag positions while waiting for the next update.");
-        if (active.length > 0) setLastUpdate(new Date().toLocaleTimeString());
-      } catch (error) {
-        console.error("[UNAI RTLS] Backend realtime check failed:", error);
-      }
-    }, 2000);
-
-    // Run immediately instead of waiting for the first interval tick.
-    void (async () => {
       try {
         const response = await fetch(
           `/api/active-tags?buildingId=${encodeURIComponent(String(buildingId))}&floorId=${encodeURIComponent(String(floor.id))}`,
           { cache: "no-store" },
         );
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        let active = Array.isArray(data?.tags) ? data.tags : [];
 
-        // Initial render fallback: use the latest MongoDB TagEvent when the
-        // active-tag monitor has not populated yet.
-        if (active.length === 0) {
-          const historyResponse = await fetch(
-            `/api/tag-events?buildingId=${encodeURIComponent(String(buildingId))}&limit=500`,
-            { cache: "no-store" },
-          );
-          if (historyResponse.ok) {
-            const historyData = await historyResponse.json();
-            const history = Array.isArray(historyData) ? historyData : Array.isArray(historyData?.events) ? historyData.events : [];
-            const latestByTag = new Map<string, any>();
-            for (const event of history) {
-              if (event?.tagId == null || event?.x == null || event?.y == null) continue;
-              const key = String(event.tagId);
-              const previous = latestByTag.get(key);
-              if (!previous || new Date(event.timestamp).getTime() > new Date(previous.timestamp).getTime()) latestByTag.set(key, event);
-            }
-            active = [...latestByTag.values()]
-              .filter((event: any) => event.floorId == null || sameId(event.floorId, floor.id))
-              .map((event: any) => ({ ...event, id: event.tagId, tagId: event.tagId, floorId: event.floorId ?? floor.id, floor_id: event.floorId ?? floor.id, buildingId: event.buildingId ?? buildingId, x: numberValue(event.x), y: numberValue(event.y), status: "STALE", lastSeen: event.timestamp }));
-          }
-        }
-        const ids = new Set<string>(active.map((tag: Tag) => String(tag.tagId ?? tag.id ?? "")).filter(Boolean));
+        const data: unknown = await response.json();
+        if (cancelled) return;
+
+        const activeRaw =
+          data && typeof data === "object" && Array.isArray((data as { tags?: unknown }).tags)
+            ? (data as { tags: unknown[] }).tags
+            : [];
+        const active = activeRaw.filter((tag): tag is Record<string, unknown> => !isAssetTag(tag));
+        const ids = new Set<string>();
+
         setTags((current) => {
           const next = [...current];
-          for (const activeTag of active) {
-            const index = next.findIndex((tag) => sameId(tag.id ?? tag.tagId ?? tag.tag_id, activeTag.tagId));
-            const normalized: Tag = { ...activeTag, id: activeTag.tagId, tagId: activeTag.tagId, floor_id: activeTag.floorId ?? floor.id, x: numberValue(activeTag.x), y: numberValue(activeTag.y) };
+          for (const raw of active) {
+            const tagId = raw.tagId ?? raw.id;
+            if (tagId === undefined || tagId === null) continue;
+            const id = String(tagId);
+            if (assetTagIdsRef.current.has(id)) continue;
+            ids.add(id);
+
+            const normalized: Tag = {
+              ...raw,
+              id: tagId as number | string,
+              tagId: tagId as number | string,
+              floor_id: (raw.floorId ?? floor.id) as number | string,
+              x: numberValue(raw.x),
+              y: numberValue(raw.y),
+            };
+            const index = next.findIndex((tag) => sameId(tag.id ?? tag.tagId ?? tag.tag_id, tagId));
             if (index >= 0) next[index] = { ...next[index], ...normalized };
             else next.push(normalized);
           }
-          return next;
+          return next.filter((tag) => !isAssetTag(tag) && !assetTagIdsRef.current.has(String(tag.id ?? tag.tagId ?? tag.tag_id)));
         });
-        // Do not clear visible tags when the initial backend request is
-        // temporarily empty. Keep the positions supplied by the page/API.
-        if (active.length > 0) {
-          setActiveTagIds(ids);
-        }
+
+        if (active.length > 0) setActiveTagIds(ids);
         setActiveTagCheckReady(true);
-        setSocketState("connected");
-        setSocketInfo(active.length > 0
-          ? "Tag positions updated from the backend."
-          : "Showing last known tag positions while waiting for the next update.");
       } catch (error) {
-        console.error("[UNAI RTLS] Initial backend realtime check failed:", error);
-        setSocketState("error");
-        setSocketInfo("Backend realtime data is unavailable.");
-      }
-    })();
-
-    // IMPORTANT: do not execute the legacy direct-browser connection below.
-    // The shared manager above is now the only place allowed to open UNAI.
-    // Keep the old implementation in this file temporarily so rollback is easy,
-    // but return before it can execute.
-    return () => {
-      window.clearInterval(backendRealtimeTimer);
-      unsubscribeRealtime();
-    };
-
-    /* Legacy direct-browser UNAI Socket.IO connection (disabled). */
-    let socket: SocketLike | null = null;
-    let cancelled = false;
-    let script: HTMLScriptElement | null = null;
-
-    async function connect() {
-      const floorID = floor.id;
-      if (floorID === undefined || floorID === null) return;
-
-      const socketKey = `${String(placeId)}:${String(buildingId)}:${String(floorID)}`;
-
-      try {
-        if (sharedSocketDisconnectTimer !== null) {
-          window.clearTimeout(sharedSocketDisconnectTimer);
-          sharedSocketDisconnectTimer = null;
-        }
-
-        // Reuse an already connected/connecting socket for this exact floor.
-        // This prevents duplicate handshakes when React remounts the component.
-        if (sharedSocket && sharedSocketKey === socketKey) {
-          socket = sharedSocket;
-          setSocketState(sharedSocket.connected ? "connected" : "connecting");
-          setSocketInfo(
-            sharedSocket.connected
-              ? `Connected as ${sharedSocket.id ?? "socket"}. Reusing UNAI connection.`
-              : "Reusing the existing UNAI RTLS connection..."
-          );
-          return;
-        }
-
-        if (sharedSocket && sharedSocketKey !== socketKey) {
-          sharedSocket.disconnect();
-          sharedSocket = null;
-          sharedSocketKey = "";
-        }
-
-        // Never hammer the UNAI socket endpoint while it is rate-limiting us.
-        // The server-side rate limit cannot be cleared by JavaScript; waiting
-        // here prevents a page/floor change from extending the lockout.
-        if (Date.now() < sharedSocketRateLimitedUntil) {
-          const remaining = Math.ceil((sharedSocketRateLimitedUntil - Date.now()) / 1000);
-          setSocketState("error");
-          setSocketInfo(`UNAI temporarily rate-limited socket connections. Please wait about ${remaining}s before retrying.`);
-          return;
-        }
-
-        setSocketState("loading");
-        setSocketInfo(`Getting socket token for floor ${String(floorID)}...`);
-
-        // Generate the floor socket token only once while a request is in
-        // flight. Multiple component mounts must not request multiple tokens.
-        if (!sharedSocketTokenPromise || sharedSocketTokenKey !== socketKey) {
-          sharedSocketTokenKey = socketKey;
-          sharedSocketTokenPromise = fetch("/api/socket-topic", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ floorID }),
-          }).then(async (response) => {
-            const credentials = await response.json().catch(() => ({}));
-            if (!response.ok) {
-              throw new Error(credentials?.error || `HTTP ${response.status}`);
-            }
-            if (!credentials.socket_token) {
-              throw new Error("Socket API did not return socket_token");
-            }
-            return String(credentials.socket_token);
-          });
-        }
-
-        const socketToken = await sharedSocketTokenPromise;
-        if (cancelled) return;
-
-        setSocketInfo("Socket token received. Connecting to UNAI RTLS...");
-        setSocketState("connecting");
-
-        const connectWithIo = (ioFactory: any) => {
-          if (cancelled) return;
-
-          if (sharedSocket && sharedSocketKey === socketKey) {
-            socket = sharedSocket;
-            setSocketState(sharedSocket.connected ? "connected" : "connecting");
-            return;
-          }
-
-          // UNAI RTLS Socket.IO protocol:
-          // Host: https://socket.lailab.online
-          // Path: /ble/location
-          // Auth: ?token=<socket_token>
-          socket = ioFactory("https://socket.lailab.online", {
-            path: "/ble/location",
-            query: { token: socketToken },
-            transports: ["websocket"],
-            // IMPORTANT: never let Socket.IO retry a rejected UNAI handshake.
-            // Reconnect loops are what trigger "Too many connection attempts".
-            reconnection: false,
-            // Do not force a brand-new Manager. Reuse the Socket.IO Manager
-            // where possible and also guard the socket at module level above.
-            forceNew: false,
-          }) as SocketLike;
-
-          sharedSocket = socket;
-          sharedSocketKey = socketKey;
-
-          const handlePosition = (payload: unknown, eventName: string) => {
-            console.log(`[UNAI RTLS] ${eventName}:`, payload);
-            setMessageCount((count) => count + 1);
-
-            const updates = findTagUpdates(payload, eventName, floorID);
-            if (!updates.length) return;
-
-            setTags((current) => {
-              const next = [...current];
-              for (const update of updates) {
-                const tagId = update.id ?? update.tagId ?? update.tag_id;
-                const index = next.findIndex((tag) =>
-                  sameId(tag.id ?? tag.tagId ?? tag.tag_id, tagId)
-                );
-                if (index >= 0) next[index] = { ...next[index], ...update };
-                else next.push(update);
-              }
-              return next;
-            });
-
-            console.log("[UNAI RTLS] TAG GROUPS:", buildTagGroups(updates));
-            addTimelineEvents(updates, eventName);
-            void saveTagEvents(updates, eventName);
-            setLastUpdate(new Date().toLocaleTimeString());
-          };
-
-          const onAnchor = (payload: unknown) => {
-            console.log("[UNAI RTLS] anchor:", payload);
-            setMessageCount((count) => count + 1);
-          };
-
-          const onConnect = () => {
-            const baseTopic = `unai/${placeId}/${buildingId}/${floorID}`;
-
-            setSocketState("connected");
-            setSocketInfo(`Connected as ${socket?.id ?? "socket"}. Joining floor rooms...`);
-            console.log("[UNAI RTLS] connected", socket?.id);
-
-            // 1. Register this browser/client.
-            socket?.emit("/register", {
-              customId: `client_${buildingId}_${floorID}`,
-            });
-
-            // 2. Join the required UNAI rooms for this floor.
-            socket?.emit("/join", `${baseTopic}/tag`);
-            socket?.emit("/join", `${baseTopic}/anchor`);
-            socket?.emit("/join", `${baseTopic}/alert`);
-
-            // 3. Request the initial location immediately.
-            socket?.emit("/broadcastToRoom", {
-              room: "init_unai_location",
-              data: {
-                action: "get_init_unai_location",
-                get_topic: `${placeId}/${buildingId}/${floorID}`,
-              },
-            });
-
-            console.log("[UNAI RTLS] registered and joined:", {
-              tag: `${baseTopic}/tag`,
-              anchor: `${baseTopic}/anchor`,
-              alert: `${baseTopic}/alert`,
-            });
-          };
-
-          const onDisconnect = (reason: string) => {
-            setSocketState("disconnected");
-            setSocketInfo(
-              reason === "io server disconnect"
-                ? "UNAI server disconnected this client. Refresh the page to request a fresh connection."
-                : `Disconnected: ${reason}. Automatic reconnect is disabled.`
-            );
-          };
-
-          const onConnectError = (error: any) => {
-            const message = error?.message ?? String(error);
-            console.error("[UNAI RTLS] connect_error", message);
-            setSocketState("error");
-
-            const rateLimited = /too many connection attempts|rate.?limit/i.test(message);
-            if (rateLimited) {
-              // Do not immediately reconnect or request another socket token.
-              // UNAI's limiter is server-side, so repeated attempts only make
-              // the lockout last longer.
-              sharedSocketRateLimitedUntil = Date.now() + SOCKET_RATE_LIMIT_COOLDOWN_MS;
-              setSocketInfo("UNAI is rate-limiting socket connections. No automatic reconnect will be attempted for 60 seconds.");
-            } else {
-              setSocketInfo(`Socket connection error: ${message}`);
-            }
-
-            if (sharedSocket === socket) {
-              sharedSocket = null;
-              sharedSocketKey = "";
-            }
-
-            // Explicitly stop the Manager after a rejected handshake so there
-            // is no hidden reconnect loop.
-            socket?.disconnect();
-          };
-
-          socket.on("connect", onConnect);
-          socket.on("disconnect", onDisconnect);
-          socket.on("connect_error", onConnectError);
-          socket.on("tag", (payload: unknown) => handlePosition(payload, "tag"));
-          socket.on("clientBox", (payload: unknown) => handlePosition(payload, "clientBox"));
-          socket.on("sensor", (payload: unknown) => handlePosition(payload, "sensor"));
-          socket.on("message", (payload: unknown) => handlePosition(payload, "message"));
-          socket.on("anchor", onAnchor);
-        };
-
-        const existingIo = (window as any).io;
-        if (typeof existingIo === "function") {
-          connectWithIo(existingIo);
-          return;
-        }
-
-        script = document.createElement("script");
-        script.src = "https://cdn.socket.io/4.8.1/socket.io.min.js";
-        script.async = true;
-        script.onload = () => {
-          const ioFactory = (window as any).io;
-          if (typeof ioFactory !== "function") {
-            setSocketState("error");
-            setSocketInfo("Socket.IO client script loaded but window.io is unavailable.");
-            return;
-          }
-          connectWithIo(ioFactory);
-        };
-        script.onerror = () => {
-          setSocketState("error");
-          setSocketInfo("Could not load Socket.IO client from CDN.");
-        };
-        document.head.appendChild(script);
-      } catch (error) {
-        console.error("[UNAI RTLS] setup failed", error);
-        setSocketState("error");
-        setSocketInfo(error instanceof Error ? error.message : String(error));
+        if (!cancelled) console.error("[TagMonitor] Active tag check failed:", error);
       }
     }
 
-    // Delay the first connection slightly. Next.js/React Strict Mode can mount
-    // client components twice in development; the delay lets the first effect
-    // cleanup cancel before a real Socket.IO connection is opened.
-    const connectTimer = window.setTimeout(() => {
-      void connect();
-    }, 1000);
+    void checkActiveTags();
+    activePollTimer = window.setInterval(() => {
+      void checkActiveTags();
+    }, 2000);
 
     return () => {
       cancelled = true;
-      window.clearInterval(backendRealtimeTimer);
-      window.clearTimeout(connectTimer);
+      if (activePollTimer !== null) {
+        window.clearInterval(activePollTimer);
+        activePollTimer = null;
+      }
+    };
+  }, [buildingId, floor.id]);
 
-      // Do not immediately disconnect here. React Strict Mode intentionally
-      // runs effect cleanup followed by a second setup in development. A short
-      // grace period lets the second setup reuse the same socket instead of
-      // creating another UNAI handshake and triggering rate limiting.
-      if (sharedSocket === socket) {
-        sharedSocketDisconnectTimer = window.setTimeout(() => {
-          if (sharedSocket === socket) {
-            socket?.off("connect");
-            socket?.off("disconnect");
-            socket?.off("connect_error");
-            socket?.disconnect();
-            sharedSocket = null;
-            sharedSocketKey = "";
-          }
-          sharedSocketDisconnectTimer = null;
-        }, SOCKET_CLEANUP_GRACE_MS);
-      } else {
-        socket?.off("connect");
-        socket?.off("disconnect");
-        socket?.off("connect_error");
+  // Load authoritative Asset IDs first, then subscribe to the shared realtime manager.
+  // This avoids the race where a Socket location payload has no usage_type.
+  useEffect(() => {
+    let cancelled = false;
+    assetTagIdsReadyRef.current = false;
+    setActiveTagCheckReady(false);
+    let unsubscribeRealtime: (() => void) | null = null;
+    let backendPollTimer: number | null = null;
+
+    async function loadAssetTagIds(): Promise<boolean> {
+      try {
+        const response = await fetch("/api/tag?mode=asset-ids", { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data: unknown = await response.json();
+        if (cancelled) return false;
+
+        const rawIds =
+          data && typeof data === "object" && Array.isArray((data as { assetTagIds?: unknown }).assetTagIds)
+            ? (data as { assetTagIds: unknown[] }).assetTagIds
+            : [];
+        const ids = new Set(rawIds.map((id) => String(id)).filter(Boolean));
+        assetTagIdsRef.current = ids;
+        assetTagIdsReadyRef.current = true;
+        setTags((current) => current.filter((tag) => !isAssetTag(tag) && !ids.has(String(tag.id ?? tag.tagId ?? tag.tag_id))));
+        setActiveTagIds((current) => new Set([...current].filter((id) => !ids.has(id))));
+        setActiveTagCheckReady(true);
+        console.log(`[UNAI TAG] Asset denylist loaded: ${ids.size} tag(s)`);
+        return true;
+      } catch (error) {
+        assetTagIdsReadyRef.current = false;
+        setActiveTagCheckReady(false);
+        console.error("[UNAI TAG] Failed to load Asset denylist:", error);
+        return false;
+      }
+    }
+
+    async function startRealtime(): Promise<void> {
+      const loaded = await loadAssetTagIds();
+      if (cancelled) return;
+
+      // Direct payload filtering still protects us when metadata is present.
+      // If the authoritative list cannot be loaded, do not create a second
+      // Socket.IO connection; the shared realtime manager remains the only owner.
+      if (!loaded) {
+        setSocketState("error");
+        setSocketInfo("Could not load Asset metadata; realtime subscription was not started.");
+        return;
       }
 
-      if (script?.parentNode) script.parentNode.removeChild(script);
+      unsubscribeRealtime = subscribeUnaiRealtime({
+        placeId,
+        buildingId,
+        floorId: floor.id ?? "",
+        onStatus: ({ state, message, socketId }) => {
+          if (state === "connected") {
+            setSocketState("connected");
+            setSocketInfo(socketId ? `${message} Socket: ${socketId}` : message);
+          } else if (state === "connecting") {
+            setSocketState("connecting");
+            setSocketInfo(message);
+          } else if (state === "rate_limited" || state === "error") {
+            setSocketState("error");
+            setSocketInfo(message);
+          } else {
+            setSocketState("disconnected");
+            setSocketInfo(message);
+          }
+        },
+        onTag: ({ payload, eventName }) => {
+          const updates = findTagUpdates(payload, eventName, floor.id, assetTagIdsRef.current);
+          if (!updates.length) return;
+
+          
+          setMessageCount((count) => count + 1);
+
+          setTags((current) => {
+            const next = [...current];
+            for (const update of updates) {
+              const tagId = update.id ?? update.tagId ?? update.tag_id;
+              if (tagId === undefined || tagId === null) continue;
+              if (isAssetTag(update) || assetTagIdsRef.current.has(String(tagId))) continue;
+              const index = next.findIndex((tag) => sameId(tag.id ?? tag.tagId ?? tag.tag_id, tagId));
+              if (index >= 0) next[index] = { ...next[index], ...update };
+              else next.push(update);
+            }
+            return next.filter((tag) => !isAssetTag(tag) && !assetTagIdsRef.current.has(String(tag.id ?? tag.tagId ?? tag.tag_id)));
+          });
+
+          setActiveTagIds((current) => {
+            const next = new Set(current);
+            updates.forEach((tag) => {
+              const id = tag.id ?? tag.tagId ?? tag.tag_id;
+              if (id !== undefined && id !== null && !assetTagIdsRef.current.has(String(id))) next.add(String(id));
+            });
+            return next;
+          });
+
+          addTimelineEvents(updates, eventName);
+          void saveTagEvents(updates, eventName);
+          setLastUpdate(new Date().toLocaleTimeString());
+        },
+      });
+
+      // Backend polling remains as a resilience path, but does not open sockets.
+      const pollBackend = async (): Promise<void> => {
+        try {
+          const response = await fetch(
+            `/api/active-tags?buildingId=${encodeURIComponent(String(buildingId))}&floorId=${encodeURIComponent(String(floor.id))}`,
+            { cache: "no-store" },
+          );
+          if (!response.ok || cancelled) return;
+          const data: unknown = await response.json();
+          const raw =
+            data && typeof data === "object" && Array.isArray((data as { tags?: unknown }).tags)
+              ? (data as { tags: unknown[] }).tags
+              : [];
+          const active = raw.filter((tag): tag is Record<string, unknown> => !isAssetTag(tag));
+          if (!active.length) return;
+
+          const ids = new Set<string>();
+          setTags((current) => {
+            const next = [...current];
+            for (const item of active) {
+              const tagId = item.tagId ?? item.id;
+              if (tagId == null || assetTagIdsRef.current.has(String(tagId))) continue;
+              ids.add(String(tagId));
+              const normalized: Tag = {
+                ...item,
+                id: tagId as number | string,
+                tagId: tagId as number | string,
+                floor_id: (item.floorId ?? floor.id) as number | string,
+                x: numberValue(item.x),
+                y: numberValue(item.y),
+              };
+              const index = next.findIndex((tag) => sameId(tag.id ?? tag.tagId ?? tag.tag_id, tagId));
+              if (index >= 0) next[index] = { ...next[index], ...normalized };
+              else next.push(normalized);
+            }
+            return next.filter((tag) => !isAssetTag(tag) && !assetTagIdsRef.current.has(String(tag.id ?? tag.tagId ?? tag.tag_id)));
+          });
+          setActiveTagIds(ids);
+          setLastUpdate(new Date().toLocaleTimeString());
+        } catch (error) {
+          if (!cancelled) console.error("[UNAI RTLS] Backend realtime check failed:", error);
+        }
+      };
+
+      void pollBackend();
+      backendPollTimer = window.setInterval(() => {
+        void pollBackend();
+      }, 2000);
+    }
+
+    void startRealtime();
+
+    return () => {
+      cancelled = true;
+      assetTagIdsReadyRef.current = false;
+      setActiveTagCheckReady(false);
+      if (backendPollTimer !== null) {
+        window.clearInterval(backendPollTimer);
+        backendPollTimer = null;
+      }
+      if (unsubscribeRealtime) {
+        unsubscribeRealtime();
+        unsubscribeRealtime = null;
+      }
     };
   }, [placeId, buildingId, floor.id]);
+
+  const visibleTags = useMemo(() => {
+    if (!activeTagCheckReady) return [];
+    const filter = tagIdFilter.trim();
+    const activeTags = tags.filter((tag) => {
+      const id = String(tag.id ?? tag.tagId ?? tag.tag_id ?? "");
+      return Boolean(id) && activeTagIds.has(id) && !isAssetTag(tag) && !assetTagIdsRef.current.has(id);
+    });
+    if (!filter) return activeTags;
+    return activeTags.filter((tag) => String(tag.id ?? tag.tagId ?? tag.tag_id ?? "") === filter);
+  }, [tags, activeTagIds, activeTagCheckReady, tagIdFilter]);
+
+  useEffect(() => {
+    setSocketTagGroups(buildTagGroups(visibleTags));
+  }, [visibleTags]);
 
   const statusClass = useMemo(() => {
     if (socketState === "connected") return "bg-emerald-100 text-emerald-700";
@@ -997,7 +602,9 @@ export default function LiveMap({
           {socketState === "connected" ? "● LIVE" : socketState.toUpperCase()}
         </span>
         <span className="text-slate-500">{socketInfo}</span>
-        <span className="ml-auto text-slate-400">Socket events: {messageCount}{lastUpdate ? ` · Last tag update ${lastUpdate}` : ""}</span>
+        <span className="ml-auto text-slate-400">
+          Socket events: {messageCount}{lastUpdate ? ` · Last tag update ${lastUpdate}` : ""}
+        </span>
       </div>
 
       <div className="overflow-auto bg-slate-100 p-4">
@@ -1025,34 +632,34 @@ export default function LiveMap({
                 key={`zone-${String(zone.id)}`}
                 className="absolute border-2"
                 title={String(zone.name ?? `Zone ${zone.id ?? ""}`)}
-                style={{ inset: 0, clipPath: `polygon(${points})`, background: zone.zone_color ? `${zone.zone_color}30` : "rgba(139,92,246,.12)", borderColor: zone.zone_color ?? "#8b5cf6", pointerEvents: "none" }}
+                style={{
+                  inset: 0,
+                  clipPath: `polygon(${points})`,
+                  background: zone.zone_color ? `${zone.zone_color}30` : "rgba(139,92,246,.12)",
+                  borderColor: zone.zone_color ?? "#8b5cf6",
+                  pointerEvents: "none",
+                }}
               />
             );
           })}
 
           <div className="absolute inset-0 z-20 pointer-events-none">
             <button
-            suppressHydrationWarning
-            type="button"
-            onClick={() => setShowAnchors((current) => !current)}
-            aria-pressed={showAnchors}
-            aria-label={showAnchors ? "Hide anchors" : "Show anchors"}
-            className={`pointer-events-auto absolute right-3 top-3 z-50 flex cursor-pointer items-center gap-2 rounded-full border-2 px-3 py-2 text-xs font-bold shadow-md backdrop-blur transition-all duration-200 ${
-            showAnchors
-            ? "border-emerald-500 bg-emerald-500 text-white hover:bg-emerald-600"
-            : "border-red-500 bg-red-500 text-white hover:bg-red-600"
-            }`}
+              suppressHydrationWarning
+              type="button"
+              onClick={() => setShowAnchors((current) => !current)}
+              aria-pressed={showAnchors}
+              aria-label={showAnchors ? "Hide anchors" : "Show anchors"}
+              className={`pointer-events-auto absolute right-3 top-3 z-50 flex cursor-pointer items-center gap-2 rounded-full border-2 px-3 py-2 text-xs font-bold shadow-md backdrop-blur transition-all duration-200 ${
+                showAnchors
+                  ? "border-emerald-500 bg-emerald-500 text-white hover:bg-emerald-600"
+                  : "border-red-500 bg-red-500 text-white hover:bg-red-600"
+              }`}
             >
-            <span>Anchors</span>
-            <span
-            className={`rounded-full px-2 py-0.5 font-extrabold ${
-            showAnchors
-            ? "bg-white text-emerald-600"
-            : "bg-white text-red-600"
-            }`}
-            >
-            {showAnchors ? "ON" : "OFF"}
-            </span>
+              <span>Anchors</span>
+              <span className={`rounded-full bg-white px-2 py-0.5 font-extrabold ${showAnchors ? "text-emerald-600" : "text-red-600"}`}>
+                {showAnchors ? "ON" : "OFF"}
+              </span>
             </button>
 
             {showAnchors && (
@@ -1066,13 +673,8 @@ export default function LiveMap({
                     <div
                       key={`anchor-${String(anchor.id)}`}
                       title={String(anchor.label ?? anchor.id ?? "Anchor")}
-                      className={`absolute flex h-7 w-7 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border-2 border-white text-[9px] font-bold text-white shadow-lg ${
-                        anchor.status === 1 ? "bg-emerald-500" : "bg-rose-500"
-                      }`}
-                      style={{
-                        left: `${(px / width) * 100}%`,
-                        top: `${(py / height) * 100}%`,
-                      }}
+                      className={`absolute flex h-7 w-7 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border-2 border-white text-[9px] font-bold text-white shadow-lg ${anchor.status === 1 ? "bg-emerald-500" : "bg-rose-500"}`}
+                      style={{ left: `${(px / width) * 100}%`, top: `${(py / height) * 100}%` }}
                     >
                       A
                     </div>
@@ -1087,9 +689,14 @@ export default function LiveMap({
             const realY = numberValue(tag.y);
             if (realX === null || realY === null) return null;
             const { px, py } = toPixel(realX, realY, floor);
-            const tagName = String(tag.label ?? tag.name ?? `Tag ${tag.id ?? ""}`);
+            const tagName = String(tag.label ?? tag.name ?? tag.ui_display ?? `Tag ${tag.id ?? ""}`);
             return (
-              <div key={`tag-${String(tag.id ?? tag.tagId)}`} title={`${tagName} · X: ${realX} · Y: ${realY}`} className="absolute z-10 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center transition-[left,top] duration-150" style={{ left: `${(px / width) * 100}%`, top: `${(py / height) * 100}%` }}>
+              <div
+                key={`tag-${String(tag.id ?? tag.tagId)}`}
+                title={`${tagName} · X: ${realX} · Y: ${realY}`}
+                className="absolute z-10 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center transition-[left,top] duration-150"
+                style={{ left: `${(px / width) * 100}%`, top: `${(py / height) * 100}%` }}
+              >
                 <div className="flex h-8 min-w-8 items-center justify-center rounded-full border-2 border-white bg-sky-600 px-2 text-[9px] font-bold text-white shadow-lg">T</div>
                 <span className="mt-1 max-w-28 truncate rounded bg-white/95 px-1.5 py-0.5 text-[9px] font-semibold text-slate-700 shadow">{tagName}</span>
               </div>
@@ -1116,17 +723,11 @@ export default function LiveMap({
         ) : (
           <div className="max-h-44 space-y-1.5 overflow-y-auto pr-1">
             {socketTagGroups.map((group) => (
-              <div
-                key={group.groupName}
-                className="rounded-lg border border-slate-200 bg-slate-50 p-2"
-              >
+              <div key={group.groupName} className="rounded-lg border border-slate-200 bg-slate-50 p-2">
                 <div className="mb-3 flex items-center justify-between">
                   <h3 className="min-w-0 truncate text-xs font-bold text-slate-800">{group.groupName}</h3>
-                  <span className="rounded-full bg-violet-100 px-1.5 py-0.5 text-[10px] font-bold text-violet-700">
-                    {group.members.length}
-                  </span>
+                  <span className="rounded-full bg-violet-100 px-1.5 py-0.5 text-[10px] font-bold text-violet-700">{group.members.length}</span>
                 </div>
-
                 <div className="mt-1 max-h-24 space-y-1 overflow-y-auto pr-1">
                   {group.members.map((tag, index) => {
                     const firstname = getStringField(tag, "firstname", "first_name", "firstName");
@@ -1134,18 +735,11 @@ export default function LiveMap({
                     const fullName = `${firstname} ${lastname}`.trim();
                     const tagName = getStringField(tag, "label", "name", "tag_name", "tagName");
                     const tagId = tag.id ?? tag.tagId ?? tag.tag_id ?? index;
-
                     return (
-                      <div
-                        key={String(tagId)}
-                        className="rounded-md border border-white bg-white px-2 py-1 shadow-sm"
-                      >
-                        <p className="truncate text-[10px] font-semibold text-slate-700">
-                          {fullName || tagName || `Tag ${String(tagId)}`}
-                        </p>
+                      <div key={String(tagId)} className="rounded-md border border-white bg-white px-2 py-1 shadow-sm">
+                        <p className="truncate text-[10px] font-semibold text-slate-700">{fullName || tagName || `Tag ${String(tagId)}`}</p>
                         <p className="mt-0.5 truncate text-[9px] text-slate-400">
-                          {tagName && fullName ? `${tagName} · ` : ""}
-                          Tag ID: {String(tagId)}
+                          {tagName && fullName ? `${tagName} · ` : ""}Tag ID: {String(tagId)}
                         </p>
                       </div>
                     );

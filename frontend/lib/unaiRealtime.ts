@@ -101,6 +101,51 @@ function isRateLimit(error: unknown) {
   );
 }
 
+// UNAI realtime payloads can contain usage_type directly. Filter ASSET here,
+// at the single shared Socket.IO boundary, before any page receives/logs the
+// payload. This is intentionally independent of the HTTP /api/tag endpoint.
+function isAssetRecord(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  const usageType =
+    item.usage_type ??
+    item.usageType ??
+    (item.usage && typeof item.usage === "object"
+      ? (item.usage as Record<string, unknown>).type
+      : undefined);
+  return String(usageType ?? "").trim().toUpperCase() === "ASSET";
+}
+
+function filterAssetPayload(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => !isAssetRecord(item))
+      .map(filterAssetPayload);
+  }
+
+  if (!value || typeof value !== "object") return value;
+  if (isAssetRecord(value)) return undefined;
+
+  const object = value as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(object)) {
+    if (child && typeof child === "object") {
+      const filtered = filterAssetPayload(child);
+      if (filtered !== undefined) result[key] = filtered;
+    } else {
+      result[key] = child;
+    }
+  }
+  return result;
+}
+
+function containsAssetRecord(value: unknown): boolean {
+  if (isAssetRecord(value)) return true;
+  if (Array.isArray(value)) return value.some(containsAssetRecord);
+  if (!value || typeof value !== "object") return false;
+  return Object.values(value as Record<string, unknown>).some(containsAssetRecord);
+}
+
 async function getToken(
   key: string,
   floorId: string | number
@@ -233,9 +278,33 @@ async function createConnection(
     connection = current;
 
     const handleTag = (payload: unknown, eventName: string) => {
+      // Drop ASSET records before they reach subscribers. This also prevents
+      // LiveMap's console.log, timeline, map state and MongoDB POST from ever
+      // seeing an object that explicitly says usage_type=ASSET.
+      // IMPORTANT: never forward the raw UNAI payload. An Asset can appear
+      // in initial data and realtime events with usage_type=ASSET. Filter the
+      // complete object tree first, then notify subscribers only with the
+      // sanitized payload.
+      const filteredPayload = filterAssetPayload(payload);
+
+      if (filteredPayload === undefined) return;
+      if (Array.isArray(filteredPayload) && filteredPayload.length === 0) return;
+
+      // If this payload contained an Asset and filtering removed everything
+      // useful from it, do not pass an empty object through to LiveMap.
+      if (
+        containsAssetRecord(payload) &&
+        filteredPayload &&
+        typeof filteredPayload === "object" &&
+        !Array.isArray(filteredPayload) &&
+        Object.keys(filteredPayload as Record<string, unknown>).length === 0
+      ) {
+        return;
+      }
+
       current.listeners.forEach((listener) => {
         try {
-          listener({ payload, eventName });
+          listener({ payload: filteredPayload, eventName });
         } catch (error) {
           console.error("[UNAI RTLS] subscriber error:", error);
         }

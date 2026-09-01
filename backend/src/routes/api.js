@@ -11,19 +11,65 @@ const tagEventsRouter = require("./tagEvents");
 const { getActiveTags, refreshActiveTags } = require("../services/tagMonitor");
 const { getCachedOrFetch, refreshStaticData } = require("../services/staticDataCache");
 const TagEvent = require("../models/TagEvent");
+const { getAssetTagIds } = require("../services/assetFilter");
 
 const router = express.Router();
 
-// Render health check. This endpoint does not depend on MongoDB so the
-// platform can verify that the HTTP server is reachable.
+// ASSET records are not RTLS tags for this application.
+function isAsset(item) {
+  const usageType = item?.usage_type ?? item?.usageType ?? item?.usage?.type;
+  return String(usageType ?? "").trim().toUpperCase() === "ASSET";
+}
+
+function filterAssets(data) {
+  // UNAI can wrap the actual tag array several levels deep (for example
+  // { result: { data: [...] } }). The old implementation only checked the
+  // first level, which is why ASSET records could still reach the frontend.
+  if (Array.isArray(data)) {
+    return data
+      .filter((item) => !isAsset(item))
+      .map((item) => filterAssets(item));
+  }
+
+  if (!data || typeof data !== "object") return data;
+
+  const result = {};
+  for (const [key, value] of Object.entries(data)) {
+    result[key] = Array.isArray(value) || (value && typeof value === "object")
+      ? filterAssets(value)
+      : value;
+  }
+  return result;
+}
+
+function countRecords(data) {
+  if (Array.isArray(data)) return data.length;
+  if (!data || typeof data !== "object") return 0;
+  return Object.values(data).reduce((total, value) => {
+    return total + (Array.isArray(value) || (value && typeof value === "object")
+      ? countRecords(value)
+      : 0);
+  }, 0);
+}
+
+function countAssets(data) {
+  if (Array.isArray(data)) {
+    return data.reduce((total, item) =>
+      total + (isAsset(item) ? 1 : countAssets(item)), 0);
+  }
+  if (!data || typeof data !== "object") return 0;
+  return Object.values(data).reduce((total, value) =>
+    total + (Array.isArray(value) || (value && typeof value === "object")
+      ? countAssets(value)
+      : 0), 0);
+}
+
 router.get("/health", (req, res) => {
   res.json({ ok: true, service: "unai-backend" });
 });
 
-// Home-page authentication: token generation is lazy and is NOT performed
-// during Node.js startup. The generated token stays in backend memory and is
-// reused by authenticated UNAI API/socket requests. The token is never sent
-// back to the browser.
+// Token generation is lazy: it happens only when the frontend explicitly
+// requests it, never during backend startup.
 router.post("/auth/token", async (req, res) => {
   try {
     await generateAccessToken();
@@ -52,8 +98,6 @@ function proxyGet(path, envName, errorMessage) {
   });
 }
 
-// Static RTLS data is cache-first. The first request populates MongoDB;
-// subsequent web requests read MongoDB and do not hit the RTLS API.
 function cachedProxyGet(path, type, envName, errorMessage) {
   router.get(path, async (req, res) => {
     try {
@@ -108,17 +152,121 @@ router.post("/sync-static-data", async (req, res) => {
 
 cachedProxyGet("/floors", "floor", "APIFLOOR_URL", "Failed to get floors");
 proxyGet("/anchor", "APIANCHOR_URL", "Failed to get anchors");
-proxyGet("/tag", "APITAG_URL", "Failed to get tags");
 
-// Home-page tag data comes directly from MongoDB.
-// For each tag, keep only its newest saved TagEvent and calculate its current
-// online/offline state from the same timeout used by the tag monitor.
+// UNAI /tag does not appear to expose a reliable server-side usage_type filter.
+// Therefore the backend fetches the endpoint once, immediately removes ASSET
+// records, and only then returns the result to the frontend.
+router.get("/tag", async (req, res) => {
+  try {
+    const data = await fetchFromApi(process.env.APITAG_URL, "Failed to get tags");
+
+    // The normal /api/tag response never exposes ASSET records. For the
+    // realtime denylist, the frontend can ask this same, already-deployed
+    // endpoint for only the Asset IDs. This avoids depending on a separate
+    // /api/tag-asset-ids route that may not exist on an older Render deploy.
+    if (String(req.query?.mode || "").toLowerCase() === "asset-ids") {
+      const assetIds = [];
+
+      function collectAssetIds(value) {
+        if (!value || typeof value !== "object") return;
+        if (Array.isArray(value)) {
+          value.forEach(collectAssetIds);
+          return;
+        }
+        if (isAsset(value)) {
+          const id = value.tagId ?? value.tag_id ?? value.tagID ?? value.id;
+          if (id !== undefined && id !== null) assetIds.push(String(id));
+        }
+        Object.values(value).forEach((child) => {
+          if (child && typeof child === "object") collectAssetIds(child);
+        });
+      }
+
+      collectAssetIds(data);
+      const uniqueIds = [...new Set(assetIds)];
+      console.log(`[UNAI TAG] Asset IDs requested: ${uniqueIds.length}`);
+      return res.json({ assetTagIds: uniqueIds });
+    }
+
+    const filtered = filterAssets(data);
+
+    const totalRecords = countRecords(data);
+    const assetRecords = countAssets(data);
+    const returnedRecords = countRecords(filtered);
+
+    console.log(
+      `[UNAI TAG] total=${totalRecords}, ` +
+      `excluded_asset=${assetRecords}, ` +
+      `returned=${returnedRecords}`
+    );
+
+    return res.json(filtered);
+  } catch (error) {
+    console.error("/api/tag error:", error);
+    return res.status(error.status || 500).json({
+      error: error.message || "Server error",
+      details: error.body || undefined,
+    });
+  }
+});
+
+// Backward-compatible Asset ID endpoint. Keep it for clients that already
+// use it, but new frontend code uses GET /api/tag?mode=asset-ids so Render
+// deployments only need the existing /api/tag route.
+router.get("/tag-asset-ids", async (req, res) => {
+  try {
+    const data = await fetchFromApi(process.env.APITAG_URL, "Failed to get tag metadata");
+    const assetIds = [];
+
+    function collect(value) {
+      if (!value || typeof value !== "object") return;
+      if (Array.isArray(value)) {
+        value.forEach(collect);
+        return;
+      }
+      if (isAsset(value)) {
+        const id = value.tagId ?? value.tag_id ?? value.tagID ?? value.id;
+        if (id !== undefined && id !== null) assetIds.push(String(id));
+      }
+      Object.values(value).forEach((child) => {
+        if (child && typeof child === "object") collect(child);
+      });
+    }
+
+    collect(data);
+    const uniqueIds = [...new Set(assetIds)];
+    console.log(`[UNAI TAG] Asset denylist endpoint: ${uniqueIds.length} Asset ID(s)`);
+    return res.json({ assetTagIds: uniqueIds });
+  } catch (error) {
+    console.error("/api/tag-asset-ids error:", error);
+    return res.status(error.status || 500).json({
+      error: error.message || "Failed to get Asset tag IDs",
+      details: error.body || undefined,
+    });
+  }
+});
+
+// Home-page tag data comes from MongoDB. Existing ASSET events are excluded
+// before grouping, so an old Asset event can never become the latest tag.
 router.get("/db-tags", async (req, res) => {
   try {
     const timeoutSeconds = Number(process.env.TAG_ALIVE_TIMEOUT_SECONDS) || 10;
     const timeoutDate = new Date(Date.now() - timeoutSeconds * 1000);
 
+    const assetTagIds = await getAssetTagIds();
+    const match = {
+      $nor: [
+        { "rawData.usage_type": { $regex: /^asset$/i } },
+        { "rawData.usageType": { $regex: /^asset$/i } },
+        { "rawData.usage.type": { $regex: /^asset$/i } },
+      ],
+    };
+    if (assetTagIds.size > 0) {
+      match.tagId = { $nin: [...assetTagIds] };
+    }
+
     const latest = await TagEvent.aggregate([
+      { $match: match },
       { $sort: { timestamp: -1 } },
       {
         $group: {
@@ -154,9 +302,19 @@ router.get("/db-tags", async (req, res) => {
     });
   }
 });
+
 cachedProxyGet("/zone", "zone", "APIZONE_URL", "Failed to get zones");
 cachedProxyGet("/v1/get_all_place", "place", "APIPLACE_URL", "Failed to get places");
 cachedProxyGet("/v1/get_all_building", "building", "APIBUILDING_URL", "Failed to get buildings");
+
+router.get("/socket-status", (req, res) => {
+  try {
+    const { getStatus } = require("../services/unaiSocketManager");
+    return res.json({ ok: true, ...getStatus() });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
 
 router.post("/socket-topic", async (req, res) => {
   try {
@@ -176,20 +334,19 @@ router.post("/socket-topic", async (req, res) => {
   }
 });
 
-// Socket.IO events received by the frontend are persisted through this API.
 router.use("/tag-events", tagEventsRouter);
 
-// Returns tags whose latest database activity is within the alive timeout.
 router.get("/active-tags", async (req, res) => {
   try {
     await refreshActiveTags();
+    const tags = getActiveTags({
+      buildingId: req.query.buildingId,
+      floorId: req.query.floorId,
+    });
     return res.json({
       ok: true,
       timeoutSeconds: Number(process.env.TAG_ALIVE_TIMEOUT_SECONDS) || 10,
-      tags: getActiveTags({
-        buildingId: req.query.buildingId,
-        floorId: req.query.floorId,
-      }),
+      tags,
     });
   } catch (error) {
     console.error("/api/active-tags error:", error);
