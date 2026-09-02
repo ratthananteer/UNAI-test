@@ -10,7 +10,7 @@ const { generateAccessToken } = require("../services/unaiAuth");
 const tagEventsRouter = require("./tagEvents");
 const { getActiveTags, refreshActiveTags } = require("../services/tagMonitor");
 const { getCachedOrFetch, refreshStaticData } = require("../services/staticDataCache");
-const TagEvent = require("../models/TagEvent");
+const TagLatest = require("../models/TagLatest");
 const { getAssetTagIds } = require("../services/assetFilter");
 
 const router = express.Router();
@@ -255,6 +255,7 @@ router.get("/db-tags", async (req, res) => {
 
     const assetTagIds = await getAssetTagIds();
     const match = {
+      isAsset: { $ne: true },
       $nor: [
         { "rawData.usage_type": { $regex: /^asset$/i } },
         { "rawData.usageType": { $regex: /^asset$/i } },
@@ -265,19 +266,24 @@ router.get("/db-tags", async (req, res) => {
       match.tagId = { $nin: [...assetTagIds] };
     }
 
-    const latest = await TagEvent.aggregate([
-      { $match: match },
-      { $sort: { timestamp: -1 } },
-      {
-        $group: {
-          _id: "$tagId",
-          latest: { $first: "$$ROOT" },
-        },
-      },
-      { $sort: { "latest.timestamp": -1 } },
-    ]);
+    const latest = await TagLatest.find(match)
+      .select({
+        _id: 0,
+        tagId: 1,
+        tagName: 1,
+        buildingId: 1,
+        floorId: 1,
+        groupId: 1,
+        groupName: 1,
+        x: 1,
+        y: 1,
+        z: 1,
+        timestamp: 1,
+      })
+      .sort({ timestamp: -1 })
+      .lean();
 
-    const tags = latest.map(({ latest: event }) => ({
+    const tags = latest.map((event) => ({
       id: event.tagId,
       tagId: event.tagId,
       name: event.tagName || `Tag ${event.tagId}`,

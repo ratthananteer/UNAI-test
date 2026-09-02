@@ -12,10 +12,9 @@ require("dotenv").config({
 });
 
 const { connectMongo } = require("./services/mongo.js");
+const { optimizeDatabase } = require("./services/dbOptimization.js");
 const { startTagMonitor } = require("./services/tagMonitor.js");
-const { start: startUnaiSocketCollector } = require("./services/unaiSocketManager.js");
-const { getCachedOrFetch } = require("./services/staticDataCache.js");
-const { fetchFromApi } = require("./services/unaiApi.js");
+
 // Static data is synchronized on demand from the Home page/API.
 // Do not authenticate with UNAI during backend startup.
 const express = require("express");
@@ -33,21 +32,9 @@ async function startServer() {
   try {
     await connectMongo();
 
+    // Ensure production indexes exist before starting high-frequency tag work.
+    await optimizeDatabase();
     startTagMonitor();
-
-    // History collection belongs to the backend, not to a browser page.
-    // Load floors from MongoDB (or fetch/cache them once), then keep one
-    // shared UNAI Socket.IO connection alive for all floors. TagEvent history
-    // therefore continues even when no frontend page is open.
-    try {
-      const floors = await getCachedOrFetch("floor", () =>
-        fetchFromApi(process.env.APIFLOOR_URL, "Failed to get floors"),
-      );
-      await startUnaiSocketCollector({ floors });
-      console.log(`[HistoryCollector] Started for ${Array.isArray(floors) ? floors.length : 0} floor(s)`);
-    } catch (error) {
-      console.error("[HistoryCollector] Startup failed:", error.message);
-    }
 
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`[Backend] Running on 0.0.0.0:${PORT}`);

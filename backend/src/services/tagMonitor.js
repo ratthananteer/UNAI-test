@@ -1,8 +1,10 @@
 // ACTIVE TAG MONITOR:
-// Periodically checks recent TagEvent records in MongoDB.
-// ASSET events are excluded from the active-tag cache.
+// Reads the latest snapshot for each tag from MongoDB.
+// TagEvent remains the historical append-only collection; TagLatest is the
+// optimized read model used for frequent ONLINE/OFFLINE checks.
 
-const TagEvent = require("../models/TagEvent");
+const TagLatest = require("../models/TagLatest");
+const { getAssetTagIds } = require("./assetFilter");
 
 let monitorTimer = null;
 let latestActiveTags = new Map();
@@ -22,32 +24,34 @@ function getIntervalMs() {
 
 async function refreshActiveTags() {
   const timeoutDate = new Date(Date.now() - getTimeoutMs());
+  const assetTagIds = await getAssetTagIds();
 
-  // Existing ASSET events may already be in MongoDB. Exclude them before
-  // grouping so an old Asset record can never become the latest tag position.
-  const latest = await TagEvent.aggregate([
-    {
-      $match: {
-        $nor: [
-          { "rawData.usage_type": { $regex: /^asset$/i } },
-          { "rawData.usageType": { $regex: /^asset$/i } },
-          { "rawData.usage.type": { $regex: /^asset$/i } },
-        ],
-      },
-    },
-    { $sort: { timestamp: -1 } },
-    {
-      $group: {
-        _id: "$tagId",
-        latest: { $first: "$$ROOT" },
-      },
-    },
-  ]);
+  const match = { isAsset: { $ne: true } };
+  if (assetTagIds.size > 0) {
+    match.tagId = { $nin: [...assetTagIds] };
+  }
+
+  // TagLatest contains one document per tag, so this query is proportional to
+  // the number of current tags rather than the full TagEvent history volume.
+  const latest = await TagLatest.find(match)
+    .select({
+      _id: 0,
+      tagId: 1,
+      buildingId: 1,
+      floorId: 1,
+      x: 1,
+      y: 1,
+      z: 1,
+      groupId: 1,
+      groupName: 1,
+      tagName: 1,
+      timestamp: 1,
+    })
+    .lean();
 
   const next = new Map();
 
-  for (const item of latest) {
-    const event = item.latest;
+  for (const event of latest) {
     const eventTime = new Date(event.timestamp).getTime();
     const isAlive = Number.isFinite(eventTime) && eventTime >= timeoutDate.getTime();
 
@@ -84,7 +88,7 @@ function startTagMonitor() {
   void run();
   monitorTimer = setInterval(() => void run(), getIntervalMs());
   console.log(
-    `[TagMonitor] Started: timeout=${getTimeoutMs() / 1000}s, interval=${getIntervalMs() / 1000}s`
+    `[TagMonitor] Started: timeout=${getTimeoutMs() / 1000}s, interval=${getIntervalMs() / 1000}s`,
   );
 }
 

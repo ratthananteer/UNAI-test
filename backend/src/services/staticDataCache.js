@@ -1,3 +1,9 @@
+// STATIC DATA CACHE SERVICE:
+// Keeps places/buildings/floors/zones in MongoDB.
+// It normalizes API response shapes, identifies records by external ID,
+// hashes each record to detect changes, and supports both cache-first reads
+// and explicit refresh/synchronization from the UNAI API.
+
 const crypto = require("crypto");
 const StaticData = require("../models/StaticData");
 const { fetchFromApi } = require("./unaiApi");
@@ -23,36 +29,48 @@ function idOf(item) {
 }
 
 async function syncType(type, apiPath) {
-  const remote = asArray(await unaiGet(apiPath));
+  const remote = asArray(await fetchFromApi(apiPath, `Failed to get ${type}`));
   let inserted = 0;
   let updated = 0;
 
-  for (const item of remote) {
-    const external_id = idOf(item);
-    if (!external_id) continue;
+  const normalized = remote
+    .map((item) => ({ item, external_id: idOf(item) }))
+    .filter(({ external_id }) => external_id);
 
-    const data_hash = hashData(item);
-    const existing = await StaticData.findOne({ type, external_id }).lean();
-
-    if (existing && existing.data_hash === data_hash) {
-      console.log(`[StaticData] ${type} ${external_id}: unchanged, using MongoDB`);
-      continue;
-    }
-
-    await StaticData.updateOne(
-      { type, external_id },
-      { $set: { type, external_id, data: item, data_hash, synced_at: new Date() } },
-      { upsert: true },
-    );
-
-    if (existing) {
-      updated += 1;
-      console.log(`[StaticData] ${type} ${external_id}: UPDATED in MongoDB`);
-    } else {
-      inserted += 1;
-      console.log(`[StaticData] ${type} ${external_id}: INSERTED into MongoDB`);
-    }
+  if (!normalized.length) {
+    console.log(`[StaticData] ${type}: remote=0 valid records`);
+    return { remote: remote.length, inserted: 0, updated: 0 };
   }
+
+  // Read existing hashes in one query instead of one findOne per record.
+  const existingRows = await StaticData.find({
+    type,
+    external_id: { $in: normalized.map(({ external_id }) => external_id) },
+  })
+    .select({ external_id: 1, data_hash: 1 })
+    .lean();
+  const existingById = new Map(existingRows.map((row) => [row.external_id, row.data_hash]));
+
+  const now = new Date();
+  const operations = [];
+  for (const { item, external_id } of normalized) {
+    const data_hash = hashData(item);
+    const previousHash = existingById.get(external_id);
+    if (previousHash === data_hash) continue;
+
+    operations.push({
+      updateOne: {
+        filter: { type, external_id },
+        update: { $set: { type, external_id, data: item, data_hash, synced_at: now } },
+        upsert: true,
+      },
+    });
+
+    if (previousHash === undefined) inserted += 1;
+    else updated += 1;
+  }
+
+  if (operations.length) await StaticData.bulkWrite(operations, { ordered: false });
 
   console.log(`[StaticData] ${type}: remote=${remote.length}, inserted=${inserted}, updated=${updated}`);
   return { remote: remote.length, inserted, updated };
@@ -76,7 +94,10 @@ async function syncStaticData() {
 }
 
 async function getCached(type) {
-  const rows = await StaticData.find({ type }).sort({ external_id: 1 }).lean();
+  const rows = await StaticData.find({ type })
+    .select({ _id: 0, data: 1 })
+    .sort({ external_id: 1 })
+    .lean();
   return rows.map((row) => row.data);
 }
 
@@ -93,15 +114,31 @@ async function getCachedOrFetch(type, fetcher) {
   const remote = asArray(await fetcher());
   let inserted = 0;
 
-  for (const item of remote) {
-    const external_id = idOf(item);
-    if (!external_id) continue;
-    await StaticData.updateOne(
-      { type, external_id },
-      { $set: { type, external_id, data: item, data_hash: hashData(item), synced_at: new Date() } },
-      { upsert: true },
-    );
-    inserted += 1;
+  const operations = remote
+    .map((item) => {
+      const external_id = idOf(item);
+      if (!external_id) return null;
+      return {
+        updateOne: {
+          filter: { type, external_id },
+          update: {
+            $set: {
+              type,
+              external_id,
+              data: item,
+              data_hash: hashData(item),
+              synced_at: new Date(),
+            },
+          },
+          upsert: true,
+        },
+      };
+    })
+    .filter(Boolean);
+
+  if (operations.length) {
+    const result = await StaticData.bulkWrite(operations, { ordered: false });
+    inserted = (result.upsertedCount ?? 0);
   }
 
   console.log(`[StaticData] ${type}: fetched=${remote.length}, inserted=${inserted}`);
@@ -115,29 +152,47 @@ async function refreshStaticData(type, fetcher) {
   let updated = 0;
   let unchanged = 0;
 
-  for (const item of remote) {
-    const external_id = idOf(item);
-    if (!external_id) continue;
-    const data_hash = hashData(item);
-    const existing = await StaticData.findOne({ type, external_id }).lean();
+  const normalized = remote
+    .map((item) => ({ item, external_id: idOf(item) }))
+    .filter(({ external_id }) => external_id);
 
-    if (existing && existing.data_hash === data_hash) {
+  const existingRows = normalized.length
+    ? await StaticData.find({
+        type,
+        external_id: { $in: normalized.map(({ external_id }) => external_id) },
+      })
+        .select({ external_id: 1, data_hash: 1 })
+        .lean()
+    : [];
+  const existingById = new Map(existingRows.map((row) => [row.external_id, row.data_hash]));
+  const now = new Date();
+  const operations = [];
+
+  for (const { item, external_id } of normalized) {
+    const data_hash = hashData(item);
+    const previousHash = existingById.get(external_id);
+
+    if (previousHash === data_hash) {
       unchanged += 1;
       continue;
     }
 
-    await StaticData.updateOne(
-      { type, external_id },
-      { $set: { type, external_id, data: item, data_hash, synced_at: new Date() } },
-      { upsert: true },
-    );
+    operations.push({
+      updateOne: {
+        filter: { type, external_id },
+        update: { $set: { type, external_id, data: item, data_hash, synced_at: now } },
+        upsert: true,
+      },
+    });
 
-    if (existing) updated += 1;
-    else inserted += 1;
+    if (previousHash === undefined) inserted += 1;
+    else updated += 1;
   }
+
+  if (operations.length) await StaticData.bulkWrite(operations, { ordered: false });
 
   console.log(`[StaticData] ${type}: remote=${remote.length}, inserted=${inserted}, updated=${updated}, unchanged=${unchanged}`);
   return { remote: remote.length, inserted, updated, unchanged };
 }
 
-module.exports = { getCachedOrFetch, refreshStaticData, syncStaticData };
+module.exports = { getCached, getCachedOrFetch, refreshStaticData, syncStaticData };

@@ -309,8 +309,12 @@ export default function TagHistoryPage() {
 
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-      const data = await response.json();
-      const loaded = Array.isArray(data) ? (data as HistoryEvent[]) : [];
+      const data: unknown = await response.json();
+      const loaded = Array.isArray(data)
+        ? (data as HistoryEvent[])
+        : data && typeof data === "object" && Array.isArray((data as { items?: unknown }).items)
+          ? ((data as { items: HistoryEvent[] }).items)
+          : [];
 
       loaded.sort(
         (a, b) =>

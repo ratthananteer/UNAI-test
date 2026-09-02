@@ -5,6 +5,7 @@
 
 const express = require("express");
 const TagEvent = require("../models/TagEvent");
+const TagLatest = require("../models/TagLatest");
 const { getAssetTagIds, isAssetOrKnownAsset } = require("../services/assetFilter");
 
 const router = express.Router();
@@ -70,6 +71,7 @@ router.post("/", async (req, res) => {
         groupName: item.groupName == null ? null : String(item.groupName),
         tagName: item.tagName == null ? null : String(item.tagName),
         event: String(item.event || "position_update"),
+        isAsset: false,
         x,
         y,
         z: Number.isFinite(Number(item.z)) ? Number(item.z) : null,
@@ -89,6 +91,62 @@ router.post("/", async (req, res) => {
     }
 
     const events = await TagEvent.insertMany(documents, { ordered: false });
+
+    // Maintain one latest snapshot per tag. This turns active-tag reads into
+    // a small indexed query instead of an aggregation over TagEvent history.
+    const latestByTag = new Map();
+    for (const document of documents) {
+      const previous = latestByTag.get(document.tagId);
+      if (!previous || document.timestamp > previous.timestamp) {
+        latestByTag.set(document.tagId, document);
+      }
+    }
+
+    if (latestByTag.size) {
+      const existing = await TagLatest.find({
+        tagId: { $in: [...latestByTag.keys()] },
+      })
+        .select({ tagId: 1, timestamp: 1 })
+        .lean();
+      const existingByTag = new Map(existing.map((row) => [row.tagId, row.timestamp]));
+
+      const latestOperations = [];
+      for (const [id, document] of latestByTag) {
+        const existingTimestamp = existingByTag.get(id);
+        if (existingTimestamp && new Date(existingTimestamp).getTime() >= document.timestamp.getTime()) {
+          continue;
+        }
+
+        latestOperations.push({
+          updateOne: {
+            filter: { tagId: id },
+            update: {
+              $set: {
+                tagId: id,
+                buildingId: document.buildingId,
+                floorId: document.floorId,
+                groupId: document.groupId,
+                groupName: document.groupName,
+                tagName: document.tagName,
+                status: document.status || "ALIVE",
+                movementStatus: document.movementStatus || "UNKNOWN",
+                isAsset: false,
+                x: document.x,
+                y: document.y,
+                z: document.z,
+                timestamp: document.timestamp,
+                receivedAt: document.receivedAt || new Date(),
+              },
+            },
+            upsert: true,
+          },
+        });
+      }
+
+      if (latestOperations.length) {
+        await TagLatest.bulkWrite(latestOperations, { ordered: false });
+      }
+    }
 
     console.log(
       `[TagEvent] Saved ${events.length} event(s), ` +
@@ -144,15 +202,41 @@ router.get("/", async (req, res) => {
 
     const requestedLimit = Number(req.query.limit);
     const limit = Number.isFinite(requestedLimit)
-      ? Math.min(Math.max(requestedLimit, 1), 5000)
+      ? Math.min(Math.max(Math.floor(requestedLimit), 1), 5000)
       : 500;
+    const requestedSkip = Number(req.query.skip);
+    const skip = Number.isFinite(requestedSkip)
+      ? Math.min(Math.max(Math.floor(requestedSkip), 0), 1_000_000)
+      : 0;
 
     const events = await TagEvent.find(filter)
       .sort({ timestamp: -1 })
+      .skip(skip)
       .limit(limit)
+      .select({
+        tagId: 1,
+        buildingId: 1,
+        floorId: 1,
+        groupId: 1,
+        groupName: 1,
+        tagName: 1,
+        event: 1,
+        status: 1,
+        movementStatus: 1,
+        x: 1,
+        y: 1,
+        z: 1,
+        timestamp: 1,
+        receivedAt: 1,
+      })
       .lean();
 
-    return res.json(events);
+    return res.json({
+      items: events,
+      limit,
+      skip,
+      hasMore: events.length === limit,
+    });
   } catch (error) {
     console.error("[TagEvent] query failed:", error);
     return res.status(500).json({
