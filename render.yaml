@@ -20,6 +20,8 @@ services:
         value: "10"
       - key: TAG_SCREEN_INTERVAL_SECONDS
         value: "2"
+      - key: ADMIN_CLEANUP_SECRET
+        sync: false
 
   - type: web
     name: unai-frontend
