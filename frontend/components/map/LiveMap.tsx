@@ -214,10 +214,17 @@ export default function LiveMap({
   const [socketInfo, setSocketInfo] = useState("Loading realtime tag data...");
   const [lastUpdate, setLastUpdate] = useState<string | null>(null);
   const [messageCount, setMessageCount] = useState(0);
-  const [socketTagGroups, setSocketTagGroups] = useState<TagGroup[]>([]);
+  const messageCountRef = useRef(0);
+  const messageCountTimerRef = useRef<number | null>(null);
   const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
   const [activeTagIds, setActiveTagIds] = useState<Set<string>>(new Set());
   const [activeTagCheckReady, setActiveTagCheckReady] = useState(false);
+  // Socket packets can arrive much faster than React needs to render. Keep a
+  // compact signature per tag so duplicate/unchanged packets do not rebuild
+  // the entire map, including the SVG zone layer.
+  const tagRenderSignatureRef = useRef<Map<string, string>>(new Map());
+  const pendingTagUpdatesRef = useRef<Map<string, Tag>>(new Map());
+  const tagFlushFrameRef = useRef<number | null>(null);
   const assetTagIdsRef = useRef<Set<string>>(new Set());
   const assetTagIdsReadyRef = useRef(false);
   // Do not accept backend active-tag data until the authoritative Asset ID
@@ -360,31 +367,20 @@ export default function LiveMap({
         const active = activeRaw.filter((tag): tag is Record<string, unknown> => !isAssetTag(tag));
         const ids = new Set<string>();
 
-        setTags((current) => {
-          const next = [...current];
-          for (const raw of active) {
-            const tagId = raw.tagId ?? raw.id;
-            if (tagId === undefined || tagId === null) continue;
-            const id = String(tagId);
-            if (assetTagIdsRef.current.has(id)) continue;
-            ids.add(id);
+        for (const raw of active) {
+          const tagId = raw.tagId ?? raw.id;
+          if (tagId === undefined || tagId === null) continue;
+          const id = String(tagId);
+          if (!assetTagIdsRef.current.has(id)) ids.add(id);
+        }
 
-            const normalized: Tag = {
-              ...raw,
-              id: tagId as number | string,
-              tagId: tagId as number | string,
-              floor_id: (raw.floorId ?? floor.id) as number | string,
-              x: numberValue(raw.x),
-              y: numberValue(raw.y),
-            };
-            const index = next.findIndex((tag) => sameId(tag.id ?? tag.tagId ?? tag.tag_id, tagId));
-            if (index >= 0) next[index] = { ...next[index], ...normalized };
-            else next.push(normalized);
-          }
-          return next.filter((tag) => !isAssetTag(tag) && !assetTagIdsRef.current.has(String(tag.id ?? tag.tagId ?? tag.tag_id)));
+        // The active-tags endpoint is status-only here. Do not overwrite
+        // socket positions with its (older) coordinates; doing so every 2s
+        // makes markers visibly jump.
+        setActiveTagIds((current) => {
+          if (current.size === ids.size && [...current].every((id) => ids.has(id))) return current;
+          return ids;
         });
-
-        if (active.length > 0) setActiveTagIds(ids);
         setActiveTagCheckReady(true);
       } catch (error) {
         if (!cancelled) console.error("[TagMonitor] Active tag check failed:", error);
@@ -394,7 +390,7 @@ export default function LiveMap({
     void checkActiveTags();
     activePollTimer = window.setInterval(() => {
       void checkActiveTags();
-    }, 2000);
+    }, 10000);
 
     return () => {
       cancelled = true;
@@ -477,34 +473,77 @@ export default function LiveMap({
           const updates = findTagUpdates(payload, eventName, floor.id, assetTagIdsRef.current);
           if (!updates.length) return;
 
-          console.log(`[UNAI RTLS] ${eventName}:`, updates);
-          setMessageCount((count) => count + 1);
-
-          setTags((current) => {
-            const next = [...current];
-            for (const update of updates) {
-              const tagId = update.id ?? update.tagId ?? update.tag_id;
-              if (tagId === undefined || tagId === null) continue;
-              if (isAssetTag(update) || assetTagIdsRef.current.has(String(tagId))) continue;
-              const index = next.findIndex((tag) => sameId(tag.id ?? tag.tagId ?? tag.tag_id, tagId));
-              if (index >= 0) next[index] = { ...next[index], ...update };
-              else next.push(update);
-            }
-            return next.filter((tag) => !isAssetTag(tag) && !assetTagIdsRef.current.has(String(tag.id ?? tag.tagId ?? tag.tag_id)));
+          // Socket traffic can be much faster than React rendering. Keep only
+          // the newest position for each tag and flush once per animation frame.
+          // This prevents a burst of socket packets from rebuilding the entire
+          // tag array repeatedly and keeps marker motion visually smooth.
+          const changedUpdates = updates.filter((update) => {
+            const tagId = update.id ?? update.tagId ?? update.tag_id;
+            if (tagId == null || isAssetTag(update) || assetTagIdsRef.current.has(String(tagId))) return false;
+            const id = String(tagId);
+            const signature = [
+              update.x ?? "",
+              update.y ?? "",
+              update.z ?? "",
+              update.floor_id ?? update.floorId ?? floor.id,
+              update.status ?? "",
+            ].join("|");
+            if (tagRenderSignatureRef.current.get(id) === signature) return false;
+            tagRenderSignatureRef.current.set(id, signature);
+            return true;
           });
 
-          setActiveTagIds((current) => {
-            const next = new Set(current);
-            updates.forEach((tag) => {
-              const id = tag.id ?? tag.tagId ?? tag.tag_id;
-              if (id !== undefined && id !== null && !assetTagIdsRef.current.has(String(id))) next.add(String(id));
+          if (!changedUpdates.length) return;
+
+          changedUpdates.forEach((update) => {
+            const id = String(update.id ?? update.tagId ?? update.tag_id);
+            pendingTagUpdatesRef.current.set(id, update);
+          });
+
+          // History persistence remains immediate so a UI performance
+          // optimization never silently drops historical socket positions.
+          void saveTagEvents(changedUpdates, eventName);
+
+          if (tagFlushFrameRef.current === null) {
+            tagFlushFrameRef.current = window.requestAnimationFrame(() => {
+              tagFlushFrameRef.current = null;
+              const batched = Array.from(pendingTagUpdatesRef.current.values());
+              pendingTagUpdatesRef.current.clear();
+              if (!batched.length) return;
+
+              setTags((current) => {
+                const next = [...current];
+                for (const update of batched) {
+                  const tagId = update.id ?? update.tagId ?? update.tag_id;
+                  if (tagId === undefined || tagId === null) continue;
+                  const index = next.findIndex((tag) => sameId(tag.id ?? tag.tagId ?? tag.tag_id, tagId));
+                  if (index >= 0) next[index] = { ...next[index], ...update };
+                  else next.push(update);
+                }
+                return next.filter((tag) => !isAssetTag(tag) && !assetTagIdsRef.current.has(String(tag.id ?? tag.tagId ?? tag.tag_id)));
+              });
+
+              setActiveTagIds((current) => {
+                const next = new Set(current);
+                batched.forEach((tag) => {
+                  const id = tag.id ?? tag.tagId ?? tag.tag_id;
+                  if (id !== undefined && id !== null && !assetTagIdsRef.current.has(String(id))) next.add(String(id));
+                });
+                return next;
+              });
+
+              addTimelineEvents(batched, eventName);
+              setLastUpdate(new Date().toLocaleTimeString());
             });
-            return next;
-          });
+          }
 
-          addTimelineEvents(updates, eventName);
-          void saveTagEvents(updates, eventName);
-          setLastUpdate(new Date().toLocaleTimeString());
+          messageCountRef.current += 1;
+          if (messageCountTimerRef.current === null) {
+            messageCountTimerRef.current = window.setTimeout(() => {
+              messageCountTimerRef.current = null;
+              setMessageCount(messageCountRef.current);
+            }, 500);
+          }
         },
       });
 
@@ -525,37 +564,30 @@ export default function LiveMap({
           if (!active.length) return;
 
           const ids = new Set<string>();
-          setTags((current) => {
-            const next = [...current];
-            for (const item of active) {
-              const tagId = item.tagId ?? item.id;
-              if (tagId == null || assetTagIdsRef.current.has(String(tagId))) continue;
+          for (const item of active) {
+            const tagId = item.tagId ?? item.id;
+            if (tagId != null && !assetTagIdsRef.current.has(String(tagId))) {
               ids.add(String(tagId));
-              const normalized: Tag = {
-                ...item,
-                id: tagId as number | string,
-                tagId: tagId as number | string,
-                floor_id: (item.floorId ?? floor.id) as number | string,
-                x: numberValue(item.x),
-                y: numberValue(item.y),
-              };
-              const index = next.findIndex((tag) => sameId(tag.id ?? tag.tagId ?? tag.tag_id, tagId));
-              if (index >= 0) next[index] = { ...next[index], ...normalized };
-              else next.push(normalized);
             }
-            return next.filter((tag) => !isAssetTag(tag) && !assetTagIdsRef.current.has(String(tag.id ?? tag.tagId ?? tag.tag_id)));
+          }
+          // Polling supplies liveness only. Socket remains authoritative for
+          // coordinates, so this cannot move a marker backwards.
+          setActiveTagIds((current) => {
+            if (current.size === ids.size && [...current].every((id) => ids.has(id))) return current;
+            return ids;
           });
-          setActiveTagIds(ids);
-          setLastUpdate(new Date().toLocaleTimeString());
         } catch (error) {
           if (!cancelled) console.error("[UNAI RTLS] Backend realtime check failed:", error);
         }
       };
 
       void pollBackend();
+      // Liveness is not a render loop. Ten seconds is enough for the
+      // TagMonitor timeout while keeping the map free from periodic state
+      // churn. Socket packets remain the source of coordinates.
       backendPollTimer = window.setInterval(() => {
         void pollBackend();
-      }, 2000);
+      }, 10000);
     }
 
     void startRealtime();
@@ -563,6 +595,15 @@ export default function LiveMap({
     return () => {
       cancelled = true;
       assetTagIdsReadyRef.current = false;
+      pendingTagUpdatesRef.current.clear();
+      if (tagFlushFrameRef.current !== null) {
+        window.cancelAnimationFrame(tagFlushFrameRef.current);
+        tagFlushFrameRef.current = null;
+      }
+      if (messageCountTimerRef.current !== null) {
+        window.clearTimeout(messageCountTimerRef.current);
+        messageCountTimerRef.current = null;
+      }
       setActiveTagCheckReady(false);
       if (backendPollTimer !== null) {
         window.clearInterval(backendPollTimer);
@@ -575,6 +616,14 @@ export default function LiveMap({
     };
   }, [placeId, buildingId, floor.id]);
 
+  const stableZones = useMemo(
+    () => zones.map((zone) => ({
+      ...zone,
+      parsedPolygon: parsePolygon(zone.polygon_data),
+    })),
+    [zones],
+  );
+
   const visibleTags = useMemo(() => {
     if (!activeTagCheckReady) return [];
     const filter = tagIdFilter.trim();
@@ -586,9 +635,7 @@ export default function LiveMap({
     return activeTags.filter((tag) => String(tag.id ?? tag.tagId ?? tag.tag_id ?? "") === filter);
   }, [tags, activeTagIds, activeTagCheckReady, tagIdFilter]);
 
-  useEffect(() => {
-    setSocketTagGroups(buildTagGroups(visibleTags));
-  }, [visibleTags]);
+  const socketTagGroups = useMemo(() => buildTagGroups(visibleTags), [visibleTags]);
 
   const statusClass = useMemo(() => {
     if (socketState === "connected") return "bg-emerald-100 text-emerald-700";
@@ -623,8 +670,8 @@ export default function LiveMap({
             <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-400">No floor map image</div>
           )}
 
-          {zones.map((zone) => {
-            const rawPolygon = parsePolygon(zone.polygon_data);
+          {stableZones.map((zone) => {
+            const rawPolygon = zone.parsedPolygon;
             if (rawPolygon.length < 3) return null;
             const points = rawPolygon
               .map(([x, y]) => {
@@ -701,7 +748,7 @@ export default function LiveMap({
                 type="button"
                 onClick={() => onTagSelect?.(tag)}
                 title={`${tagName} · X: ${realX} · Y: ${realY}`}
-                className="absolute z-10 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center transition-[left,top] duration-150"
+                className="absolute z-10 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center transition-[left,top] duration-75 will-change-[left,top]"
                 style={{ left: `${(px / width) * 100}%`, top: `${(py / height) * 100}%` }}
               >
                 <div className="flex h-8 min-w-8 items-center justify-center rounded-full border-2 border-white bg-sky-600 px-2 text-[9px] font-bold text-white shadow-lg">T</div>
