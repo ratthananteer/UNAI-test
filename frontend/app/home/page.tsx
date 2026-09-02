@@ -282,7 +282,7 @@ export default function Home() {
           {panelVisibility.tags && (
             <DataListCard
               title="Tags"
-              subtitle="/api/tag"
+              subtitle="/api/db-tags"
               icon="T"
               iconClass="bg-sky-50 text-sky-600"
               items={tags.map((tag, index) => ({
@@ -389,7 +389,7 @@ export default function Home() {
                 <ApiBadge text="GET /api/v1/get_all_place" />
                 <ApiBadge text="GET /api/v1/get_all_building" />
                 <ApiBadge text="GET /api/anchor" />
-                <ApiBadge text="GET /api/tag" />
+                <ApiBadge text="GET /api/db-tags" />
               </div>
             </div>
           </section>

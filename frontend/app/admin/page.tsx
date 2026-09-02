@@ -33,6 +33,11 @@ export default function AdminPage() {
   const [cleanupLoading, setCleanupLoading] = useState(false);
   const [cleanupMessage, setCleanupMessage] = useState("");
   const [cleanupError, setCleanupError] = useState("");
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
 
   useEffect(() => {
     setRole(localStorage.getItem("userRole"));
@@ -80,6 +85,24 @@ export default function AdminPage() {
       api: visible,
     });
   };
+
+  // Some browser extensions inject attributes such as `fdprocessedid` into
+  // form controls before React hydrates. Do not SSR the interactive admin
+  // controls; render the same lightweight shell on server and first client
+  // render, then mount the controls after hydration.
+  if (!mounted) {
+    return (
+      <main className="min-h-screen bg-slate-50 text-slate-900">
+        <div className="mx-auto max-w-7xl px-5 py-6 sm:px-8 lg:px-10">
+          <section className="rounded-3xl border border-slate-800 bg-slate-100 p-6 shadow-xl">
+            <div className="h-4 w-40 animate-pulse rounded bg-slate-300" />
+            <div className="mt-4 h-10 w-80 animate-pulse rounded bg-slate-200" />
+            <div className="mt-3 h-4 w-full max-w-2xl animate-pulse rounded bg-slate-200" />
+          </section>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="min-h-screen bg-slate-50 text-slate-900">
