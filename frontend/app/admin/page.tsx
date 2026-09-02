@@ -27,6 +27,12 @@ export default function AdminPage() {
   const [panels, setPanels] = useState<PanelSettings>(DEFAULT_PANELS);
   const [saved, setSaved] = useState(false);
   const [role, setRole] = useState<string | null>(null);
+  const [cleanupSecret, setCleanupSecret] = useState("");
+  const [cleanupCount, setCleanupCount] = useState<number | null>(null);
+  const [cleanupPreview, setCleanupPreview] = useState<number | null>(null);
+  const [cleanupLoading, setCleanupLoading] = useState(false);
+  const [cleanupMessage, setCleanupMessage] = useState("");
+  const [cleanupError, setCleanupError] = useState("");
 
   useEffect(() => {
     setRole(localStorage.getItem("userRole"));
@@ -76,9 +82,9 @@ export default function AdminPage() {
   };
 
   return (
-    <main className="min-h-screen bg-slate-100 text-slate-950">
+    <main className="min-h-screen bg-slate-950 text-slate-100">
       <div className="mx-auto max-w-7xl px-5 py-6 sm:px-8 lg:px-10">
-        <header className="mb-8 flex flex-col gap-5 rounded-3xl border border-slate-900 bg-slate-100 p-6 shadow-xl md:flex-row md:items-center md:justify-between">
+        <header className="mb-8 flex flex-col gap-5 rounded-3xl border border-slate-800 bg-slate-900 p-6 shadow-xl md:flex-row md:items-center md:justify-between">
           <div>
             <div className="mb-2 flex items-center gap-2 text-xs font-bold uppercase tracking-[0.2em] text-cyan-400">
               <span className="h-2 w-2 rounded-full bg-emerald-400" />
@@ -109,7 +115,7 @@ export default function AdminPage() {
         </header>
 
         {role !== null && role !== "admin" && (
-          <div className="mb-6 rounded-2xl border border-amber-700/50 bg-amber-100 px-5 py-4 text-sm text-amber-200">
+          <div className="mb-6 rounded-2xl border border-amber-700/50 bg-amber-950/40 px-5 py-4 text-sm text-amber-200">
             This page is currently a frontend demo control panel. The role is stored in
             localStorage and is not server-side authentication.
           </div>
@@ -122,8 +128,8 @@ export default function AdminPage() {
           <Metric title="Mode" value="Admin" detail="configuration only" />
         </section>
 
-        <section className="mt-6 overflow-hidden rounded-3xl border border-slate-900 bg-slate-100 shadow-xl">
-          <div className="border-b border-slate-900 p-6">
+        <section className="mt-6 overflow-hidden rounded-3xl border border-slate-800 bg-slate-900 shadow-xl">
+          <div className="border-b border-slate-800 p-6">
             <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <p className="text-xs font-bold uppercase tracking-wider text-cyan-400">
@@ -161,7 +167,7 @@ export default function AdminPage() {
             </div>
           </div>
 
-          <div className="grid gap-px bg-slate-100 md:grid-cols-2 lg:grid-cols-3">
+          <div className="grid gap-px bg-slate-800 md:grid-cols-2 lg:grid-cols-3">
             {(Object.keys(PANEL_INFO) as PanelKey[]).map((key) => {
               const info = PANEL_INFO[key];
               const enabled = panels[key];
@@ -172,10 +178,10 @@ export default function AdminPage() {
                   type="button"
                   onClick={() => toggle(key)}
                   aria-pressed={enabled}
-                  className="bg-slate-120 p-5 text-left transition hover:bg-slate-200"
+                  className="bg-slate-900 p-5 text-left transition hover:bg-slate-850"
                 >
                   <div className="flex items-start justify-between gap-4">
-                    <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-400 text-cyan-400">
+                    <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-800 text-cyan-400">
                       {info.icon}
                     </div>
                     <span
@@ -207,7 +213,7 @@ export default function AdminPage() {
             })}
           </div>
 
-          <div className="flex items-center justify-between border-t border-slate-100 px-6 py-4">
+          <div className="flex items-center justify-between border-t border-slate-800 px-6 py-4">
             <span className="text-xs text-slate-500">
               Settings key: <code className="text-slate-400">adminPanelVisibility</code>
             </span>
@@ -217,6 +223,140 @@ export default function AdminPage() {
               </span>
             )}
           </div>
+        </section>
+
+        <section className="mt-6 overflow-hidden rounded-3xl border border-rose-900/60 bg-slate-900 shadow-xl">
+          <div className="border-b border-rose-900/50 bg-rose-950/20 p-6">
+            <p className="text-xs font-bold uppercase tracking-wider text-rose-400">Database maintenance</p>
+            <h2 className="mt-1 text-xl font-bold text-white">Tag history cleanup</h2>
+            <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-400">
+              Permanently delete TagEvent history received more than 30 minutes ago. TagLatest is preserved, so current tag status and locations are not deleted.
+            </p>
+          </div>
+
+          <div className="grid gap-5 p-6 lg:grid-cols-[1fr_auto] lg:items-end">
+            <div>
+              <label htmlFor="admin-cleanup-secret" className="text-sm font-semibold text-slate-200">
+                Admin cleanup secret
+              </label>
+              <input
+                id="admin-cleanup-secret"
+                type="password"
+                value={cleanupSecret}
+                onChange={(event) => {
+                  setCleanupSecret(event.target.value);
+                  setCleanupError("");
+                  setCleanupMessage("");
+                }}
+                placeholder="Enter ADMIN_CLEANUP_SECRET"
+                autoComplete="off"
+                className="mt-2 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-600 focus:border-rose-500 focus:ring-2 focus:ring-rose-500/20"
+              />
+              <p className="mt-2 text-xs text-slate-500">
+                The secret is kept only in this page's memory and is sent in the request header. It is not saved to localStorage.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap gap-2 lg:justify-end">
+              <button
+                type="button"
+                disabled={cleanupLoading || !cleanupSecret.trim()}
+                onClick={async () => {
+                  setCleanupLoading(true);
+                  setCleanupError("");
+                  setCleanupMessage("");
+                  setCleanupCount(null);
+                  try {
+                    const response = await fetch("/api/admin/tag-events/cleanup-preview", {
+                      headers: { "x-admin-cleanup-secret": cleanupSecret.trim() },
+                      cache: "no-store",
+                    });
+                    const data: unknown = await response.json().catch(() => null);
+                    if (!response.ok) {
+                      const message = data && typeof data === "object" && "error" in data
+                        ? String((data as { error?: unknown }).error ?? `HTTP ${response.status}`)
+                        : `HTTP ${response.status}`;
+                      throw new Error(message);
+                    }
+                    const count = data && typeof data === "object" && "eligibleCount" in data
+                      ? Number((data as { eligibleCount?: unknown }).eligibleCount)
+                      : 0;
+                    setCleanupPreview(Number.isFinite(count) ? count : 0);
+                    setCleanupMessage("Preview updated. No data was deleted.");
+                  } catch (error) {
+                    setCleanupError(error instanceof Error ? error.message : String(error));
+                  } finally {
+                    setCleanupLoading(false);
+                  }
+                }}
+                className="rounded-xl border border-slate-700 bg-slate-800 px-4 py-3 text-sm font-semibold text-slate-200 hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Preview
+              </button>
+              <button
+                type="button"
+                disabled={cleanupLoading || !cleanupSecret.trim()}
+                onClick={async () => {
+                  const confirmed = window.confirm(
+                    "Delete all TagEvent records received more than 30 minutes ago? This cannot be undone. TagLatest will be preserved.",
+                  );
+                  if (!confirmed) return;
+
+                  setCleanupLoading(true);
+                  setCleanupError("");
+                  setCleanupMessage("");
+                  setCleanupCount(null);
+                  try {
+                    const response = await fetch("/api/admin/tag-events/cleanup", {
+                      method: "POST",
+                      headers: { "x-admin-cleanup-secret": cleanupSecret.trim() },
+                    });
+                    const data: unknown = await response.json().catch(() => null);
+                    if (!response.ok) {
+                      const message = data && typeof data === "object" && "error" in data
+                        ? String((data as { error?: unknown }).error ?? `HTTP ${response.status}`)
+                        : `HTTP ${response.status}`;
+                      throw new Error(message);
+                    }
+                    const count = data && typeof data === "object" && "deletedCount" in data
+                      ? Number((data as { deletedCount?: unknown }).deletedCount)
+                      : 0;
+                    setCleanupCount(Number.isFinite(count) ? count : 0);
+                    setCleanupPreview(0);
+                    setCleanupMessage("Cleanup completed successfully.");
+                  } catch (error) {
+                    setCleanupError(error instanceof Error ? error.message : String(error));
+                  } finally {
+                    setCleanupLoading(false);
+                  }
+                }}
+                className="rounded-xl bg-rose-600 px-4 py-3 text-sm font-bold text-white hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {cleanupLoading ? "Working..." : "Delete >30 min"}
+              </button>
+            </div>
+          </div>
+
+          <div className="grid gap-3 border-t border-slate-800 bg-slate-950/40 p-6 sm:grid-cols-3">
+            <div>
+              <p className="text-xs uppercase tracking-wider text-slate-500">Retention</p>
+              <p className="mt-1 text-lg font-bold text-white">30 minutes</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-wider text-slate-500">Eligible now</p>
+              <p className="mt-1 text-lg font-bold text-amber-300">{cleanupPreview === null ? "—" : cleanupPreview}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-wider text-slate-500">Last deleted</p>
+              <p className="mt-1 text-lg font-bold text-rose-300">{cleanupCount === null ? "—" : cleanupCount}</p>
+            </div>
+          </div>
+
+          {(cleanupMessage || cleanupError) && (
+            <div className={`border-t px-6 py-4 text-sm ${cleanupError ? "border-rose-900/50 bg-rose-950/20 text-rose-300" : "border-emerald-900/50 bg-emerald-950/20 text-emerald-300"}`}>
+              {cleanupError || cleanupMessage}
+            </div>
+          )}
         </section>
 
         <section className="mt-6 grid gap-4 lg:grid-cols-3">
@@ -248,9 +388,9 @@ function Metric({
   detail: string;
 }) {
   return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-100 p-5 shadow-lg">
+    <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5 shadow-lg">
       <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{title}</p>
-      <p className="mt-2 text-3xl font-bold text-black">{value}</p>
+      <p className="mt-2 text-3xl font-bold text-white">{value}</p>
       <p className="mt-1 text-xs text-slate-500">{detail}</p>
     </div>
   );
@@ -258,8 +398,8 @@ function Metric({
 
 function InfoCard({ title, text }: { title: string; text: string }) {
   return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-100 p-5">
-      <h3 className="font-semibold text-slate-900">{title}</h3>
+    <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5">
+      <h3 className="font-semibold text-slate-200">{title}</h3>
       <p className="mt-2 text-sm leading-6 text-slate-500">{text}</p>
     </div>
   );
