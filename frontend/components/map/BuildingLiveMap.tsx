@@ -17,6 +17,25 @@ import LiveMap, { type LiveMapTag } from "./LiveMap";
 
 type Item = Record<string, unknown>;
 
+type GeofenceStatus = {
+  tagId: string;
+  zoneId: string;
+  zoneName?: string | null;
+  status: "INSIDE" | "OUTSIDE";
+  enteredAt?: string | null;
+  lastSeenAt?: string | null;
+  lastX?: number | null;
+  lastY?: number | null;
+};
+
+type GeofenceEvent = {
+  tagId: string;
+  zoneId: string;
+  zoneName?: string | null;
+  event: "ENTER" | "EXIT";
+  timestamp: string;
+};
+
 function idOf(value: unknown): string | number | undefined {
   return typeof value === "string" || typeof value === "number" ? value : undefined;
 }
@@ -75,6 +94,7 @@ export default function BuildingLiveMap({
   const [followedTagId, setFollowedTagId] = useState("");
   const [userSearch, setUserSearch] = useState("");
   const [selectedUserTagId, setSelectedUserTagId] = useState("");
+  const [geofenceStatus, setGeofenceStatus] = useState<GeofenceStatus[]>([]);
 
   const getUserName = (tag: Item): string => {
     const first = str(tag.firstname ?? tag.first_name ?? tag.firstName, "").trim();
@@ -99,6 +119,40 @@ export default function BuildingLiveMap({
     if (!selectedUserTagId) return undefined;
     return tags.find((tag: Item) => String(tag.id ?? tag.tagId ?? tag.tag_id) === selectedUserTagId);
   }, [tags, selectedUserTagId]);
+
+  const selectedUserZones = useMemo(
+    () => geofenceStatus.filter((item) => item.tagId === selectedUserTagId && item.status === "INSIDE"),
+    [geofenceStatus, selectedUserTagId],
+  );
+
+  useEffect(() => {
+    if (selectedFloorId === undefined) return;
+    let cancelled = false;
+    let timer: number | null = null;
+
+    async function loadGeofence(): Promise<void> {
+      try {
+        const query = `buildingId=${encodeURIComponent(String(buildingId))}&floorId=${encodeURIComponent(String(selectedFloorId))}`;
+        const statusResponse = await fetch(`/api/geofence/status?${query}`, { cache: "no-store" });
+        if (!statusResponse.ok || cancelled) return;
+        const statusData: unknown = await statusResponse.json();
+        if (cancelled) return;
+        const statusItems = statusData && typeof statusData === "object" && Array.isArray((statusData as { items?: unknown }).items)
+          ? (statusData as { items: GeofenceStatus[] }).items
+          : [];
+        setGeofenceStatus(statusItems);
+      } catch (error) {
+        if (!cancelled) console.error("[Geofence] UI load failed:", error);
+      }
+    }
+
+    void loadGeofence();
+    timer = window.setInterval(() => void loadGeofence(), 2000);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [buildingId, selectedFloorId]);
 
   const selectedFloor = useMemo(() => {
     return usableFloors.find((floor) => String(floorId(floor)) === String(selectedFloorId));
@@ -272,6 +326,13 @@ export default function BuildingLiveMap({
                 <span className="text-slate-500">Status <strong className={selectedUser.status === 1 ? "text-emerald-600" : "text-rose-600"}>{selectedUser.status === 1 ? "ONLINE" : "OFFLINE"}</strong></span>
                 <span className="text-slate-500">Group <strong className="text-slate-700">{str(selectedUser.group_name ?? selectedUser.groupName, "—")}</strong></span>
                 <span className="text-slate-500">Position <strong className="text-slate-700">X {str(selectedUser.x, "—")}, Y {str(selectedUser.y, "—")}</strong></span>
+                <span className="col-span-2 text-slate-500">
+                  Zone <strong className="text-slate-700">
+                    {selectedUserZones.length
+                      ? selectedUserZones.map((zone) => zone.zoneName || `Zone ${zone.zoneId}`).join(", ")
+                      : "Outside all zones"}
+                  </strong>
+                </span>
                 <span className="text-slate-500">Last seen <strong className="text-slate-700">{formatLastSeenValue(selectedUser.lastSeen ?? selectedUser.last_seen ?? selectedUser.lastSeenAt)}</strong></span>
               </div>
             </div>
@@ -383,6 +444,7 @@ function BuildingTagHistory({
 }) {
   type HistoryEvent = { _id?: string; tagId?: string | number; tagName?: string | null; floorId?: string | number | null; x?: number | null; y?: number | null; timestamp: string; event?: string };
   const [events, setEvents] = useState<HistoryEvent[]>([]);
+  const [geofenceEvents, setGeofenceEvents] = useState<GeofenceEvent[]>([]);
   const [tagId, setTagId] = useState("");
 
   const tagNames = useMemo(() => {
@@ -509,7 +571,7 @@ function BuildingTagHistory({
         const response = await fetch(`/api/tag-events?buildingId=${encodeURIComponent(String(buildingId))}&limit=500`, { cache: "no-store" });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
-        if (!cancelled) setEvents(Array.isArray(data) ? data : []);
+        if (!cancelled) setEvents(Array.isArray(data) ? data : Array.isArray(data?.items) ? data.items : []);
       } catch (error) {
         console.error("[BuildingTagHistory] Failed to load history:", error);
       }
@@ -517,6 +579,41 @@ function BuildingTagHistory({
     void load();
     return () => { cancelled = true; };
   }, [buildingId]);
+
+  useEffect(() => {
+    if (selectedFloorId === undefined) {
+      setGeofenceEvents([]);
+      return;
+    }
+
+    let cancelled = false;
+    let timer: number | null = null;
+
+    async function loadGeofenceEvents(): Promise<void> {
+      try {
+        const query = `buildingId=${encodeURIComponent(String(buildingId))}&floorId=${encodeURIComponent(String(selectedFloorId))}&limit=12`;
+        const response = await fetch(`/api/geofence/events?${query}`, { cache: "no-store" });
+        if (!response.ok || cancelled) return;
+        const data: unknown = await response.json();
+        if (cancelled) return;
+        const items = data && typeof data === "object" && Array.isArray((data as { items?: unknown }).items)
+          ? (data as { items: GeofenceEvent[] }).items
+          : Array.isArray(data)
+            ? data as GeofenceEvent[]
+            : [];
+        setGeofenceEvents(items);
+      } catch (error) {
+        if (!cancelled) console.error("[Geofence] Event UI load failed:", error);
+      }
+    }
+
+    void loadGeofenceEvents();
+    timer = window.setInterval(() => void loadGeofenceEvents(), 2000);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [buildingId, selectedFloorId]);
 
   useEffect(() => {
     setPlaying(false);
@@ -704,6 +801,30 @@ function BuildingTagHistory({
         </div>
       </div>
       <div className="border-t bg-white p-4">
+        <div className="mb-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
+          <div className="mb-2 flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-bold text-slate-800">Geofence Activity</h3>
+              <p className="text-xs text-slate-400">ENTER / EXIT transitions from the current floor</p>
+            </div>
+            <span className="rounded-full bg-white px-2 py-1 text-[10px] font-semibold text-slate-500">{geofenceEvents.length} recent</span>
+          </div>
+          {geofenceEvents.length === 0 ? (
+            <p className="py-2 text-xs text-slate-400">No zone transitions yet. Move a tag across a zone boundary to test it.</p>
+          ) : (
+            <div className="max-h-36 space-y-1.5 overflow-y-auto pr-1">
+              {geofenceEvents.map((event, eventIndex) => (
+                <div key={`${event.tagId}-${event.zoneId}-${event.timestamp}-${eventIndex}`} className="flex items-center gap-2 rounded-lg bg-white px-3 py-2 text-xs">
+                  <span className={`rounded-full px-2 py-0.5 font-bold ${event.event === "ENTER" ? "bg-emerald-100 text-emerald-700" : "bg-rose-100 text-rose-700"}`}>{event.event}</span>
+                  <span className="font-semibold text-slate-700">Tag {event.tagId}</span>
+                  <span className="min-w-0 flex-1 truncate text-slate-500">{event.zoneName || `Zone ${event.zoneId}`}</span>
+                  <span className="shrink-0 text-[10px] text-slate-400">{new Date(event.timestamp).toLocaleTimeString()}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
         {tagId ? (
           <input
             type="range"

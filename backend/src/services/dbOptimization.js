@@ -4,6 +4,8 @@
 
 const TagEvent = require("../models/TagEvent");
 const TagLatest = require("../models/TagLatest");
+const ZonePresence = require("../models/ZonePresence");
+const ZoneEvent = require("../models/ZoneEvent");
 const StaticData = require("../models/StaticData");
 
 async function backfillTagLatest() {
@@ -55,6 +57,8 @@ async function optimizeDatabase() {
   await Promise.all([
     TagEvent.createIndexes(),
     TagLatest.createIndexes(),
+    ZonePresence.createIndexes(),
+    ZoneEvent.createIndexes(),
     StaticData.createIndexes(),
   ]);
 

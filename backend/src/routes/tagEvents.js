@@ -7,6 +7,7 @@ const express = require("express");
 const TagEvent = require("../models/TagEvent");
 const TagLatest = require("../models/TagLatest");
 const { getAssetTagIds, isAssetOrKnownAsset } = require("../services/assetFilter");
+const { processGeofenceEvents } = require("../services/geofence");
 
 const router = express.Router();
 
@@ -148,9 +149,20 @@ router.post("/", async (req, res) => {
       }
     }
 
+    let geofenceTransitions = [];
+    try {
+      const geofenceResult = await processGeofenceEvents(documents);
+      geofenceTransitions = geofenceResult.transitions || [];
+    } catch (geofenceError) {
+      // A malformed/missing zone must never stop RTLS position history from
+      // being saved. Geofencing is an additional read model on top of tags.
+      console.error("[Geofence] Processing failed:", geofenceError);
+    }
+
     console.log(
       `[TagEvent] Saved ${events.length} event(s), ` +
-      `ignored_asset=${assetCount}, invalid=${invalidCount}`
+      `ignored_asset=${assetCount}, invalid=${invalidCount}, ` +
+      `geofence_transitions=${geofenceTransitions.length}`
     );
 
     return res.status(201).json({
@@ -158,6 +170,7 @@ router.post("/", async (req, res) => {
       count: events.length,
       ignoredAssetCount: assetCount,
       invalidCount,
+      geofenceTransitions,
       ids: events.map((event) => event._id),
     });
   } catch (error) {

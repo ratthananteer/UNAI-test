@@ -11,6 +11,8 @@ const tagEventsRouter = require("./tagEvents");
 const { getActiveTags, refreshActiveTags } = require("../services/tagMonitor");
 const { getCachedOrFetch, refreshStaticData } = require("../services/staticDataCache");
 const TagLatest = require("../models/TagLatest");
+const ZonePresence = require("../models/ZonePresence");
+const ZoneEvent = require("../models/ZoneEvent");
 const { getAssetTagIds } = require("../services/assetFilter");
 
 const router = express.Router();
@@ -342,6 +344,52 @@ router.post("/socket-topic", async (req, res) => {
 });
 
 router.use("/tag-events", tagEventsRouter);
+
+// Current geofence state for tags on a floor/building.
+router.get("/geofence/status", async (req, res) => {
+  try {
+    const filter = {};
+    if (req.query.buildingId) filter.buildingId = String(req.query.buildingId);
+    if (req.query.floorId) filter.floorId = String(req.query.floorId);
+    if (req.query.tagId) filter.tagId = String(req.query.tagId);
+
+    const rows = await ZonePresence.find(filter)
+      .select({ _id: 0, tagId: 1, zoneId: 1, zoneName: 1, buildingId: 1, floorId: 1, status: 1, enteredAt: 1, lastSeenAt: 1, lastX: 1, lastY: 1 })
+      .sort({ lastSeenAt: -1 })
+      .lean();
+
+    return res.json({ ok: true, items: rows });
+  } catch (error) {
+    console.error("/api/geofence/status error:", error);
+    return res.status(500).json({ error: "Failed to load geofence status", details: error.message });
+  }
+});
+
+// Recent ENTER / EXIT transitions for the building/floor.
+router.get("/geofence/events", async (req, res) => {
+  try {
+    const filter = {};
+    if (req.query.buildingId) filter.buildingId = String(req.query.buildingId);
+    if (req.query.floorId) filter.floorId = String(req.query.floorId);
+    if (req.query.tagId) filter.tagId = String(req.query.tagId);
+
+    const requestedLimit = Number(req.query.limit);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(Math.floor(requestedLimit), 1), 200)
+      : 50;
+
+    const items = await ZoneEvent.find(filter)
+      .select({ _id: 0, tagId: 1, zoneId: 1, zoneName: 1, buildingId: 1, floorId: 1, event: 1, x: 1, y: 1, timestamp: 1 })
+      .sort({ timestamp: -1 })
+      .limit(limit)
+      .lean();
+
+    return res.json({ ok: true, items });
+  } catch (error) {
+    console.error("/api/geofence/events error:", error);
+    return res.status(500).json({ error: "Failed to load geofence events", details: error.message });
+  }
+});
 
 router.get("/active-tags", async (req, res) => {
   try {
