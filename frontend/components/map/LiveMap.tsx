@@ -399,6 +399,11 @@ export default function LiveMap({
         // socket positions with its (older) coordinates; doing so every 2s
         // makes markers visibly jump.
         setActiveTagIds((current) => {
+          // An empty active response can occur during backend/TagMonitor
+          // startup. Do not erase a valid MongoDB snapshot and make the UI say
+          // "Waiting for tag data". A subsequent poll will replace the set when
+          // the monitor has produced its first snapshot.
+          if (ids.size === 0 && current.size > 0) return current;
           if (current.size === ids.size && [...current].every((id) => ids.has(id))) return current;
           return ids;
         });
@@ -603,6 +608,9 @@ export default function LiveMap({
           // Polling supplies liveness only. Socket remains authoritative for
           // coordinates, so this cannot move a marker backwards.
           setActiveTagIds((current) => {
+            // Do not replace a non-empty backend snapshot with an empty
+            // transient polling result while TagMonitor is warming up.
+            if (ids.size === 0 && current.size > 0) return current;
             if (current.size === ids.size && [...current].every((id) => ids.has(id))) return current;
             return ids;
           });
@@ -655,14 +663,22 @@ export default function LiveMap({
   );
 
   const visibleTags = useMemo(() => {
-    if (!activeTagCheckReady) return [];
     const filter = tagIdFilter.trim();
-    const activeTags = tags.filter((tag) => {
+
+    // Backend/MongoDB data is the initial source of truth for this page. Do not
+    // replace it with an empty array while the Asset denylist or liveness check
+    // is still starting. Socket.IO will progressively merge newer positions.
+    const safeTags = tags.filter((tag) => {
       const id = String(tag.id ?? tag.tagId ?? tag.tag_id ?? "");
-      return Boolean(id) && activeTagIds.has(id) && !isAssetTag(tag) && !assetTagIdsRef.current.has(id);
+      if (!id || isAssetTag(tag) || assetTagIdsRef.current.has(id)) return false;
+
+      // Before the liveness check is ready, keep the backend snapshot visible.
+      // Once ready, use the active-tag read model for online filtering.
+      return !activeTagCheckReady || activeTagIds.has(id);
     });
-    if (!filter) return activeTags;
-    return activeTags.filter((tag) => String(tag.id ?? tag.tagId ?? tag.tag_id ?? "") === filter);
+
+    if (!filter) return safeTags;
+    return safeTags.filter((tag) => String(tag.id ?? tag.tagId ?? tag.tag_id ?? "") === filter);
   }, [tags, activeTagIds, activeTagCheckReady, tagIdFilter]);
 
   const socketTagGroups = useMemo(() => buildTagGroups(visibleTags), [visibleTags]);
