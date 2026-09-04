@@ -30,7 +30,15 @@ function isAsset(item) {
   return String(usage ?? "").trim().toUpperCase() === "ASSET";
 }
 
-async function getDbTags() {
+const DB_TAGS_CACHE_MS = Math.max(
+  5_000,
+  Number(process.env.DB_TAGS_CACHE_MS) || 5_000,
+);
+let dbTagsCache = null;
+let dbTagsCacheAt = 0;
+let dbTagsRefreshPromise = null;
+
+async function readDbTagsFromMongo() {
   const assetTagIds = await getAssetTagIds();
   const filter = { isAsset: { $ne: true } };
   if (assetTagIds.size) filter.tagId = { $nin: [...assetTagIds] };
@@ -56,6 +64,33 @@ async function getDbTags() {
   });
 }
 
+async function getDbTags() {
+  const now = Date.now();
+
+  // /db-tags is polled by the Home page. Keep the endpoint cheap even when
+  // several browser tabs refresh at the same time. TagLatest is already the
+  // MongoDB read model, so a very short server-side cache is sufficient.
+  if (dbTagsCache && now - dbTagsCacheAt < DB_TAGS_CACHE_MS) {
+    return dbTagsCache;
+  }
+
+  // Single-flight: concurrent requests share one MongoDB query instead of
+  // creating a burst of identical requests when a page/tab becomes active.
+  if (dbTagsRefreshPromise) return dbTagsRefreshPromise;
+
+  dbTagsRefreshPromise = readDbTagsFromMongo()
+    .then((tags) => {
+      dbTagsCache = tags;
+      dbTagsCacheAt = Date.now();
+      return tags;
+    })
+    .finally(() => {
+      dbTagsRefreshPromise = null;
+    });
+
+  return dbTagsRefreshPromise;
+}
+
 // Basic backend health check. Render uses this endpoint as its healthCheckPath.
 router.get("/health", (req, res) => {
   res.json({ ok: true, service: "unai-backend", timestamp: new Date().toISOString() });
@@ -77,6 +112,11 @@ router.get("/db-tags", async (req, res) => {
       if (req.query.floorId && String(tag.floorId) !== String(req.query.floorId)) return false;
       return true;
     });
+
+    // This endpoint is intentionally cache-friendly. The data itself is
+    // refreshed by TagMonitor/TagLatest; clients do not need to hammer the
+    // backend every few seconds.
+    res.set("Cache-Control", "private, max-age=2, stale-while-revalidate=8");
     return res.json(filtered);
   } catch (error) {
     console.error("/api/db-tags error:", error);

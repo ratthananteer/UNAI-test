@@ -175,25 +175,53 @@ export default function Home() {
   // stays on the initial load, while MongoDB TagMonitor updates tag freshness.
   useEffect(() => {
     let cancelled = false;
+    let refreshInFlight = false;
+    let timer: number | null = null;
+    let retryDelay = 30_000;
 
     const refreshTagStatus = async () => {
+      // Never overlap polling requests. This is especially important when the
+      // browser tab wakes up after being backgrounded and multiple timers can
+      // otherwise fire close together.
+      if (refreshInFlight || cancelled) return;
+      refreshInFlight = true;
+
       try {
         const data = await getApi("/api/db-tags");
-        if (!cancelled) setTagData(getItems(data) as Tag[]);
+        if (!cancelled) {
+          setTagData(getItems(data) as Tag[]);
+          retryDelay = 30_000;
+        }
       } catch (err) {
-        if (!cancelled) console.error("[UNAI HOME] Tag status refresh failed:", err);
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error("[UNAI HOME] Tag status refresh failed:", message);
+
+          // A 429 means the proxy/backend is rate-limiting us. Do not retry
+          // every few seconds; back off to protect the API and keep the Home
+          // page usable with the last successful tag snapshot.
+          if (/HTTP 429|rate.?limit|too many requests/i.test(message)) {
+            retryDelay = Math.min(Math.max(retryDelay * 2, 60_000), 5 * 60_000);
+          } else {
+            retryDelay = Math.min(Math.max(retryDelay, 30_000) * 2, 5 * 60_000);
+          }
+        }
+      } finally {
+        refreshInFlight = false;
+        if (!cancelled) {
+          timer = window.setTimeout(() => void refreshTagStatus(), retryDelay);
+        }
       }
     };
 
-    // TagLatest is a lightweight MongoDB read model. Polling every 10 seconds
-    // is enough for the ONLINE/OFFLINE timeout and avoids unnecessary API load.
-    const timer = window.setInterval(() => {
-      void refreshTagStatus();
-    }, 10000);
+    // The initial Home load already fetches /api/db-tags. Start the lightweight
+    // status refresh after 30 seconds instead of immediately making a second
+    // request, then use backoff if the backend/proxy returns HTTP 429.
+    timer = window.setTimeout(() => void refreshTagStatus(), 30_000);
 
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== null) window.clearTimeout(timer);
     };
   }, []);
 
