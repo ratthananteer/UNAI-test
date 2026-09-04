@@ -183,11 +183,30 @@ router.get("/v1/get_all_building", async (req, res) => {
 
 router.get("/floors", async (req, res) => {
   try {
-    const data = await getCachedOrFetch("floor", () => fetchFromApi(process.env.APIFLOOR_URL, "Failed to get floors"));
+    // Prefer MongoDB cache. The external UNAI floor endpoint can return 404
+    // independently of the rest of the API; a missing upstream floor response
+    // must not turn the Building page itself into HTTP 404/500.
+    const data = await getCachedOrFetch(
+      "floor",
+      () => fetchFromApi(process.env.APIFLOOR_URL, "Failed to get floors"),
+    );
     return res.json(data);
   } catch (error) {
-    console.error("/api/floors error:", error);
-    return res.status(error.status || 500).json({ error: "Failed to get floors", details: error.message });
+    console.error("/api/floors upstream error:", error);
+
+    // If UNAI currently rejects the floor endpoint, return the cache instead
+    // of leaking the upstream 404 to the frontend. This keeps the Building
+    // route renderable while the floor source is repaired/refreshed.
+    try {
+      const cached = await require("../models/StaticData").find({ type: "floor" })
+        .select({ _id: 0, data: 1 })
+        .sort({ external_id: 1 })
+        .lean();
+      return res.json(cached.map((row) => row.data));
+    } catch (cacheError) {
+      console.error("/api/floors cache fallback error:", cacheError);
+      return res.json([]);
+    }
   }
 });
 
