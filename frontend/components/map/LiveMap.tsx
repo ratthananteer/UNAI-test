@@ -433,14 +433,14 @@ export default function LiveMap({
 
     async function loadAssetTagIds(): Promise<boolean> {
       try {
-        const response = await fetch("/api/tag?mode=asset-ids", { cache: "no-store" });
+        const response = await fetch("/api/tag-asset-ids", { cache: "no-store" });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data: unknown = await response.json();
         if (cancelled) return false;
 
         const rawIds =
-          data && typeof data === "object" && Array.isArray((data as { assetTagIds?: unknown }).assetTagIds)
-            ? (data as { assetTagIds: unknown[] }).assetTagIds
+          data && typeof data === "object" && Array.isArray((data as { tagIds?: unknown }).tagIds)
+            ? (data as { tagIds: unknown[] }).tagIds
             : [];
         const ids = new Set(rawIds.map((id) => String(id)).filter(Boolean));
         assetTagIdsRef.current = ids;
@@ -462,16 +462,19 @@ export default function LiveMap({
       const loaded = await loadAssetTagIds();
       if (cancelled) return;
 
-      // Direct payload filtering still protects us when metadata is present.
-      // If the authoritative list cannot be loaded, do not create a second
-      // Socket.IO connection; the shared realtime manager remains the only owner.
+      // Asset metadata is an additional denylist, not a hard dependency for
+      // realtime. If the endpoint is temporarily unavailable, continue with an
+      // empty denylist. Direct payload inspection still removes records whose
+      // usage_type is explicitly ASSET, and the backend TagLatest endpoint also
+      // excludes assets. This keeps realtime available during metadata outages.
       if (!loaded) {
-        setSocketState("error");
-        setSocketInfo("Could not load Asset metadata; realtime subscription was not started.");
-        return;
+        assetTagIdsRef.current = new Set();
+        assetTagIdsReadyRef.current = true;
+        setActiveTagCheckReady(true);
+        setSocketInfo("Asset metadata unavailable; realtime continues with payload filtering.");
       }
 
-      unsubscribeRealtime = subscribeUnaiRealtime({
+      const unsubscribe = await subscribeUnaiRealtime({
         placeId,
         buildingId,
         floorId: floor.id ?? "",
@@ -567,6 +570,12 @@ export default function LiveMap({
           }
         },
       });
+
+      if (cancelled) {
+        unsubscribe();
+        return;
+      }
+      unsubscribeRealtime = unsubscribe;
 
       // Backend polling remains as a resilience path, but does not open sockets.
       const pollBackend = async (): Promise<void> => {
