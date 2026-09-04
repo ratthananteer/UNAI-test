@@ -18,8 +18,16 @@ type SocketLike = {
 
 type Connection = {
   key: string;
+  placeId: string | number;
+  buildingId: string | number;
+  floorId: string | number;
   socket: SocketLike;
   listeners: Set<Listener>;
+  reconnectTimer: number | null;
+  reconnectAttempt: number;
+  watchdogTimer: number | null;
+  reconnecting: boolean;
+  closed: boolean;
 };
 
 type TokenCacheEntry = {
@@ -39,10 +47,29 @@ const tokenCache = new Map<string, TokenCacheEntry>();
 let disconnectTimer: number | null = null;
 let rateLimitedUntil = 0;
 let ioPromise: Promise<any> | null = null;
+let reconnectPromise: Promise<void> | null = null;
+let reconnectingKey = "";
 
 const GRACE_MS = 2_000;
 const TOKEN_CACHE_MS = 5 * 60_000;
 const RATE_LIMIT_COOLDOWN_MS = 60_000;
+
+// Socket.IO automatic reconnection is intentionally disabled. We own the
+// reconnect policy here so one shared socket can recover without creating a
+// burst of connections when the network/server is unstable.
+const SOCKET_WATCHDOG_MS = 10_000;
+const RECONNECT_BASE_MS = 2_000;
+const RECONNECT_MAX_MS = 30_000;
+const RECONNECT_JITTER_MS = 750;
+const MAX_RECONNECT_ATTEMPTS = 8;
+
+function reconnectDelay(attempt: number): number {
+  const exponential = Math.min(
+    RECONNECT_MAX_MS,
+    RECONNECT_BASE_MS * 2 ** Math.max(0, attempt - 1),
+  );
+  return exponential + Math.floor(Math.random() * RECONNECT_JITTER_MS);
+}
 
 function report(status: { state: string; message: string; socketId?: string }) {
   pendingStatusListeners.forEach((listener) => listener(status));
@@ -192,10 +219,23 @@ async function getToken(
   return tokenPromise;
 }
 
+function stopConnectionTimers(target: Connection) {
+  if (target.reconnectTimer !== null) {
+    window.clearTimeout(target.reconnectTimer);
+    target.reconnectTimer = null;
+  }
+  if (target.watchdogTimer !== null) {
+    window.clearInterval(target.watchdogTimer);
+    target.watchdogTimer = null;
+  }
+}
+
 function closeConnection() {
   if (!connection) return;
 
   const old = connection;
+  old.closed = true;
+  stopConnectionTimers(old);
   connection = null;
 
   old.socket.off("tag");
@@ -219,7 +259,8 @@ async function createConnection(
   key: string,
   placeId: string | number,
   buildingId: string | number,
-  floorId: string | number
+  floorId: string | number,
+  reconnectAttempt = 0
 ): Promise<Connection | null> {
   if (Date.now() < rateLimitedUntil) {
     const seconds = Math.ceil((rateLimitedUntil - Date.now()) / 1000);
@@ -272,8 +313,16 @@ async function createConnection(
 
     const current: Connection = {
       key,
+      placeId,
+      buildingId,
+      floorId,
       socket,
       listeners: new Set(pendingListeners),
+      reconnectTimer: null,
+      reconnectAttempt,
+      watchdogTimer: null,
+      reconnecting: false,
+      closed: false,
     };
 
     connection = current;
@@ -313,6 +362,14 @@ async function createConnection(
     };
 
     socket.on("connect", () => {
+      // A successful connection resets the backoff. This means a stable
+      // connection has no reconnect timers or periodic connection attempts.
+      current.reconnectAttempt = 0;
+      current.reconnecting = false;
+      if (current.reconnectTimer !== null) {
+        window.clearTimeout(current.reconnectTimer);
+        current.reconnectTimer = null;
+      }
       rateLimitedUntil = 0;
 
       report({
@@ -350,6 +407,54 @@ async function createConnection(
     socket.on("sensor", (payload) => handleTag(payload, "sensor"));
     socket.on("message", (payload) => handleTag(payload, "message"));
 
+    const scheduleReconnect = (reason: string) => {
+      if (current.closed || connection !== current || current.listeners.size === 0) return;
+      if (current.reconnectTimer !== null || current.reconnecting) return;
+
+      if (Date.now() < rateLimitedUntil) {
+        const wait = Math.max(1_000, rateLimitedUntil - Date.now());
+        current.reconnectTimer = window.setTimeout(() => {
+          current.reconnectTimer = null;
+          scheduleReconnect("rate-limit cooldown finished");
+        }, wait);
+        report({
+          state: "rate_limited",
+          message: `UNAI rate limit active. Reconnect paused for ${Math.ceil(wait / 1000)}s.`,
+        });
+        return;
+      }
+
+      if (current.reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+        report({
+          state: "error",
+          message: "Realtime reconnect stopped after 8 attempts. Waiting for a new page subscription.",
+        });
+        return;
+      }
+
+      current.reconnectAttempt += 1;
+      const wait = reconnectDelay(current.reconnectAttempt);
+      report({
+        state: "disconnected",
+        message: `${reason} Reconnecting in ${Math.ceil(wait / 1000)}s (attempt ${current.reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS})...`,
+      });
+
+      current.reconnectTimer = window.setTimeout(() => {
+        current.reconnectTimer = null;
+        if (current.closed || connection !== current || current.listeners.size === 0) return;
+
+        current.reconnecting = true;
+        reconnectingKey = current.key;
+        reconnectPromise = reconnectConnection(current).finally(() => {
+          current.reconnecting = false;
+          if (reconnectingKey === current.key) {
+            reconnectingKey = "";
+            reconnectPromise = null;
+          }
+        });
+      }, wait);
+    };
+
     socket.on("connect_error", (error) => {
       console.error("[UNAI RTLS] connect_error:", error?.message || error);
 
@@ -357,8 +462,7 @@ async function createConnection(
         rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
         report({
           state: "rate_limited",
-          message:
-            "UNAI rate limit detected. Automatic reconnect is disabled for 60 seconds.",
+          message: "UNAI rate limit detected. Reconnect is paused for 60 seconds.",
         });
       } else {
         report({
@@ -370,27 +474,32 @@ async function createConnection(
       }
 
       if (connection === current) {
-        closeConnection();
+        current.socket.disconnect();
+        scheduleReconnect("Socket connection failed.");
       }
     });
 
     socket.on("disconnect", (reason) => {
       console.log("[UNAI RTLS] shared socket disconnected:", reason);
 
-      if (connection === current) {
-        connection = null;
-      }
+      if (connection !== current || current.closed || current.listeners.size === 0) return;
 
-      if (pendingListeners.size > 0) {
-        report({
-          state: "disconnected",
-          message:
-            reason === "io server disconnect"
-              ? "UNAI server disconnected this client. Refresh to connect again."
-              : `Disconnected: ${reason}. Automatic reconnect is disabled.`,
-        });
-      }
+      report({
+        state: "disconnected",
+        message: `Disconnected: ${reason}. Automatic reconnect is scheduled safely.`,
+      });
+      scheduleReconnect("Socket disconnected.");
     });
+
+    // A lightweight watchdog catches cases where the browser/socket state is
+    // stale but a disconnect event was missed. It checks every 10s only while
+    // this shared connection has active subscribers; it never creates a new
+    // connection by itself, it only schedules the same guarded backoff path.
+    current.watchdogTimer = window.setInterval(() => {
+      if (current.closed || connection !== current || current.listeners.size === 0) return;
+      if (current.socket.connected) return;
+      scheduleReconnect("Socket status is disconnected.");
+    }, SOCKET_WATCHDOG_MS);
 
     return current;
   } catch (error) {
@@ -402,13 +511,89 @@ async function createConnection(
   }
 }
 
+async function reconnectConnection(current: Connection): Promise<void> {
+  if (current.closed || connection !== current || current.listeners.size === 0) return;
+
+  // Tear down only the dead socket. Keep the Connection object and its
+  // subscribers so a reconnect does not force React components to resubscribe.
+  current.socket.off("tag");
+  current.socket.off("clientBox");
+  current.socket.off("sensor");
+  current.socket.off("message");
+  current.socket.off("connect");
+  current.socket.off("disconnect");
+  current.socket.off("connect_error");
+  current.socket.disconnect();
+  stopConnectionTimers(current);
+
+  connection = null;
+  const replacement = await createConnection(
+    current.key,
+    current.placeId,
+    current.buildingId,
+    current.floorId,
+    current.reconnectAttempt,
+  );
+
+  if (!replacement) {
+    // createConnection can fail before a socket exists (for example while the
+    // token endpoint is unavailable). Count that as a reconnect attempt too,
+    // otherwise a failing auth endpoint could cause an endless request loop.
+    if (!current.closed && pendingKey === current.key && pendingListeners.size > 0) {
+      if (current.reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+        report({
+          state: "error",
+          message: "Realtime reconnect stopped after 8 attempts. Waiting for a new page subscription.",
+        });
+        connection = current;
+        current.reconnecting = false;
+        return;
+      }
+
+      current.reconnectAttempt += 1;
+      connection = current;
+      current.reconnecting = false;
+
+      // createConnection reports the error; retry only once using the same
+      // guarded backoff. A 429/known rate-limit cooldown takes precedence.
+      const wait = Date.now() < rateLimitedUntil
+        ? Math.max(1_000, rateLimitedUntil - Date.now())
+        : reconnectDelay(current.reconnectAttempt);
+      current.reconnectTimer = window.setTimeout(() => {
+        current.reconnectTimer = null;
+        if (connection === current) {
+          current.reconnecting = true;
+          reconnectingKey = current.key;
+          reconnectPromise = reconnectConnection(current).finally(() => {
+            current.reconnecting = false;
+            if (reconnectingKey === current.key) {
+              reconnectingKey = "";
+              reconnectPromise = null;
+            }
+          });
+        }
+      }, wait);
+    }
+    return;
+  }
+
+  // createConnection replaces the shared connection and installs the same
+  // guarded listeners. No second socket is left alive.
+}
+
 function ensureConnection(
   key: string,
   placeId: string | number,
   buildingId: string | number,
   floorId: string | number
 ) {
-  if (connection?.key === key) return Promise.resolve(connection);
+  if (connection?.key === key && connection.socket.connected) return Promise.resolve(connection);
+
+  // A reconnect is already rebuilding this exact shared socket. Do not let a
+  // second subscriber start another token/socket request while it is in flight.
+  if (reconnectPromise && reconnectingKey === key) {
+    return reconnectPromise.then(() => connection);
+  }
 
   if (connectionPromise && pendingKey === key) {
     return connectionPromise;
@@ -465,7 +650,9 @@ export function subscribeUnaiRealtime({
 
   pendingStatusListeners.add(statusListener);
 
-  // If the connection already exists, attach immediately.
+  // If the connection already exists, attach immediately. If it is currently
+  // disconnected, the manager's backoff/watchdog owns recovery; do not open a
+  // second socket from this subscriber.
   if (connection?.key === key) {
     connection.listeners.add(onTag);
     onStatus?.({
