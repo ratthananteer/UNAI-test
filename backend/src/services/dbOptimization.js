@@ -4,11 +4,18 @@
 
 const TagEvent = require("../models/TagEvent");
 const TagLatest = require("../models/TagLatest");
-const ZonePresence = require("../models/ZonePresence");
-const ZoneEvent = require("../models/ZoneEvent");
 const StaticData = require("../models/StaticData");
 
 async function backfillTagLatest() {
+  // This migration is only needed when TagLatest is empty (first deployment or
+  // an intentional rebuild). Scanning the full history on every Render restart
+  // would turn startup cost into O(TagEvent history size).
+  const existingCount = await TagLatest.estimatedDocumentCount();
+  if (existingCount > 0) {
+    console.log(`[MongoDB] TagLatest backfill skipped: ${existingCount} snapshot(s) already exist`);
+    return 0;
+  }
+
   const latest = await TagEvent.aggregate([
     { $match: { isAsset: { $ne: true } } },
     { $sort: { tagId: 1, timestamp: -1 } },
@@ -57,8 +64,6 @@ async function optimizeDatabase() {
   await Promise.all([
     TagEvent.createIndexes(),
     TagLatest.createIndexes(),
-    ZonePresence.createIndexes(),
-    ZoneEvent.createIndexes(),
     StaticData.createIndexes(),
   ]);
 

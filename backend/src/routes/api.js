@@ -260,14 +260,9 @@ router.get("/db-tags", async (req, res) => {
     const timeoutDate = new Date(Date.now() - timeoutSeconds * 1000);
 
     const assetTagIds = await getAssetTagIds();
-    const match = {
-      isAsset: { $ne: true },
-      $nor: [
-        { "rawData.usage_type": { $regex: /^asset$/i } },
-        { "rawData.usageType": { $regex: /^asset$/i } },
-        { "rawData.usage.type": { $regex: /^asset$/i } },
-      ],
-    };
+    // Asset state is denormalized into TagLatest. Avoid regex scans through
+    // historical rawData when Home only needs the latest snapshot.
+    const match = { isAsset: { $ne: true } };
     if (assetTagIds.size > 0) {
       match.tagId = { $nin: [...assetTagIds] };
     }

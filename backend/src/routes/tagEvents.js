@@ -7,10 +7,46 @@ const express = require("express");
 const TagEvent = require("../models/TagEvent");
 const TagLatest = require("../models/TagLatest");
 const { getAssetTagIds, isAssetOrKnownAsset } = require("../services/assetFilter");
-const { processGeofenceEvents } = require("../services/geofence");
 
 const router = express.Router();
 
+function configNumber(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+// History is sampled independently from TagLatest. TagLatest always keeps the
+// newest position, while TagEvent only keeps a meaningful movement/state change.
+const HISTORY_MIN_INTERVAL_MS = configNumber("TAG_HISTORY_MIN_INTERVAL_MS", 1000);
+const HISTORY_MIN_DISTANCE = configNumber("TAG_HISTORY_MIN_DISTANCE", 0.2);
+
+function eventKeyOf(document) {
+  return [
+    document.tagId,
+    document.floorId ?? "",
+    document.timestamp.getTime(),
+    document.x,
+    document.y,
+    document.z ?? "",
+  ].join("|");
+}
+
+function shouldPersistHistory(document, previous) {
+  if (!previous) return true;
+  if (document.event !== "position_update") return true;
+  if (String(document.floorId ?? "") !== String(previous.floorId ?? "")) return true;
+
+  const previousTimestamp = new Date(previous.timestamp).getTime();
+  const elapsed = document.timestamp.getTime() - previousTimestamp;
+  const dx = Number(document.x) - Number(previous.x);
+  const dy = Number(document.y) - Number(previous.y);
+  const distance = Math.sqrt((dx * dx) + (dy * dy));
+
+  // Protect against out-of-order packets. A newer packet can still update
+  // TagLatest, but it should not create a backwards history point.
+  if (elapsed <= 0) return false;
+  return elapsed >= HISTORY_MIN_INTERVAL_MS || distance >= HISTORY_MIN_DISTANCE;
+}
 
 function parseTimestamp(value) {
   if (typeof value === "number") {
@@ -27,13 +63,8 @@ function parseTimestamp(value) {
   return new Date();
 }
 
-const ASSET_QUERY = {
-  $nor: [
-    { "rawData.usage_type": { $regex: /^asset$/i } },
-    { "rawData.usageType": { $regex: /^asset$/i } },
-    { "rawData.usage.type": { $regex: /^asset$/i } },
-  ],
-};
+// Asset filtering is denormalized into isAsset/tagId. Avoid regex scans on
+// rawData because TagEvent is the high-volume collection.
 
 router.post("/", async (req, res) => {
   try {
@@ -91,7 +122,44 @@ router.post("/", async (req, res) => {
       });
     }
 
-    const events = await TagEvent.insertMany(documents, { ordered: false });
+    documents.forEach((document) => {
+      document.eventKey = eventKeyOf(document);
+    });
+
+    // Read the current snapshot once for the whole request. This is used for
+    // both history sampling and the latest read model, avoiding one query per tag.
+    const tagIds = [...new Set(documents.map((document) => document.tagId))];
+    const existingLatest = await TagLatest.find({ tagId: { $in: tagIds } })
+      .select({ tagId: 1, floorId: 1, x: 1, y: 1, z: 1, timestamp: 1 })
+      .lean();
+    const existingByTag = new Map(existingLatest.map((row) => [String(row.tagId), row]));
+
+    // Only persist meaningful history points. TagLatest still receives every
+    // newer position so the live map never loses realtime precision.
+    const historyDocuments = [];
+    const historyCandidateByTag = new Map(existingByTag);
+    for (const document of documents) {
+      const id = document.tagId;
+      const previous = historyCandidateByTag.get(id);
+      if (shouldPersistHistory(document, previous)) {
+        historyDocuments.push(document);
+        historyCandidateByTag.set(id, document);
+      }
+    }
+
+    // The unique eventKey index protects against duplicate packets from two
+    // browser subscribers. Ordered=false lets unique-key duplicates be ignored
+    // without failing the entire batch.
+    let events = [];
+    if (historyDocuments.length) {
+      try {
+        events = await TagEvent.insertMany(historyDocuments, { ordered: false });
+      } catch (error) {
+        if (error?.code !== 11000 && !Array.isArray(error?.writeErrors)) throw error;
+        events = Array.isArray(error?.insertedDocs) ? error.insertedDocs : [];
+        console.warn("[TagEvent] Duplicate history event(s) ignored");
+      }
+    }
 
     // Maintain one latest snapshot per tag. This turns active-tag reads into
     // a small indexed query instead of an aggregation over TagEvent history.
@@ -104,16 +172,10 @@ router.post("/", async (req, res) => {
     }
 
     if (latestByTag.size) {
-      const existing = await TagLatest.find({
-        tagId: { $in: [...latestByTag.keys()] },
-      })
-        .select({ tagId: 1, timestamp: 1 })
-        .lean();
-      const existingByTag = new Map(existing.map((row) => [row.tagId, row.timestamp]));
-
       const latestOperations = [];
       for (const [id, document] of latestByTag) {
-        const existingTimestamp = existingByTag.get(id);
+        const existing = existingByTag.get(String(id));
+        const existingTimestamp = existing?.timestamp;
         if (existingTimestamp && new Date(existingTimestamp).getTime() >= document.timestamp.getTime()) {
           continue;
         }
@@ -149,20 +211,9 @@ router.post("/", async (req, res) => {
       }
     }
 
-    let geofenceTransitions = [];
-    try {
-      const geofenceResult = await processGeofenceEvents(documents);
-      geofenceTransitions = geofenceResult.transitions || [];
-    } catch (geofenceError) {
-      // A malformed/missing zone must never stop RTLS position history from
-      // being saved. Geofencing is an additional read model on top of tags.
-      console.error("[Geofence] Processing failed:", geofenceError);
-    }
-
     console.log(
       `[TagEvent] Saved ${events.length} event(s), ` +
-      `ignored_asset=${assetCount}, invalid=${invalidCount}, ` +
-      `geofence_transitions=${geofenceTransitions.length}`
+      `ignored_asset=${assetCount}, invalid=${invalidCount}`
     );
 
     return res.status(201).json({
@@ -170,7 +221,6 @@ router.post("/", async (req, res) => {
       count: events.length,
       ignoredAssetCount: assetCount,
       invalidCount,
-      geofenceTransitions,
       ids: events.map((event) => event._id),
     });
   } catch (error) {
@@ -185,7 +235,7 @@ router.post("/", async (req, res) => {
 router.get("/", async (req, res) => {
   try {
     const assetTagIds = await getAssetTagIds();
-    const filter = { ...ASSET_QUERY };
+    const filter = { isAsset: { $ne: true } };
 
     // Socket location events may not contain usage_type. Exclude those known
     // Asset IDs as well, including Asset records that were stored previously.

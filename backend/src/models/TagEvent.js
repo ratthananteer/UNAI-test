@@ -10,6 +10,9 @@ const tagEventSchema = new mongoose.Schema(
     groupName: { type: String, default: null },
     tagName: { type: String, default: null },
     event: { type: String, default: "position_update" },
+    // Stable fingerprint used to prevent duplicate history writes when more
+    // than one frontend subscriber sends the same realtime packet.
+    eventKey: { type: String, default: null },
     status: { type: String, default: "ALIVE" },
     movementStatus: { type: String, default: "UNKNOWN" },
     // Denormalized so active/history queries do not need regex scans inside rawData.
@@ -22,7 +25,9 @@ const tagEventSchema = new mongoose.Schema(
     receivedAt: { type: Date, default: Date.now },
     timestamp: { type: Date, required: true },
   },
-  { timestamps: true }
+  // TagEvent is append-only history. Mongoose createdAt/updatedAt are
+  // redundant because receivedAt is the authoritative ingestion timestamp.
+  { timestamps: false }
 );
 
 // Query-oriented indexes. Keep the index set small because TagEvent is a
@@ -31,6 +36,9 @@ const tagEventSchema = new mongoose.Schema(
 tagEventSchema.index({ tagId: 1, timestamp: -1 });
 tagEventSchema.index({ floorId: 1, tagId: 1, timestamp: -1 });
 tagEventSchema.index({ buildingId: 1, floorId: 1, timestamp: -1 });
+// Sparse unique index only applies to newly written events. This is safe for
+// older documents created before eventKey existed.
+tagEventSchema.index({ eventKey: 1 }, { unique: true, sparse: true });
 
 // Retention is based on when our backend received the event, not an upstream
 // timestamp that may be delayed or malformed. This makes TTL predictable.

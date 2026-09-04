@@ -1,8 +1,17 @@
+// STATIC DATA MODEL:
+// Stores relatively stable RTLS configuration such as places, buildings,
+// floors, and zones in MongoDB so the frontend can read a local cache.
+// `data` keeps the original API object; `data_hash` detects whether it changed.
+
 const mongoose = require("mongoose");
 
 const StaticDataSchema = new mongoose.Schema(
   {
-    type: { type: String, required: true, enum: ["place", "building", "floor", "zone"], index: true },
+    type: {
+      type: String,
+      required: true,
+      enum: ["place", "building", "floor", "zone", "anchor"],
+    },
     external_id: { type: String, required: true },
     data: { type: mongoose.Schema.Types.Mixed, required: true },
     data_hash: { type: String, required: true },
