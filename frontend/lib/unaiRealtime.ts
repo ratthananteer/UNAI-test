@@ -33,8 +33,7 @@ let pendingKey = "";
 let pendingListeners = new Set<Listener>();
 let pendingStatusListeners = new Set<(status: { state: string; message: string; socketId?: string }) => void>();
 
-let tokenPromise: Promise<string> | null = null;
-let tokenPromiseKey = "";
+const tokenPromises = new Map<string, Promise<string>>();
 const tokenCache = new Map<string, TokenCacheEntry>();
 
 let disconnectTimer: number | null = null;
@@ -155,9 +154,10 @@ async function getToken(
     return cached.token;
   }
 
-  if (!tokenPromise || tokenPromiseKey !== key) {
-    tokenPromiseKey = key;
-    tokenPromise = fetch("/api/socket-topic", {
+  const existingPromise = tokenPromises.get(key);
+  if (existingPromise) return existingPromise;
+
+  const tokenPromise = fetch("/api/socket-topic", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ floorID: floorId }),
@@ -182,11 +182,14 @@ async function getToken(
         return value;
       })
       .catch((error) => {
-        tokenPromise = null;
-        tokenPromiseKey = "";
         throw error;
       });
-  }
+
+  tokenPromises.set(key, tokenPromise);
+  void tokenPromise.then(
+    () => tokenPromises.delete(key),
+    () => tokenPromises.delete(key),
+  );
 
   return tokenPromise;
 }

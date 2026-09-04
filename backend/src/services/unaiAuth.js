@@ -9,13 +9,23 @@ const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "..", "..", ".env") });
 
 let refreshPromise = null;
+let generatePromise = null;
 let accessTokenExpiresAt = 0;
+let authRateLimitedUntil = 0;
+const AUTH_RATE_LIMIT_COOLDOWN_MS = 60_000;
 
 // Keep a small safety window so we never intentionally use a token that is
 // about to expire. The UNAI token is currently requested for 60 minutes.
 const TOKEN_REFRESH_SKEW_MS = 2 * 60 * 1000;
 
-async function generateAccessToken() {
+async function generateAccessTokenRequest() {
+  if (Date.now() < authRateLimitedUntil) {
+    const error = new Error("UNAI authentication is temporarily rate-limited. Please wait before requesting another token.");
+    error.status = 429;
+    error.retryAfterMs = authRateLimitedUntil - Date.now();
+    throw error;
+  }
+
   const username = process.env.UNAI_USERNAME;
   const password = process.env.UNAI_PASSWORD;
 
@@ -83,6 +93,20 @@ async function generateAccessToken() {
     lastStatus = response.status;
     lastBody = body;
 
+    if (response.status === 429) {
+      const retryAfter = Number(response.headers.get("retry-after"));
+      authRateLimitedUntil = Date.now() + (
+        Number.isFinite(retryAfter) && retryAfter > 0
+          ? Math.min(retryAfter * 1000, 5 * 60 * 1000)
+          : AUTH_RATE_LIMIT_COOLDOWN_MS
+      );
+      const error = new Error("Failed to generate UNAI access token: HTTP 429");
+      error.status = 429;
+      error.body = body;
+      error.retryAfterMs = authRateLimitedUntil - Date.now();
+      throw error;
+    }
+
     // A 404 is specifically a route mismatch. Continue to the next known
     // route instead of immediately breaking the Home page.
     if (response.status === 404) {
@@ -100,6 +124,17 @@ async function generateAccessToken() {
   error.status = lastStatus;
   error.body = lastBody;
   throw error;
+}
+
+async function generateAccessToken() {
+  // Single-flight even for callers that explicitly request token generation.
+  // This prevents multiple pages/routes from hitting /auth/gen_token at once.
+  if (!generatePromise) {
+    generatePromise = generateAccessTokenRequest().finally(() => {
+      generatePromise = null;
+    });
+  }
+  return generatePromise;
 }
 
 async function getAccessToken() {

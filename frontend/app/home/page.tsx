@@ -185,9 +185,11 @@ export default function Home() {
       }
     };
 
+    // TagLatest is a lightweight MongoDB read model. Polling every 10 seconds
+    // is enough for the ONLINE/OFFLINE timeout and avoids unnecessary API load.
     const timer = window.setInterval(() => {
       void refreshTagStatus();
-    }, 2000);
+    }, 10000);
 
     return () => {
       cancelled = true;

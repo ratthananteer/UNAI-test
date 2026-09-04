@@ -6,8 +6,11 @@
 const { fetchFromApi } = require("./unaiApi");
 
 let assetTagIdsCache = new Set();
+let tagMetadataCache = null;
 let loadedAt = 0;
-const CACHE_MS = 60_000;
+let refreshPromise = null;
+const CACHE_MS = 5 * 60_000;
+const FAILURE_COOLDOWN_MS = 60_000;
 
 function isAsset(value) {
   if (!value || typeof value !== "object") return false;
@@ -42,25 +45,61 @@ function collectAssetTagIds(value, output = new Set()) {
   return output;
 }
 
+async function getTagMetadata(force = false) {
+  const now = Date.now();
+
+  if (!force && now - loadedAt < CACHE_MS && tagMetadataCache !== null) {
+    return tagMetadataCache;
+  }
+
+  if (!force && loadedAt > 0 && now - loadedAt < FAILURE_COOLDOWN_MS) {
+    return tagMetadataCache;
+  }
+
+  if (refreshPromise) return refreshPromise;
+
+  refreshPromise = (async () => {
+    try {
+      const data = await fetchFromApi(
+        process.env.APITAG_URL,
+        "Failed to get tag metadata",
+      );
+      tagMetadataCache = data;
+      assetTagIdsCache = collectAssetTagIds(data);
+      loadedAt = Date.now();
+      console.log(
+        `[UNAI TAG] Metadata loaded: ${assetTagIdsCache.size} Asset tag(s)`,
+      );
+    } catch (error) {
+      loadedAt = Date.now();
+      console.error("[UNAI TAG] Failed to refresh tag metadata:", error.message);
+    } finally {
+      refreshPromise = null;
+    }
+
+    return tagMetadataCache;
+  })();
+
+  return refreshPromise;
+}
+
 async function getAssetTagIds(force = false) {
-  if (!force && Date.now() - loadedAt < CACHE_MS) {
+  const now = Date.now();
+
+  // Reuse the cached denylist for several minutes. Asset metadata is not
+  // realtime data, so refreshing it every few seconds only increases UNAI
+  // API traffic and can trigger HTTP 429 rate limits.
+  if (!force && now - loadedAt < CACHE_MS) {
     return assetTagIdsCache;
   }
 
-  try {
-    const data = await fetchFromApi(
-      process.env.APITAG_URL,
-      "Failed to get tag metadata",
-    );
-    assetTagIdsCache = collectAssetTagIds(data);
-    loadedAt = Date.now();
-    console.log(
-      `[UNAI TAG] Asset metadata loaded: ${assetTagIdsCache.size} Asset tag(s)`,
-    );
-  } catch (error) {
-    console.error("[UNAI TAG] Failed to refresh Asset metadata:", error.message);
+  // After an upstream failure, keep using the last known denylist during a
+  // short cooldown instead of hammering the rate-limited endpoint.
+  if (!force && loadedAt > 0 && now - loadedAt < FAILURE_COOLDOWN_MS) {
+    return assetTagIdsCache;
   }
 
+  await getTagMetadata(force);
   return assetTagIdsCache;
 }
 
@@ -75,5 +114,6 @@ module.exports = {
   tagIdOf,
   collectAssetTagIds,
   getAssetTagIds,
+  getTagMetadata,
   isAssetOrKnownAsset,
 };

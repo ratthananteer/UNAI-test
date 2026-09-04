@@ -12,7 +12,7 @@ const adminRouter = require("./admin");
 const { getActiveTags, refreshActiveTags } = require("../services/tagMonitor");
 const { getCachedOrFetch, refreshStaticData } = require("../services/staticDataCache");
 const TagLatest = require("../models/TagLatest");
-const { getAssetTagIds } = require("../services/assetFilter");
+const { getAssetTagIds, getTagMetadata } = require("../services/assetFilter");
 
 const router = express.Router();
 
@@ -152,14 +152,19 @@ router.post("/sync-static-data", async (req, res) => {
 });
 
 cachedProxyGet("/floors", "floor", "APIFLOOR_URL", "Failed to get floors");
-proxyGet("/anchor", "APIANCHOR_URL", "Failed to get anchors");
+// Anchors are static infrastructure data for the map. Cache them in the same
+// MongoDB StaticData collection so opening Home does not hit UNAI on every page load.
+cachedProxyGet("/anchor", "anchor", "APIANCHOR_URL", "Failed to get anchors");
 
 // UNAI /tag does not appear to expose a reliable server-side usage_type filter.
 // Therefore the backend fetches the endpoint once, immediately removes ASSET
 // records, and only then returns the result to the frontend.
 router.get("/tag", async (req, res) => {
   try {
-    const data = await fetchFromApi(process.env.APITAG_URL, "Failed to get tags");
+    // Tag metadata is shared with the Asset denylist service and cached for
+    // several minutes. This endpoint must not call UNAI independently on every
+    // Building/Tag History page load.
+    const data = await getTagMetadata();
 
     // The normal /api/tag response never exposes ASSET records. For the
     // realtime denylist, the frontend can ask this same, already-deployed
@@ -216,7 +221,7 @@ router.get("/tag", async (req, res) => {
 // deployments only need the existing /api/tag route.
 router.get("/tag-asset-ids", async (req, res) => {
   try {
-    const data = await fetchFromApi(process.env.APITAG_URL, "Failed to get tag metadata");
+    const data = await getTagMetadata();
     const assetIds = [];
 
     function collect(value) {

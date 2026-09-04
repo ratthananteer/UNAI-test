@@ -1,4 +1,14 @@
+// UNAI API SERVICE:
+// Sends authenticated HTTP requests to the external UNAI RTLS API.
+// It obtains a generated access token from unaiAuth and automatically generates
+// a replacement token once when UNAI responds with 401/403.
+// It also generates the per-floor Socket.IO topic credentials for the frontend.
+
 const { getAccessToken, refreshAccessToken } = require("./unaiAuth");
+
+const socketTopicCache = new Map();
+const socketTopicPromises = new Map();
+const SOCKET_TOPIC_CACHE_MS = 5 * 60_000;
 
 async function fetchFromApi(url, errorMessage, retryAfterUnauthorized = true) {
   if (!url) {
@@ -24,6 +34,15 @@ async function fetchFromApi(url, errorMessage, retryAfterUnauthorized = true) {
     const error = new Error(`${errorMessage}: HTTP ${response.status}`);
     error.status = response.status;
     error.body = body;
+
+    if (response.status === 429) {
+      const retryAfter = Number(response.headers.get("retry-after"));
+      error.retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(retryAfter * 1000, 5 * 60 * 1000)
+        : 60_000;
+      error.message = `${errorMessage}: HTTP 429 (rate limited; retry after ${Math.ceil(error.retryAfterMs / 1000)}s)`;
+    }
+
     throw error;
   }
 
@@ -31,6 +50,24 @@ async function fetchFromApi(url, errorMessage, retryAfterUnauthorized = true) {
 }
 
 async function generateSocketTopic(floorID) {
+  const key = String(floorID);
+  const cached = socketTopicCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+  const existingPromise = socketTopicPromises.get(key);
+  if (existingPromise) return existingPromise;
+
+  const requestPromise = generateSocketTopicRequest(floorID);
+  socketTopicPromises.set(key, requestPromise);
+
+  try {
+    return await requestPromise;
+  } finally {
+    socketTopicPromises.delete(key);
+  }
+}
+
+async function generateSocketTopicRequest(floorID) {
   const url = "https://rtls.lailab.online/gen_encrypt_topic";
   const body = new URLSearchParams({ floorID: String(floorID) });
 
@@ -69,6 +106,13 @@ async function generateSocketTopic(floorID) {
     const error = new Error(`Failed to generate socket topic: HTTP ${response.status}`);
     error.status = response.status;
     error.body = data;
+    if (response.status === 429) {
+      const retryAfter = Number(response.headers.get("retry-after"));
+      error.retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(retryAfter * 1000, 5 * 60 * 1000)
+        : 60_000;
+      error.message = `Failed to generate socket topic: HTTP 429 (rate limited; retry after ${Math.ceil(error.retryAfterMs / 1000)}s)`;
+    }
     throw error;
   }
 
@@ -79,10 +123,17 @@ async function generateSocketTopic(floorID) {
     throw error;
   }
 
-  return {
+  const value = {
     socket_token: data.socket_token,
     ...(data.encrypt_topic ? { encrypt_topic: data.encrypt_topic } : {}),
   };
+
+  socketTopicCache.set(String(floorID), {
+    value,
+    expiresAt: Date.now() + SOCKET_TOPIC_CACHE_MS,
+  });
+
+  return value;
 }
 
 module.exports = { fetchFromApi, generateSocketTopic };
