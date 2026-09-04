@@ -157,10 +157,8 @@ async function getToken(
   const existingPromise = tokenPromises.get(key);
   if (existingPromise) return existingPromise;
 
-  const tokenPromise = fetch("/api/socket-topic", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ floorID: floorId }),
+  const tokenPromise = fetch(`/api/socket-topic?floorID=${encodeURIComponent(String(floorId))}`, {
+      method: "GET",
       cache: "no-store",
     })
       .then(async (response) => {
