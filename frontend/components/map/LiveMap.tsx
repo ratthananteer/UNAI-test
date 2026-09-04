@@ -747,7 +747,7 @@ export default function LiveMap({
                     <div
                       key={`anchor-${String(anchor.id)}`}
                       title={String(anchor.label ?? anchor.id ?? "Anchor")}
-                      className={`absolute flex h-7 w-7 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border-2 border-white text-[9px] font-bold text-white shadow-lg ${anchor.status === 1 ? "bg-emerald-500" : "bg-rose-500"}`}
+                      className={`absolute flex h-5 w-5 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border-2 border-white text-[9px] font-bold text-white shadow-lg ${anchor.status === 1 ? "bg-emerald-500" : "bg-rose-500"}`}
                       style={{ left: `${(px / width) * 100}%`, top: `${(py / height) * 100}%` }}
                     >
                       A
@@ -775,8 +775,8 @@ export default function LiveMap({
                 className="absolute z-10 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center transition-[left,top] duration-75 will-change-[left,top]"
                 style={{ left: `${(px / width) * 100}%`, top: `${(py / height) * 100}%` }}
               >
-                <div className="flex h-8 min-w-8 items-center justify-center rounded-full border-2 border-white bg-sky-600 px-2 text-[9px] font-bold text-white shadow-lg">T</div>
-                <span className="mt-1 max-w-28 truncate rounded bg-white/95 px-1.5 py-0.5 text-[9px] font-semibold text-slate-700 shadow">{tagName}</span>
+                <div className="flex h-5 min-w-5 items-center justify-center rounded-full border-2 border-white bg-sky-600 px-1 text-[9px] font-bold text-white shadow-lg">T</div>
+                <span className="mt-1 max-w-28 truncate rounded bg-white/95 px-1.5 py-0.5 text-[8px] font-semibold text-slate-700 shadow">{tagName}</span>
               </button>
             );
           })}

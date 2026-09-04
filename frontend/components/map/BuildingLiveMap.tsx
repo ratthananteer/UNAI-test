@@ -720,10 +720,10 @@ function BuildingTagHistory({
                 <div
                   className={`flex items-center justify-center rounded-full border-2 border-white font-bold text-white shadow-lg ${
                     isCurrent
-                      ? "h-8 min-w-8 bg-sky-600 px-2 text-[9px] ring-2 ring-sky-300"
+                      ? "h-5 w-5 bg-sky-600 px-2 text-[9px] ring-2 ring-sky-300"
                       : isPastShadow
-                        ? "h-5 min-w-5 bg-sky-500/20 px-1 text-[7px] opacity-45 shadow-[0_0_10px_rgba(14,165,233,0.25)]"
-                        : "h-8 min-w-8 bg-sky-600 px-2 text-[9px]"
+                        ? "h-5 w-5 bg-sky-500/20 px-1 text-[7px] opacity-45 shadow-[0_0_10px_rgba(14,165,233,0.25)]"
+                        : "h-5 w-5 bg-sky-600 px-2 text-[9px]"
                   }`}
                 >
                   {isPastShadow ? "" : "T"}

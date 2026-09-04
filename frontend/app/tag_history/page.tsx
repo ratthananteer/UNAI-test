@@ -639,8 +639,8 @@ export default function TagHistoryPage() {
                       }}
                       title={`Tag ID: ${currentEvent?.tagId} · X: ${currentEvent?.x}, Y: ${currentEvent?.y}`}
                     >
-                      <div className="flex h-8 min-w-8 items-center justify-center rounded-full border-2 border-white bg-sky-600 px-2 text-[9px] font-bold text-white shadow-lg ring-2 ring-sky-300">T</div>
-                      <span className="mt-1 max-w-28 truncate rounded bg-white/95 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700 shadow">{userNameOf(currentEvent, tagMetadata)}</span>
+                      <div className="flex h-5 min-w-5 items-center justify-center rounded-full border-2 border-white bg-sky-600 px-1 text-[9px] font-bold text-white shadow-lg ring-2 ring-sky-300">T</div>
+                      <span className="mt-1 max-w-28 truncate rounded bg-white/95 px-1.5 py-0.5 text-[8px] font-semibold text-sky-700 shadow">{userNameOf(currentEvent, tagMetadata)}</span>
                     </div>
                   )}
                 </div>
