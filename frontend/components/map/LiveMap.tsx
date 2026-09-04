@@ -177,6 +177,27 @@ function toPixel(realX: number, realY: number, floor: Floor): { px: number; py: 
   return { px: originX + realX * scale, py: originY - realY * scale };
 }
 
+// Keep a marker inside the rendered floor image. UNAI can occasionally send a
+// stale/noisy coordinate slightly outside the floor boundary. We do not change
+// the stored X/Y; this only protects the UI position from escaping the map.
+function mapPosition(realX: number, realY: number, floor: Floor, width: number, height: number) {
+  const { px, py } = toPixel(realX, realY, floor);
+  if (!Number.isFinite(px) || !Number.isFinite(py) || width <= 0 || height <= 0) return null;
+
+  // Allow a small coordinate tolerance so a marker does not visibly jump when
+  // it is only a few pixels beyond an image edge, then clamp it to the image.
+  const toleranceX = width * 0.05;
+  const toleranceY = height * 0.05;
+  if (px < -toleranceX || px > width + toleranceX || py < -toleranceY || py > height + toleranceY) {
+    return null;
+  }
+
+  return {
+    px: Math.max(0, Math.min(width, px)),
+    py: Math.max(0, Math.min(height, py)),
+  };
+}
+
 function parsePolygon(value: unknown): [number, number][] {
   if (!value) return [];
   try {
@@ -697,7 +718,6 @@ export default function LiveMap({
 
           <div className="absolute inset-0 z-20 pointer-events-none">
             <button
-              suppressHydrationWarning
               type="button"
               onClick={() => setShowAnchors((current) => !current)}
               aria-pressed={showAnchors}
@@ -720,7 +740,9 @@ export default function LiveMap({
                   const realX = numberValue(anchor.x);
                   const realY = numberValue(anchor.y);
                   if (realX === null || realY === null) return null;
-                  const { px, py } = toPixel(realX, realY, floor);
+                  const position = mapPosition(realX, realY, floor, width, height);
+                  if (!position) return null;
+                  const { px, py } = position;
                   return (
                     <div
                       key={`anchor-${String(anchor.id)}`}
@@ -740,7 +762,9 @@ export default function LiveMap({
             const realX = numberValue(tag.x);
             const realY = numberValue(tag.y);
             if (realX === null || realY === null) return null;
-            const { px, py } = toPixel(realX, realY, floor);
+            const position = mapPosition(realX, realY, floor, width, height);
+            if (!position) return null;
+            const { px, py } = position;
             const tagName = String(tag.label ?? tag.name ?? tag.ui_display ?? `Tag ${tag.id ?? ""}`);
             return (
               <button

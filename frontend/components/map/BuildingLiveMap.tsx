@@ -39,6 +39,15 @@ function belongsToFloor(item: Item, selectedId: string | number): boolean {
   return value === undefined || String(value) === String(selectedId);
 }
 
+// Location-bearing tags must have an explicit floor before they are rendered
+// on a floor map. Metadata records can omit floor information; treating those
+// records as belonging to every floor can put a stale tag coordinate on the
+// wrong map (and is especially visible when only one tag has bad coordinates).
+function tagBelongsToFloor(item: Item, selectedId: string | number): boolean {
+  const value = idOf(item.floor_id ?? item.floorId ?? item.floor ?? item.floorID);
+  return value !== undefined && String(value) === String(selectedId);
+}
+
 export default function BuildingLiveMap({
   placeId,
   buildingId,
@@ -122,11 +131,42 @@ export default function BuildingLiveMap({
     id: selectedFloorId,
     name: str(floorValue("name") ?? floorValue("floor_name") ?? floorValue("title"), `Floor ${String(selectedFloorId)}`),
     map_path: (floorValue("map_path") ?? floorValue("mapPath") ?? null) as string | null,
-    map_width: num(floorValue("map_width") ?? floorValue("mapWidth")),
-    map_height: num(floorValue("map_height") ?? floorValue("mapHeight")),
-    pixel_meter: num(floorValue("pixel_meter") ?? floorValue("pixelMeter")),
-    origin_x: num(floorValue("origin_x") ?? floorValue("originX")),
-    origin_y: num(floorValue("origin_y") ?? floorValue("originY")),
+    // UNAI floor payloads have appeared with both snake_case and camelCase
+    // names. Prefer the real map dimensions/transform whenever available;
+    // falling back to 1600x900 in LiveMap is only a last resort.
+    map_width: num(
+      floorValue("map_width") ??
+        floorValue("mapWidth") ??
+        floorValue("width") ??
+        floorValue("map_width_px") ??
+        floorValue("mapWidthPx"),
+    ),
+    map_height: num(
+      floorValue("map_height") ??
+        floorValue("mapHeight") ??
+        floorValue("height") ??
+        floorValue("map_height_px") ??
+        floorValue("mapHeightPx"),
+    ),
+    pixel_meter: num(
+      floorValue("pixel_meter") ??
+        floorValue("pixelMeter") ??
+        floorValue("pixel_per_meter") ??
+        floorValue("pixels_per_meter") ??
+        floorValue("pixelPerMeter"),
+    ),
+    origin_x: num(
+      floorValue("origin_x") ??
+        floorValue("originX") ??
+        floorValue("map_origin_x") ??
+        floorValue("mapOriginX"),
+    ),
+    origin_y: num(
+      floorValue("origin_y") ??
+        floorValue("originY") ??
+        floorValue("map_origin_y") ??
+        floorValue("mapOriginY"),
+    ),
   };
 
   const liveAnchors = anchors.filter((item) => belongsToFloor(item, selectedFloorId)).map((item) => ({
@@ -137,7 +177,7 @@ export default function BuildingLiveMap({
     status: typeof item.status === "number" ? item.status : undefined,
   }));
 
-  const liveTags = tags.filter((item) => belongsToFloor(item, selectedFloorId));
+  const liveTags = tags.filter((item) => tagBelongsToFloor(item, selectedFloorId));
   const liveZones = zones.filter((item) => belongsToFloor(item, selectedFloorId)).map((item) => ({
     id: idOf(item.id ?? item.zone_id ?? item.zoneId),
     name: str(item.name ?? item.zone_name ?? item.title, "Zone"),
