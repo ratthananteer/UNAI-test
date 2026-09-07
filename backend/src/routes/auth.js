@@ -10,7 +10,7 @@ const {
   setAuthCookie,
   clearAuthCookie,
   authRequired,
-} = require("../services/auth");
+} = require("../services/Auth");
 
 const router = express.Router();
 
