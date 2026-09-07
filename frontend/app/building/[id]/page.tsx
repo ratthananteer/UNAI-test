@@ -1,8 +1,8 @@
 // BUILDING DETAIL PAGE:
-// Loads building/floor/anchor/tag/zone data from the backend before rendering
-// the interactive map. Current tag state comes from MongoDB TagLatest through
-// /api/db-tags; realtime Socket.IO is owned by BuildingLiveMap after the page
-// has received its initial backend snapshot.
+// Server-side loads building configuration and the MongoDB current-tag snapshot.
+// Local development talks to the local Express backend; production uses the
+// configured BACKEND_URL. This avoids accidentally calling an old Render
+// deployment during `next dev` and receiving stale/missing routes such as 404 /api/floors.
 
 import Link from "next/link";
 import { BuildingMapModes } from "../../../components/map/BuildingLiveMap";
@@ -10,7 +10,10 @@ import { BuildingMapModes } from "../../../components/map/BuildingLiveMap";
 type DataItem = Record<string, unknown>;
 
 const BACKEND_URL = (
-  process.env.BACKEND_URL || "https://unai-backend.onrender.com"
+  process.env.BACKEND_URL ||
+  (process.env.NODE_ENV === "development"
+    ? "http://localhost:4000"
+    : "https://unai-backend.onrender.com")
 ).replace(/\/$/, "");
 
 function isDataItem(value: unknown): value is DataItem {
@@ -34,7 +37,16 @@ function unwrapItems(json: unknown): DataItem[] {
 
   if (json && typeof json === "object") {
     const object = json as DataItem;
-    for (const candidate of [object.data, object.items, object.results, object.tags]) {
+    for (const candidate of [
+      object.data,
+      object.items,
+      object.results,
+      object.tags,
+      object.floors,
+      object.buildings,
+      object.anchors,
+      object.zones,
+    ]) {
       if (Array.isArray(candidate)) return candidate.filter(isDataItem);
     }
   }
@@ -42,22 +54,48 @@ function unwrapItems(json: unknown): DataItem[] {
   return [];
 }
 
-async function getApi(path: string): Promise<DataItem[]> {
-  try {
-    const response = await fetch(`${BACKEND_URL}${path}`, {
-      cache: "no-store",
-    });
+async function getApi(path: string, fallbackPaths: string[] = []): Promise<DataItem[]> {
+  const paths = [path, ...fallbackPaths];
 
-    if (!response.ok) {
-      console.error(`[Building] ${path} returned HTTP ${response.status}`);
+  for (let index = 0; index < paths.length; index += 1) {
+    const currentPath = paths[index];
+
+    try {
+      const response = await fetch(`${BACKEND_URL}${currentPath}`, {
+        cache: "no-store",
+      });
+
+      if (response.ok) {
+        return unwrapItems(await response.json());
+      }
+
+      // A 404 here is normally caused by an older backend/frontend process.
+      // Try the compatibility route before giving up, but do not hide other
+      // HTTP errors behind a misleading fallback.
+      if (response.status === 404 && index < paths.length - 1) {
+        console.warn(
+          `[Building] ${currentPath} returned HTTP 404; trying ${paths[index + 1]}`,
+        );
+        continue;
+      }
+
+      console.error(`[Building] ${currentPath} returned HTTP ${response.status}`);
+      return [];
+    } catch (error) {
+      if (index < paths.length - 1) {
+        console.warn(
+          `[Building] ${currentPath} failed; trying ${paths[index + 1]}`,
+          error,
+        );
+        continue;
+      }
+
+      console.error(`[Building] ${currentPath} failed:`, error);
       return [];
     }
-
-    return unwrapItems(await response.json());
-  } catch (error) {
-    console.error(`[Building] ${path} failed:`, error);
-    return [];
   }
+
+  return [];
 }
 
 export default async function BuildingPage({
@@ -67,18 +105,19 @@ export default async function BuildingPage({
 }) {
   const { id } = await params;
 
-  // These are independent backend reads, so load them in parallel. The
-  // important change is that the Building map receives CURRENT tag snapshots
-  // from MongoDB (/api/db-tags), rather than tag metadata (/api/tag).
-  // /api/tag describes tags; /api/db-tags contains the latest coordinates and
-  // liveness needed to render the map immediately while Socket.IO starts.
+  // All initial data is loaded before the map is rendered. Current tag
+  // positions come from MongoDB /api/db-tags, while floor/building/anchor/zone
+  // configuration comes from the backend cache-first endpoints.
   const [buildingResponse, floorResponse, anchorResponse, tagResponse, zoneResponse] =
     await Promise.all([
       getApi("/api/v1/get_all_building"),
-      getApi("/api/floors"),
-      getApi("/api/anchor"),
+      getApi(
+        `/api/floors?buildingId=${encodeURIComponent(id)}`,
+        [`/api/v1/get_all_floor?buildingId=${encodeURIComponent(id)}`],
+      ),
+      getApi(`/api/anchor?buildingId=${encodeURIComponent(id)}`),
       getApi(`/api/db-tags?buildingId=${encodeURIComponent(id)}`),
-      getApi("/api/zone"),
+      getApi(`/api/zone?buildingId=${encodeURIComponent(id)}`),
     ]);
 
   const buildings = buildingResponse;
@@ -111,7 +150,7 @@ export default async function BuildingPage({
       if (nestedId !== undefined) return String(nestedId) === id;
     }
 
-    // Keep legacy floor payloads that do not expose a building reference.
+    // Some cached UNAI floor records do not contain a building reference.
     return true;
   });
 

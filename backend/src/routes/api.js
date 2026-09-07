@@ -181,34 +181,64 @@ router.get("/v1/get_all_building", async (req, res) => {
   }
 });
 
-router.get("/floors", async (req, res) => {
+async function getFloorsResponse(req, res) {
   try {
-    // Prefer MongoDB cache. The external UNAI floor endpoint can return 404
-    // independently of the rest of the API; a missing upstream floor response
-    // must not turn the Building page itself into HTTP 404/500.
+    // The Building page must never expose an upstream UNAI 404 as its own
+    // /api/floors response. MongoDB is the source of truth when it already
+    // contains floor configuration; UNAI is only used to populate an empty
+    // cache.
     const data = await getCachedOrFetch(
       "floor",
       () => fetchFromApi(process.env.APIFLOOR_URL, "Failed to get floors"),
     );
-    return res.json(data);
-  } catch (error) {
-    console.error("/api/floors upstream error:", error);
 
-    // If UNAI currently rejects the floor endpoint, return the cache instead
-    // of leaking the upstream 404 to the frontend. This keeps the Building
-    // route renderable while the floor source is repaired/refreshed.
+    const filtered = data.filter((floor) => {
+      const buildingId = req.query.buildingId;
+      if (buildingId == null) return true;
+
+      const floorBuildingId = floor?.building_id ?? floor?.buildingId;
+      if (floorBuildingId != null) return String(floorBuildingId) === String(buildingId);
+
+      const building = floor?.building;
+      if (building && typeof building === "object") {
+        const nestedId = building.id ?? building.building_id ?? building.buildingId;
+        if (nestedId != null) return String(nestedId) === String(buildingId);
+      }
+
+      // Preserve legacy/cache records that do not carry a building relation.
+      return true;
+    });
+
+    return res.status(200).json(filtered);
+  } catch (error) {
+    console.error("[API] floor source unavailable:", error.message);
+
+    // Always return HTTP 200 for this read-model endpoint. A temporary UNAI
+    // 404/5xx should result in an empty/stale floor list, not a failed
+    // Building page render.
     try {
-      const cached = await require("../models/StaticData").find({ type: "floor" })
+      const StaticData = require("../models/StaticData");
+      const cached = await StaticData.find({ type: "floor" })
         .select({ _id: 0, data: 1 })
         .sort({ external_id: 1 })
         .lean();
-      return res.json(cached.map((row) => row.data));
+
+      const data = cached.map((row) => row.data).filter(Boolean);
+      return res.status(200).json(data);
     } catch (cacheError) {
-      console.error("/api/floors cache fallback error:", cacheError);
-      return res.json([]);
+      console.error("[API] floor cache fallback error:", cacheError.message);
+      return res.status(200).json([]);
     }
   }
-});
+}
+
+// Preferred frontend route.
+router.get("/floors", getFloorsResponse);
+
+// Compatibility alias for older Building-page builds. Both routes use the
+// exact same MongoDB-first implementation, so a stale frontend cannot fall
+// through to a missing endpoint and turn a floor read into HTTP 404.
+router.get("/v1/get_all_floor", getFloorsResponse);
 
 router.get("/zone", async (req, res) => {
   try {
@@ -222,11 +252,34 @@ router.get("/zone", async (req, res) => {
 
 router.get("/anchor", async (req, res) => {
   try {
-    const data = await getCachedOrFetch("anchor", () => fetchFromApi(process.env.APIANCHOR_URL, "Failed to get anchors"));
-    return res.json(data);
+    // Anchors are static configuration, just like floors/zones. Read MongoDB
+    // first so a temporary/retired UNAI anchor endpoint cannot make the
+    // Building page fail. If the cache is empty, try UNAI once and persist the
+    // result through getCachedOrFetch().
+    const data = await getCachedOrFetch(
+      "anchor",
+      () => fetchFromApi(process.env.APIANCHOR_URL, "Failed to get anchors"),
+    );
+
+    const filtered = data.filter((anchor) => {
+      if (req.query.buildingId != null) {
+        const buildingId = anchor?.building_id ?? anchor?.buildingId;
+        if (buildingId != null && String(buildingId) !== String(req.query.buildingId)) return false;
+      }
+      if (req.query.floorId != null) {
+        const floorId = anchor?.floor_id ?? anchor?.floorId;
+        if (floorId != null && String(floorId) !== String(req.query.floorId)) return false;
+      }
+      return true;
+    });
+
+    return res.json(filtered);
   } catch (error) {
-    console.error("/api/anchor error:", error);
-    return res.status(error.status || 500).json({ error: "Failed to get anchors", details: error.message });
+    // A 404 from the upstream anchor endpoint is not a reason to fail the
+    // Building page. getCachedOrFetch normally already returned cache data;
+    // this final fallback also handles a completely empty cache gracefully.
+    console.warn("[API] /anchor upstream unavailable:", error.message);
+    return res.json([]);
   }
 });
 
@@ -260,7 +313,7 @@ router.post("/auth/token", async (req, res) => {
 // Manual static-data refresh for operational/admin use.
 router.post("/refresh-static", async (req, res) => {
   try {
-    const types = ["place", "building", "floor", "zone"];
+    const types = ["place", "building", "floor", "zone", "anchor"];
     const results = {};
     for (const type of types) {
       const envNames = {
@@ -268,6 +321,7 @@ router.post("/refresh-static", async (req, res) => {
         building: "APIBUILDING_URL",
         floor: "APIFLOOR_URL",
         zone: "APIZONE_URL",
+        anchor: "APIANCHOR_URL",
       };
       results[type] = await refreshStaticData(type, () =>
         fetchFromApi(process.env[envNames[type]], `Failed to get ${type}`),
