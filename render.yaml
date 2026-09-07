@@ -40,4 +40,4 @@ services:
     dockerContext: ./frontend
     envVars:
       - key: BACKEND_URL
-        sync: false
+        value: https://unai-test.onrender.com
