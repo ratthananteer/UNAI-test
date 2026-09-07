@@ -22,6 +22,16 @@ services:
         value: "2"
       - key: ADMIN_CLEANUP_SECRET
         sync: false
+      - key: AUTH_JWT_SECRET
+        sync: false
+      - key: AUTH_USER_TOKEN_DAYS
+        value: "30"
+      - key: AUTH_ADMIN_TOKEN_MINUTES
+        value: "120"
+      - key: AUTH_ADMIN_USERNAME
+        sync: false
+      - key: AUTH_ADMIN_PASSWORD
+        sync: false
 
   - type: web
     name: unai-frontend
