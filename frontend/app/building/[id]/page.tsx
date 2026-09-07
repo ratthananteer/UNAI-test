@@ -139,7 +139,23 @@ export default async function BuildingPage({
     const tagId = getId(tag.id ?? tag.tagId ?? tag.tag_id);
     if (tagId === undefined) continue;
     const previous = tagById.get(String(tagId));
-    tagById.set(String(tagId), previous ? { ...previous, ...tag } : tag);
+
+    // TagLatest is the live-position source, but it can legitimately contain
+    // null fields when a socket packet did not provide building/floor/name
+    // metadata. Do not let those nulls erase valid /api/tag metadata; otherwise
+    // BuildingLiveMap cannot associate the tag with its floor and renders 0 tags.
+    if (!previous) {
+      tagById.set(String(tagId), tag);
+      continue;
+    }
+
+    const merged: DataItem = { ...previous };
+    for (const [key, value] of Object.entries(tag)) {
+      if (value !== null && value !== undefined && value !== "") {
+        merged[key] = value;
+      }
+    }
+    tagById.set(String(tagId), merged);
   }
   const tags = Array.from(tagById.values()).filter((tag) => {
     const tagBuildingId = getId(tag.buildingId ?? tag.building_id ?? tag.building);

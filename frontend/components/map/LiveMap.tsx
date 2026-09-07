@@ -90,6 +90,14 @@ function isAssetTag(value: unknown): boolean {
 }
 
 function collectObjects(value: unknown, output: Record<string, unknown>[] = []): Record<string, unknown>[] {
+  // Some UNAI socket deployments send the clientBox payload as JSON text.
+  if (typeof value === "string") {
+    try {
+      return collectObjects(JSON.parse(value), output);
+    } catch {
+      return output;
+    }
+  }
   if (!value || typeof value !== "object") return output;
   if (Array.isArray(value)) {
     value.forEach((item) => collectObjects(item, output));
@@ -106,7 +114,10 @@ function collectObjects(value: unknown, output: Record<string, unknown>[] = []):
     object.tag,
     object.tags,
     object.location,
+    object.position,
     object.positions,
+    object.tagData,
+    object.tag_data,
   ].forEach((child) => {
     if (child && typeof child === "object") collectObjects(child, output);
   });
@@ -124,12 +135,35 @@ function findTagUpdates(
   for (const object of collectObjects(payload)) {
     if (isAssetTag(object)) continue;
 
-    const rawTagId = object.tagId ?? object.tag_id ?? object.tagID ?? object.id;
+    const rawTagId =
+      object.tagId ??
+      object.tag_id ??
+      object.tagID ??
+      object.tag_key ??
+      object.id;
     if (rawTagId === undefined || rawTagId === null) continue;
     if (assetTagIds.has(String(rawTagId))) continue;
 
-    const x = numberValue(object.x ?? object.pos_x ?? object.position_x ?? object.location_x);
-    const y = numberValue(object.y ?? object.pos_y ?? object.position_y ?? object.location_y);
+    const position =
+      object.position && typeof object.position === "object"
+        ? (object.position as Record<string, unknown>)
+        : undefined;
+    const x = numberValue(
+      object.x ??
+        object.pos_x ??
+        object.position_x ??
+        object.location_x ??
+        position?.x ??
+        position?.pos_x,
+    );
+    const y = numberValue(
+      object.y ??
+        object.pos_y ??
+        object.position_y ??
+        object.location_y ??
+        position?.y ??
+        position?.pos_y,
+    );
     if (x === null || y === null) continue;
 
     const payloadFloor = object.floorId ?? object.floor_id ?? object.floor ?? object.floorID;
@@ -434,7 +468,6 @@ export default function LiveMap({
     assetTagIdsReadyRef.current = false;
     setActiveTagCheckReady(false);
     let unsubscribeRealtime: (() => void) | null = null;
-    let backendPollTimer: number | null = null;
 
     async function loadAssetTagIds(): Promise<boolean> {
       try {
@@ -582,50 +615,6 @@ export default function LiveMap({
       }
       unsubscribeRealtime = unsubscribe;
 
-      // Backend polling remains as a resilience path, but does not open sockets.
-      const pollBackend = async (): Promise<void> => {
-        try {
-          const response = await fetch(
-            `/api/active-tags?buildingId=${encodeURIComponent(String(buildingId))}&floorId=${encodeURIComponent(String(floor.id))}`,
-            { cache: "no-store" },
-          );
-          if (!response.ok || cancelled) return;
-          const data: unknown = await response.json();
-          const raw =
-            data && typeof data === "object" && Array.isArray((data as { tags?: unknown }).tags)
-              ? (data as { tags: unknown[] }).tags
-              : [];
-          const active = raw.filter((tag): tag is Record<string, unknown> => !isAssetTag(tag));
-          if (!active.length) return;
-
-          const ids = new Set<string>();
-          for (const item of active) {
-            const tagId = item.tagId ?? item.id;
-            if (tagId != null && !assetTagIdsRef.current.has(String(tagId))) {
-              ids.add(String(tagId));
-            }
-          }
-          // Polling supplies liveness only. Socket remains authoritative for
-          // coordinates, so this cannot move a marker backwards.
-          setActiveTagIds((current) => {
-            // Do not replace a non-empty backend snapshot with an empty
-            // transient polling result while TagMonitor is warming up.
-            if (ids.size === 0 && current.size > 0) return current;
-            if (current.size === ids.size && [...current].every((id) => ids.has(id))) return current;
-            return ids;
-          });
-        } catch (error) {
-          if (!cancelled) console.error("[UNAI RTLS] Backend realtime check failed:", error);
-        }
-      };
-
-      void pollBackend();
-      // Liveness is not a render loop. Ten seconds is enough for the
-      // TagMonitor timeout while keeping the map free from periodic state
-      // churn. Socket packets remain the source of coordinates.
-      backendPollTimer = window.setInterval(() => {
-        void pollBackend();
-      }, 10000);
     }
 
     void startRealtime();
@@ -643,10 +632,6 @@ export default function LiveMap({
         messageCountTimerRef.current = null;
       }
       setActiveTagCheckReady(false);
-      if (backendPollTimer !== null) {
-        window.clearInterval(backendPollTimer);
-        backendPollTimer = null;
-      }
       if (unsubscribeRealtime) {
         unsubscribeRealtime();
         unsubscribeRealtime = null;

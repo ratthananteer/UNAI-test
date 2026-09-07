@@ -621,7 +621,13 @@ async function connect() {
   socket = io(SOCKET_URL, {
     path: SOCKET_PATH,
     query: { token },
+    // UNAI's supplied client/documentation uses Socket.IO v3. The
+    // /ble/location5 endpoint also does not expose a working polling
+    // handshake, so use WebSocket only. This prevents a failed EIO=3
+    // WebSocket attempt from turning into a noisy polling 404/CORS loop.
     transports: ["websocket"],
+    upgrade: false,
+    secure: true,
     reconnection: false,
     forceNew: true,
     timeout: 10_000,
