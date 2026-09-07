@@ -1,175 +1,228 @@
-// UNAI AUTH SERVICE:
-// Generates access tokens from the configured UNAI username/password.
-// Tokens are kept in memory through process.env.ACCESS_TOKEN and refreshed
-// before expiry or immediately after an authenticated API request returns 401/403.
-// `refreshPromise` prevents several simultaneous requests from generating
-// several tokens at the same time.
+const crypto = require("crypto");
+const User = require("../models/User");
 
-const path = require("path");
-require("dotenv").config({ path: path.join(__dirname, "..", "..", ".env") });
+const ACCESS_COOKIE = "unai_auth";
+const JWT_ALGORITHM = "HS256";
+const USER_TOKEN_DAYS = Math.max(1, Number(process.env.AUTH_USER_TOKEN_DAYS) || 30);
+const ADMIN_TOKEN_MINUTES = Math.max(5, Number(process.env.AUTH_ADMIN_TOKEN_MINUTES) || 120);
 
-let refreshPromise = null;
-let generatePromise = null;
-let accessTokenExpiresAt = 0;
-let authRateLimitedUntil = 0;
-const AUTH_RATE_LIMIT_COOLDOWN_MS = 60_000;
+function getSecret() {
+  const secret = process.env.AUTH_JWT_SECRET;
+  if (!secret || secret.length < 32) {
+    throw new Error("AUTH_JWT_SECRET must be set and contain at least 32 characters");
+  }
+  return secret;
+}
 
-// Keep a small safety window so we never intentionally use a token that is
-// about to expire. The UNAI token is currently requested for 60 minutes.
-const TOKEN_REFRESH_SKEW_MS = 2 * 60 * 1000;
+function base64url(value) {
+  return Buffer.from(value).toString("base64url");
+}
 
-async function generateAccessTokenRequest() {
-  if (Date.now() < authRateLimitedUntil) {
-    const error = new Error("UNAI authentication is temporarily rate-limited. Please wait before requesting another token.");
-    error.status = 429;
-    error.retryAfterMs = authRateLimitedUntil - Date.now();
-    throw error;
+function signJwt(payload) {
+  const header = base64url(JSON.stringify({ alg: JWT_ALGORITHM, typ: "JWT" }));
+  const body = base64url(JSON.stringify(payload));
+  const unsigned = `${header}.${body}`;
+  const signature = crypto.createHmac("sha256", getSecret()).update(unsigned).digest("base64url");
+  return `${unsigned}.${signature}`;
+}
+
+function verifyJwt(token) {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 3) throw new Error("Invalid token");
+
+  const unsigned = `${parts[0]}.${parts[1]}`;
+  const expected = crypto.createHmac("sha256", getSecret()).update(unsigned).digest();
+  const actual = Buffer.from(parts[2], "base64url");
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
+    throw new Error("Invalid token signature");
   }
 
-  const username = process.env.UNAI_USERNAME;
-  const password = process.env.UNAI_PASSWORD;
-
-  if (!username || !password) {
-    throw new Error("UNAI_USERNAME and UNAI_PASSWORD must be configured in .env");
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  } catch {
+    throw new Error("Invalid token payload");
   }
 
-  const requestBody = new URLSearchParams({
-    username,
-    password,
-    token_expire_time_in_minute: "60",
-    refresh_token_expire_time_in_minute: "60",
-    socket_token_type: "rs256",
+  if (!payload.exp || payload.exp <= Math.floor(Date.now() / 1000)) {
+    throw new Error("Token expired");
+  }
+
+  return payload;
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const N = 16384;
+  const r = 8;
+  const p = 1;
+  const key = crypto.scryptSync(password, salt, 64, { N, r, p, maxmem: 32 * 1024 * 1024 });
+  return `scrypt$${N}$${r}$${p}$${salt}$${key.toString("hex")}`;
+}
+
+function verifyPassword(password, encoded) {
+  const [algorithm, n, r, p, salt, keyHex] = String(encoded || "").split("$");
+  if (algorithm !== "scrypt" || !n || !r || !p || !salt || !keyHex) return false;
+
+  try {
+    const derived = crypto.scryptSync(password, salt, 64, {
+      N: Number(n),
+      r: Number(r),
+      p: Number(p),
+      maxmem: 32 * 1024 * 1024,
+    });
+    const expected = Buffer.from(keyHex, "hex");
+    return expected.length === derived.length && crypto.timingSafeEqual(expected, derived);
+  } catch {
+    return false;
+  }
+}
+
+function normalizeUsername(username) {
+  return String(username || "").trim().toLowerCase();
+}
+
+function validateCredentials(username, password) {
+  const normalized = normalizeUsername(username);
+  if (!/^[a-z0-9._-]{3,64}$/.test(normalized)) {
+    return "Username must be 3-64 characters and use only letters, numbers, ., _, or -.";
+  }
+  if (typeof password !== "string" || password.length < 8 || password.length > 128) {
+    return "Password must be 8-128 characters.";
+  }
+  return null;
+}
+
+function createToken(user, remember) {
+  const now = Math.floor(Date.now() / 1000);
+  const ttl = user.role === "admin"
+    ? ADMIN_TOKEN_MINUTES * 60
+    : (remember ? USER_TOKEN_DAYS * 24 * 60 * 60 : 24 * 60 * 60);
+
+  return signJwt({
+    sub: String(user._id),
+    username: user.username,
+    role: user.role,
+    sv: user.sessionVersion || 0,
+    iat: now,
+    exp: now + ttl,
   });
+}
 
-  // UNAI deployments have used both the root auth route and the /api auth
-  // route. A 404 means the route is not mounted on that deployment, so try
-  // the known route variants before failing the request.
-  const authUrls = [
-    "https://rtls.lailab.online/auth/gen_token",
-    "https://rtls.lailab.online/auth/gen_token/",
-    "https://rtls.lailab.online/api/auth/gen_token",
-    "https://rtls.lailab.online/api/auth/gen_token/",
+function parseCookies(header) {
+  const result = {};
+  for (const item of String(header || "").split(";")) {
+    const index = item.indexOf("=");
+    if (index < 0) continue;
+    const key = item.slice(0, index).trim();
+    const value = item.slice(index + 1).trim();
+    if (key) result[key] = decodeURIComponent(value);
+  }
+  return result;
+}
+
+function getTokenFromRequest(req) {
+  const cookies = parseCookies(req.headers.cookie);
+  return cookies[ACCESS_COOKIE] || null;
+}
+
+async function authenticateRequest(req) {
+  const token = getTokenFromRequest(req);
+  if (!token) return null;
+
+  try {
+    const payload = verifyJwt(token);
+    const user = await User.findById(payload.sub).select("username role sessionVersion").lean();
+    if (!user) return null;
+    if (Number(user.sessionVersion || 0) !== Number(payload.sv || 0)) return null;
+    return { id: String(user._id), username: user.username, role: user.role };
+  } catch {
+    return null;
+  }
+}
+
+function setAuthCookie(res, token, user, remember = true) {
+  const isProduction = process.env.NODE_ENV === "production";
+  const options = [
+    `${ACCESS_COOKIE}=${encodeURIComponent(token)}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
   ];
+  if (isProduction) options.push("Secure");
 
-  let lastStatus = 500;
-  let lastBody = "";
-
-  for (const url of authUrls) {
-    let response;
-    try {
-      response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: requestBody,
-      });
-    } catch (requestError) {
-      console.warn(`[UNAI AUTH] Request failed for ${url}:`, requestError);
-      continue;
-    }
-
-    const body = await response.text().catch(() => "");
-    let data;
-    try {
-      data = JSON.parse(body);
-    } catch {
-      data = null;
-    }
-
-    const accessToken =
-      data?.access_token ??
-      data?.accessToken ??
-      data?.token ??
-      data?.data?.access_token ??
-      data?.data?.accessToken ??
-      data?.data?.token;
-
-    if (response.ok && accessToken) {
-      process.env.ACCESS_TOKEN = accessToken;
-      accessTokenExpiresAt = Date.now() + 60 * 60 * 1000;
-      console.log(`[UNAI AUTH] Access token refreshed successfully via ${url}`);
-      return accessToken;
-    }
-
-    lastStatus = response.status;
-    lastBody = body;
-
-    if (response.status === 429) {
-      const retryAfter = Number(response.headers.get("retry-after"));
-      authRateLimitedUntil = Date.now() + (
-        Number.isFinite(retryAfter) && retryAfter > 0
-          ? Math.min(retryAfter * 1000, 5 * 60 * 1000)
-          : AUTH_RATE_LIMIT_COOLDOWN_MS
-      );
-      const error = new Error("Failed to generate UNAI access token: HTTP 429");
-      error.status = 429;
-      error.body = body;
-      error.retryAfterMs = authRateLimitedUntil - Date.now();
-      throw error;
-    }
-
-    // A 404 is specifically a route mismatch. Continue to the next known
-    // route instead of immediately breaking the Home page.
-    if (response.status === 404) {
-      console.warn(`[UNAI AUTH] ${url} returned 404; trying the next auth route.`);
-      continue;
-    }
-
-    const error = new Error(`Failed to generate UNAI access token: HTTP ${response.status}`);
-    error.status = response.status;
-    error.body = body;
-    throw error;
+  // Normal users get a persistent cookie after choosing Remember me. Admins
+  // deliberately receive a session cookie only, so closing the browser logs
+  // them out.
+  if (user.role === "user" && remember) {
+    const maxAge = USER_TOKEN_DAYS * 24 * 60 * 60;
+    options.push(`Max-Age=${maxAge}`);
   }
 
-  const error = new Error(`Failed to generate UNAI access token: HTTP ${lastStatus}`);
-  error.status = lastStatus;
-  error.body = lastBody;
-  throw error;
+  res.setHeader("Set-Cookie", options.join("; "));
 }
 
-async function generateAccessToken() {
-  // Single-flight even for callers that explicitly request token generation.
-  // This prevents multiple pages/routes from hitting /auth/gen_token at once.
-  if (!generatePromise) {
-    generatePromise = generateAccessTokenRequest().finally(() => {
-      generatePromise = null;
-    });
-  }
-  return generatePromise;
+function clearAuthCookie(res) {
+  const options = [
+    `${ACCESS_COOKIE}=`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    "Max-Age=0",
+  ];
+  if (process.env.NODE_ENV === "production") options.push("Secure");
+  res.setHeader("Set-Cookie", options.join("; "));
 }
 
-async function getAccessToken() {
-  const token = process.env.ACCESS_TOKEN;
-  const stillValid = token && Date.now() < accessTokenExpiresAt - TOKEN_REFRESH_SKEW_MS;
-
-  if (stillValid) return token;
-
-  // Clear an expired in-memory token before generating a replacement.
-  if (token) {
-    process.env.ACCESS_TOKEN = "";
-  }
-
-  if (!refreshPromise) {
-    refreshPromise = generateAccessToken().finally(() => {
-      refreshPromise = null;
-    });
-  }
-
-  return refreshPromise;
+function authRequired() {
+  return async (req, res, next) => {
+    const user = await authenticateRequest(req);
+    if (!user) return res.status(401).json({ error: "Authentication required" });
+    req.user = user;
+    return next();
+  };
 }
 
-async function refreshAccessToken() {
-  // Always replace the current token when an API explicitly reports that it
-  // is unauthorized. Do not return the expired token from getAccessToken().
-  process.env.ACCESS_TOKEN = "";
-  accessTokenExpiresAt = 0;
-
-  if (!refreshPromise) {
-    refreshPromise = generateAccessToken().finally(() => {
-      refreshPromise = null;
-    });
-  }
-
-  return refreshPromise;
+function adminRequired() {
+  return async (req, res, next) => {
+    const user = await authenticateRequest(req);
+    if (!user) return res.status(401).json({ error: "Authentication required" });
+    if (user.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    req.user = user;
+    return next();
+  };
 }
 
-module.exports = { getAccessToken, refreshAccessToken, generateAccessToken };
+async function ensureBootstrapAdmin() {
+  const username = normalizeUsername(process.env.AUTH_ADMIN_USERNAME);
+  const password = process.env.AUTH_ADMIN_PASSWORD;
+  if (!username || !password) return;
+
+  const validationError = validateCredentials(username, password);
+  if (validationError) throw new Error(`AUTH_ADMIN credentials invalid: ${validationError}`);
+
+  const existing = await User.findOne({ username }).select("_id role");
+  if (existing) return;
+
+  await User.create({
+    username,
+    password: hashPassword(password),
+    role: "admin",
+  });
+  console.log(`[Auth] Bootstrap admin created: ${username}`);
+}
+
+module.exports = {
+  ACCESS_COOKIE,
+  hashPassword,
+  verifyPassword,
+  normalizeUsername,
+  validateCredentials,
+  createToken,
+  authenticateRequest,
+  setAuthCookie,
+  clearAuthCookie,
+  authRequired,
+  adminRequired,
+  ensureBootstrapAdmin,
+};
