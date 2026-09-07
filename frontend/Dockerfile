@@ -3,7 +3,8 @@ FROM node:24-alpine AS deps
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci
+RUN npm config set registry https://registry.npmjs.org/ \
+    && npm ci --no-audit --no-fund
 
 FROM node:24-alpine AS builder
 
@@ -24,3 +25,9 @@ ENV HOSTNAME=0.0.0.0
 COPY --from=builder /app ./
 
 CMD ["npm", "start"]
+
+FROM node:24-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+
+
