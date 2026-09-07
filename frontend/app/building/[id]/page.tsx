@@ -105,10 +105,11 @@ export default async function BuildingPage({
 }) {
   const { id } = await params;
 
-  // All initial data is loaded before the map is rendered. Current tag
-  // positions come from MongoDB /api/db-tags, while floor/building/anchor/zone
-  // configuration comes from the backend cache-first endpoints.
-  const [buildingResponse, floorResponse, anchorResponse, tagResponse, zoneResponse] =
+  // Load both the MongoDB latest snapshot and the UNAI tag metadata. MongoDB
+  // is preferred because it contains the latest coordinates, but metadata is
+  // a deliberate fallback so a newly opened Building page can still render
+  // tags before TagLatest has received its first realtime packet.
+  const [buildingResponse, floorResponse, anchorResponse, dbTagResponse, tagMetadataResponse, zoneResponse] =
     await Promise.all([
       getApi("/api/v1/get_all_building"),
       getApi(
@@ -117,14 +118,33 @@ export default async function BuildingPage({
       ),
       getApi(`/api/anchor?buildingId=${encodeURIComponent(id)}`),
       getApi(`/api/db-tags?buildingId=${encodeURIComponent(id)}`),
+      getApi("/api/tag"),
       getApi(`/api/zone?buildingId=${encodeURIComponent(id)}`),
     ]);
 
   const buildings = buildingResponse;
   const floors = floorResponse;
   const anchors = anchorResponse;
-  const tags = tagResponse;
   const zones = zoneResponse;
+
+  // Merge by tag ID. MongoDB wins for live coordinates/status; /api/tag fills
+  // missing metadata and acts as the cold-start source. This prevents the
+  // Building map from becoming completely empty when TagLatest is still cold.
+  const tagById = new Map<string, DataItem>();
+  for (const tag of tagMetadataResponse) {
+    const tagId = getId(tag.id ?? tag.tagId ?? tag.tag_id);
+    if (tagId !== undefined) tagById.set(String(tagId), tag);
+  }
+  for (const tag of dbTagResponse) {
+    const tagId = getId(tag.id ?? tag.tagId ?? tag.tag_id);
+    if (tagId === undefined) continue;
+    const previous = tagById.get(String(tagId));
+    tagById.set(String(tagId), previous ? { ...previous, ...tag } : tag);
+  }
+  const tags = Array.from(tagById.values()).filter((tag) => {
+    const tagBuildingId = getId(tag.buildingId ?? tag.building_id ?? tag.building);
+    return tagBuildingId === undefined || String(tagBuildingId) === id;
+  });
 
   const building = buildings.find((item) => {
     const itemId = getId(item.id ?? item.building_id ?? item.buildingId);

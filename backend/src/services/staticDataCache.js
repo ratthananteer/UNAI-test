@@ -24,8 +24,19 @@ function asArray(value) {
 
 function idOf(item) {
   if (!item || typeof item !== "object") return undefined;
-  const id = item.id ?? item.place_id ?? item.building_id ?? item.floor_id ?? item.zone_id;
-  return id === undefined || id === null ? undefined : String(id);
+  const id =
+    item.id ??
+    item.place_id ??
+    item.building_id ??
+    item.floor_id ??
+    item.floorId ??
+    item.floorID ??
+    item.floor ??
+    item.zone_id ??
+    item.zoneId;
+  return id === undefined || id === null || typeof id === "object"
+    ? undefined
+    : String(id);
 }
 
 async function syncType(type, apiPath) {
@@ -82,6 +93,7 @@ async function syncStaticData() {
     building: ["APIBUILDING_URL", "Failed to get buildings"],
     floor: ["APIFLOOR_URL", "Failed to get floors"],
     zone: ["APIZONE_URL", "Failed to get zones"],
+    anchor: ["APIANCHOR_URL", "Failed to get anchors"],
   };
 
   const results = {};

@@ -73,8 +73,14 @@ let reconnectingKey = "";
 let disconnectTimer: number | null = null;
 let rateLimitedUntil = 0;
 
-const tokenCache = new Map<string, { token: string; expiresAt: number }>();
-const tokenPromises = new Map<string, Promise<string>>();
+type SocketCredentials = {
+  token: string;
+  encryptTopic: string;
+  expiresAt: number;
+};
+
+const tokenCache = new Map<string, SocketCredentials>();
+const tokenPromises = new Map<string, Promise<SocketCredentials>>();
 
 function keyOf(placeId: string | number, buildingId: string | number, floorId: string | number) {
   return `${String(placeId)}:${String(buildingId)}:${String(floorId)}`;
@@ -150,10 +156,10 @@ async function loadSocketIo(): Promise<SocketFactory> {
   return socketIoPromise;
 }
 
-async function getSocketToken(floorId: string | number, forceRefresh = false): Promise<string> {
+async function getSocketCredentials(floorId: string | number, forceRefresh = false): Promise<SocketCredentials> {
   const key = String(floorId);
   const cached = tokenCache.get(key);
-  if (!forceRefresh && cached && cached.expiresAt > Date.now()) return cached.token;
+  if (!forceRefresh && cached && cached.expiresAt > Date.now()) return cached;
 
   const existing = tokenPromises.get(key);
   if (existing && !forceRefresh) return existing;
@@ -171,10 +177,19 @@ async function getSocketToken(floorId: string | number, forceRefresh = false): P
         }
         throw error;
       }
+
       const token = data?.socket_token ?? data?.socketToken ?? data?.token;
+      const encryptTopic = data?.encrypt_topic ?? data?.encryptTopic ?? data?.topic;
       if (!token) throw new Error("Socket topic response did not contain socket_token.");
-      tokenCache.set(key, { token: String(token), expiresAt: Date.now() + TOKEN_CACHE_MS });
-      return String(token);
+      if (!encryptTopic) throw new Error("Socket topic response did not contain encrypt_topic.");
+
+      const credentials = {
+        token: String(token),
+        encryptTopic: String(encryptTopic),
+        expiresAt: Date.now() + TOKEN_CACHE_MS,
+      };
+      tokenCache.set(key, credentials);
+      return credentials;
     })
     .finally(() => tokenPromises.delete(key));
 
@@ -192,15 +207,16 @@ function notify(target: Connection, payload: unknown) {
   }
 }
 
-function joinRooms(target: Connection) {
-  const baseTopic = `${target.placeId}/${target.buildingId}/${target.floorId}`;
-  target.socket.emit("join_room", `${baseTopic}/tag`);
-  target.socket.emit("join_room", `${baseTopic}/anchor`);
-  target.socket.emit("join_room", `${baseTopic}/alert`);
-  target.socket.emit("/broadcastToRoom", {
-    room: "init_unai_location",
-    data: { action: "get_init_unai_location", get_topic: baseTopic },
-  });
+function joinRooms(target: Connection, encryptTopic: string) {
+  // UNAI's documented subscription format is:
+  //   unai/[encrypt_topic]/tag
+  // The previous implementation used join_room with place/building/floor,
+  // which can successfully establish a Socket.IO connection but subscribe to
+  // a room that does not contain tag location events. That produces the exact
+  // symptom seen on Building: LIVE socket + zero tags.
+  const tagTopic = `unai/${encryptTopic}/tag`;
+  target.socket.emit("/join", tagTopic);
+  console.info(`[UNAI REALTIME] JOIN ${tagTopic}`);
 }
 
 function scheduleReconnect(target: Connection, reason: string) {
@@ -247,6 +263,14 @@ function scheduleReconnect(target: Connection, reason: string) {
   }, delay);
 }
 
+function credentialsForConnection(target: Connection): string {
+  const cached = tokenCache.get(String(target.floorId));
+  if (!cached?.encryptTopic) {
+    throw new Error(`No encrypt_topic cached for floor ${String(target.floorId)}.`);
+  }
+  return cached.encryptTopic;
+}
+
 function attachHandlers(target: Connection) {
   const socket = target.socket;
 
@@ -266,7 +290,7 @@ function attachHandlers(target: Connection) {
       message: `Connected to UNAI realtime floor ${String(target.floorId)}.`,
       socketId: undefined,
     });
-    joinRooms(target);
+    joinRooms(target, credentialsForConnection(target));
   });
 
   socket.on("connect_error", (error: unknown) => {
@@ -318,11 +342,14 @@ async function createConnection(
   listeners: Set<RealtimeSubscriber>,
   reconnectAttempt = 0,
 ): Promise<Connection> {
-  const [SocketIO, socketToken] = await Promise.all([loadSocketIo(), getSocketToken(floorId)]);
+  const [SocketIO, credentials] = await Promise.all([
+    loadSocketIo(),
+    getSocketCredentials(floorId),
+  ]);
 
   const socket = SocketIO(SOCKET_URL, {
     path: SOCKET_PATH,
-    query: { token: socketToken },
+    query: { token: credentials.token },
     transports: ["websocket"],
     reconnection: false,
     forceNew: false,

@@ -672,9 +672,10 @@ export default function LiveMap({
       const id = String(tag.id ?? tag.tagId ?? tag.tag_id ?? "");
       if (!id || isAssetTag(tag) || assetTagIdsRef.current.has(id)) return false;
 
-      // Before the liveness check is ready, keep the backend snapshot visible.
-      // Once ready, use the active-tag read model for online filtering.
-      return !activeTagCheckReady || activeTagIds.has(id);
+        // Liveness controls the ONLINE/OFFLINE indicator only. It must never
+      // remove a tag from the map: offline/stale tags still have useful last
+      // coordinates and should remain visible until a newer position arrives.
+      return true;
     });
 
     if (!filter) return safeTags;
@@ -682,6 +683,11 @@ export default function LiveMap({
   }, [tags, activeTagIds, activeTagCheckReady, tagIdFilter]);
 
   const socketTagGroups = useMemo(() => buildTagGroups(visibleTags), [visibleTags]);
+
+  const onlineVisibleCount = useMemo(
+    () => visibleTags.filter((tag) => activeTagIds.has(String(tag.id ?? tag.tagId ?? tag.tag_id))).length,
+    [visibleTags, activeTagIds],
+  );
 
   const statusClass = useMemo(() => {
     if (socketState === "connected") return "bg-emerald-100 text-emerald-700";
@@ -812,7 +818,9 @@ export default function LiveMap({
         <div className="mb-2 flex items-center justify-between">
           <div>
             <h2 className="text-sm font-bold text-slate-800">Tag Groups</h2>
-            <p className="text-xs text-slate-400">Grouped from realtime tag data supplied by the backend</p>
+            <p className="text-xs text-slate-400">
+              {visibleTags.length} tags visible · {onlineVisibleCount} online · offline tags keep their last known position
+            </p>
           </div>
           <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-500">
             {socketTagGroups.length} group{socketTagGroups.length === 1 ? "" : "s"}
@@ -821,8 +829,10 @@ export default function LiveMap({
 
         {socketTagGroups.length === 0 ? (
           <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 p-5 text-center text-sm text-slate-400">
-            Waiting for tag data from backend...
-          </div>
+            {socketState === "connected"
+                ? "No tag with a valid position is available on this floor."
+                : "Waiting for tag data from backend..."}
+            </div>
         ) : (
           <div className="max-h-44 space-y-1.5 overflow-y-auto pr-1">
             {socketTagGroups.map((group) => (

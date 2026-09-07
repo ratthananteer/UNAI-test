@@ -31,7 +31,13 @@ function num(value: unknown): number | null {
 }
 
 function floorId(item: Item): string | number | undefined {
-  return idOf(item.id ?? item.floor_id ?? item.floorId);
+  return idOf(
+    item.id ??
+      item.floor_id ??
+      item.floorId ??
+      item.floorID ??
+      item.floor,
+  );
 }
 
 function belongsToFloor(item: Item, selectedId: string | number): boolean {
