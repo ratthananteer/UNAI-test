@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
 type ApiRecord = Record<string, unknown>;
@@ -90,6 +91,7 @@ function formatLastSeen(value?: string): string {
 }
 
 export default function Home() {
+  const router = useRouter();
   const [anchorData, setAnchorData] = useState<ApiResponse | null>(null);
   const [tagData, setTagData] = useState<ApiResponse | null>(null);
   const [placeData, setPlaceData] = useState<ApiResponse | null>(null);
@@ -270,19 +272,40 @@ export default function Home() {
               Indoor Location Platform
             </div>
             <h1 className="text-4xl font-bold tracking-tight text-slate-900 md:text-5xl">
-              UNAI Real-Time Location System
+              Building Overview
             </h1>
             <p className="mt-3 max-w-2xl text-slate-500">
               Places, buildings and positioning infrastructure connected to your backend API.
             </p>
           </div>
 
-          <Link
-            href="/"
+          <button
+            type="button"
+            onClick={async () => {
+              console.log("[AUTH][HOME] logout button clicked");
+              try {
+                const response = await fetch("/api/auth/logout", {
+                  method: "POST",
+                  credentials: "include",
+                  cache: "no-store",
+                  headers: { "Cache-Control": "no-store" },
+                });
+                const body = await response.text();
+                console.log("[AUTH][HOME] logout response", {
+                  status: response.status,
+                  ok: response.ok,
+                  body,
+                });
+              } catch (error) {
+                console.error("[AUTH][HOME] logout request failed", error);
+              } finally {
+                window.location.replace("/");
+              }
+            }}
             className="rounded-2xl bg-white px-5 py-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-100"
           >
             Log out
-          </Link>
+          </button>
         </header>
 
         {error && (

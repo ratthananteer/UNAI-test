@@ -13,7 +13,7 @@ const BACKEND_URL = (
   process.env.BACKEND_URL ||
   (process.env.NODE_ENV === "development"
     ? "http://localhost:4000"
-    : "https://unai-backend.onrender.com")
+    : "https://unai-test.onrender.com")
 ).replace(/\/$/, "");
 
 function isDataItem(value: unknown): value is DataItem {

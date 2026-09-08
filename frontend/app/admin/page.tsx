@@ -26,7 +26,6 @@ const PANEL_INFO: Record<PanelKey, { title: string; description: string; icon: s
 export default function AdminPage() {
   const [panels, setPanels] = useState<PanelSettings>(DEFAULT_PANELS);
   const [saved, setSaved] = useState(false);
-  const [role, setRole] = useState<string | null>(null);
   const [cleanupSecret, setCleanupSecret] = useState("");
   const [cleanupCount, setCleanupCount] = useState<number | null>(null);
   const [cleanupPreview, setCleanupPreview] = useState<number | null>(null);
@@ -40,8 +39,6 @@ export default function AdminPage() {
   }, []);
 
   useEffect(() => {
-    setRole(localStorage.getItem("userRole"));
-
     const raw = localStorage.getItem("adminPanelVisibility");
     if (!raw) return;
 
@@ -128,27 +125,41 @@ export default function AdminPage() {
             >
               Open Home
             </Link>
-            <Link
-              href="/"
+            <button
+              type="button"
+              onClick={async () => {
+                console.log("[AUTH][ADMIN] logout button clicked");
+                try {
+                  const response = await fetch("/api/auth/logout", {
+                    method: "POST",
+                    credentials: "include",
+                    cache: "no-store",
+                    headers: { "Cache-Control": "no-store" },
+                  });
+                  const body = await response.text();
+                  console.log("[AUTH][ADMIN] logout response", {
+                    status: response.status,
+                    ok: response.ok,
+                    body,
+                  });
+                } catch (error) {
+                  console.error("[AUTH][ADMIN] logout request failed", error);
+                } finally {
+                  window.location.replace("/");
+                }
+              }}
               className="rounded-xl bg-cyan-500 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400"
             >
               Logout
-            </Link>
+            </button>
           </div>
         </header>
-
-        {role !== null && role !== "admin" && (
-          <div className="mb-6 rounded-2xl border border-amber-700/50 bg-amber-100/40 px-5 py-4 text-sm text-amber-200">
-            This page is currently a frontend demo control panel. The role is stored in
-            localStorage and is not server-side authentication.
-          </div>
-        )}
 
         <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <Metric title="Panels visible" value={String(visibleCount)} detail="of 5 dashboard panels" />
           <Metric title="Panels hidden" value={String(5 - visibleCount)} detail="not shown on Home" />
-          <Metric title="Storage" value="Local" detail="browser localStorage" />
-          <Metric title="Mode" value="Admin" detail="configuration only" />
+          <Metric title="Storage" value="Local" detail="dashboard preferences" />
+          <Metric title="Mode" value="Admin" detail="server-authorized" />
         </section>
 
         <section className="mt-6 overflow-hidden rounded-3xl border border-slate-800 bg-slate-50 shadow-xl">
@@ -392,8 +403,8 @@ export default function AdminPage() {
             text="Tag History is not hidden by these switches. Historical playback and stored TagEvent data remain available separately."
           />
           <InfoCard
-            title="Security note"
-            text="The current admin role is a frontend demo. Real production authorization should be enforced by the backend, not localStorage."
+            title="Security"
+            text="Admin access is enforced by the backend. The browser cannot promote a normal user by changing localStorage."
           />
         </section>
       </div>
