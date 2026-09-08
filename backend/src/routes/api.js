@@ -265,11 +265,36 @@ router.get("/v1/get_all_floor", getFloorsResponse);
 
 router.get("/zone", async (req, res) => {
   try {
-    const data = await getCachedOrFetch("zone", () => fetchFromApi(process.env.APIZONE_URL, "Failed to get zones"));
-    return res.json(data);
+    // Zone geometry is static configuration. Keep the normal Building/Home
+    // read path MongoDB-only so opening or refreshing a page can never trigger
+    // an upstream UNAI /zone request and consume the rate limit.
+    const cached = await getCached("zone");
+
+    const filtered = cached.filter((zone) => {
+      if (req.query.buildingId != null) {
+        const buildingId = zone?.building_id ?? zone?.buildingId;
+        if (buildingId != null && String(buildingId) !== String(req.query.buildingId)) return false;
+      }
+      if (req.query.floorId != null) {
+        const floorId = zone?.floor_id ?? zone?.floorId ?? zone?.floorID;
+        if (floorId != null && String(floorId) !== String(req.query.floorId)) return false;
+      }
+      return true;
+    });
+
+    if (cached.length === 0) {
+      console.warn("[API] /zone MongoDB cache is empty; returning [] without calling UNAI");
+    } else {
+      console.log(`[API] /zone MongoDB cache HIT (${cached.length} records)`);
+    }
+
+    res.set("Cache-Control", "private, max-age=30, stale-while-revalidate=300");
+    return res.status(200).json(filtered);
   } catch (error) {
-    console.error("/api/zone error:", error);
-    return res.status(error.status || 500).json({ error: "Failed to get zones", details: error.message });
+    // Zone is optional presentation/configuration data. A MongoDB read failure
+    // must not turn the Building page into a request/retry loop.
+    console.error("[API] /zone MongoDB read failed:", error.message);
+    return res.status(200).json([]);
   }
 });
 
