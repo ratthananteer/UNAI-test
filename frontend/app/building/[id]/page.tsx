@@ -4,6 +4,7 @@
 // configured BACKEND_URL.
 
 import Link from "next/link";
+import { cookies } from "next/headers";
 import { BuildingMapModes } from "../../../components/map/BuildingLiveMap";
 
 type DataItem = Record<string, unknown>;
@@ -12,7 +13,7 @@ const BACKEND_URL = (
   process.env.BACKEND_URL ||
   (process.env.NODE_ENV === "development"
     ? "http://localhost:4000"
-    : "https://unai-test.onrender.com")
+    : "https://unai-backend.onrender.com")
 ).replace(/\/$/, "");
 
 function isDataItem(value: unknown): value is DataItem {
@@ -40,7 +41,11 @@ function unwrapItems(json: unknown): DataItem[] {
   return [];
 }
 
-async function getApi(path: string, fallbackPaths: string[] = []): Promise<DataItem[]> {
+async function getApi(
+  path: string,
+  fallbackPaths: string[] = [],
+  authCookie = "",
+): Promise<DataItem[]> {
   const paths = [path, ...fallbackPaths];
 
   for (let index = 0; index < paths.length; index += 1) {
@@ -56,7 +61,13 @@ async function getApi(path: string, fallbackPaths: string[] = []): Promise<DataI
     });
 
     try {
-      const response = await fetch(url, { cache: "no-store" });
+      const requestHeaders: HeadersInit = {};
+      if (authCookie) requestHeaders.cookie = authCookie;
+
+      const response = await fetch(url, {
+        cache: "no-store",
+        headers: requestHeaders,
+      });
       const elapsedMs = Date.now() - startedAt;
 
       console.log("[BUILDING][RENDER][API] response", {
@@ -112,21 +123,26 @@ export default async function BuildingPage({
   const { id } = await params;
   const renderStartedAt = Date.now();
 
+  const cookieStore = await cookies();
+  const authCookie = cookieStore.toString();
+  const hasAuthCookie = cookieStore.has("unai_auth");
+
   console.log("[BUILDING][RENDER] ===== BUILDING PAGE START =====", {
     id,
     backendUrl: BACKEND_URL,
     nodeEnv: process.env.NODE_ENV,
+    hasAuthCookie,
     timestamp: new Date().toISOString(),
   });
 
   const [buildingResponse, floorResponse, anchorResponse, dbTagResponse, tagMetadataResponse, zoneResponse] =
     await Promise.all([
-      getApi("/api/v1/get_all_building"),
-      getApi(`/api/floors?buildingId=${encodeURIComponent(id)}`, [`/api/v1/get_all_floor?buildingId=${encodeURIComponent(id)}`]),
-      getApi(`/api/anchor?buildingId=${encodeURIComponent(id)}`),
-      getApi(`/api/db-tags?buildingId=${encodeURIComponent(id)}`),
-      getApi("/api/tag"),
-      getApi(`/api/zone?buildingId=${encodeURIComponent(id)}`),
+      getApi("/api/v1/get_all_building", [], authCookie),
+      getApi(`/api/floors?buildingId=${encodeURIComponent(id)}`, [`/api/v1/get_all_floor?buildingId=${encodeURIComponent(id)}`], authCookie),
+      getApi(`/api/anchor?buildingId=${encodeURIComponent(id)}`, [], authCookie),
+      getApi(`/api/db-tags?buildingId=${encodeURIComponent(id)}`, [], authCookie),
+      getApi("/api/tag", [], authCookie),
+      getApi(`/api/zone?buildingId=${encodeURIComponent(id)}`, [], authCookie),
     ]);
 
   const buildings = buildingResponse;
