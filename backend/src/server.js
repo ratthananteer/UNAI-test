@@ -34,7 +34,6 @@ async function startServer() {
 
     // Ensure production indexes exist before starting high-frequency tag work.
     await optimizeDatabase();
-    await ensureBootstrapAdmin();
     startTagMonitor();
 
     app.listen(PORT, "0.0.0.0", () => {
