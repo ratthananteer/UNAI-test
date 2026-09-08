@@ -8,6 +8,7 @@ const { generateAccessToken } = require("../services/unaiAuth");
 const tagEventsRouter = require("./tagEvents");
 const adminRouter = require("./admin");
 const analyticsRouter = require("./analytics");
+const anomaliesRouter = require("./anomalies");
 const { getActiveTags, refreshActiveTags } = require("../services/tagMonitor");
 const { getCached, getCachedOrFetch, refreshStaticData } = require("../services/staticDataCache");
 const TagLatest = require("../models/TagLatest");
@@ -122,8 +123,9 @@ router.use(authRequired());
 // Analytics dashboard.
 router.use("/analytics", analyticsRouter);
 
-// Historical tag events and admin cleanup.
+// Historical tag events, rule-based anomaly history, and admin cleanup.
 router.use("/tag-events", tagEventsRouter);
+router.use("/anomalies", anomaliesRouter);
 router.use("/admin", adminRequired(), adminRouter);
 
 // Current tag state from MongoDB TagLatest.

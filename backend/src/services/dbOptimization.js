@@ -5,6 +5,7 @@
 const TagEvent = require("../models/TagEvent");
 const TagLatest = require("../models/TagLatest");
 const StaticData = require("../models/StaticData");
+const AnomalyEvent = require("../models/AnomalyEvent");
 
 async function backfillTagLatest() {
   // This migration is only needed when TagLatest is empty (first deployment or
@@ -65,6 +66,7 @@ async function optimizeDatabase() {
     TagEvent.createIndexes(),
     TagLatest.createIndexes(),
     StaticData.createIndexes(),
+    AnomalyEvent.createIndexes(),
   ]);
 
   try {

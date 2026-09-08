@@ -4,6 +4,7 @@ const { generateSocketTopic } = require("./unaiApi");
 const { refreshAccessToken } = require("./unaiAuth");
 const TagEvent = require("../models/TagEvent");
 const { getAssetTagIds, isAssetOrKnownAsset } = require("./assetFilter");
+const { evaluateRecord } = require("./anomalyDetector");
 
 // HISTORICAL SOCKET COLLECTOR
 // ---------------------------
@@ -566,6 +567,17 @@ function handleTagPayload(payload) {
     log("PAYLOAD SAMPLE", JSON.stringify(payload).slice(0, 3000));
     return;
   }
+
+  // Anomaly detection runs on every normalized non-asset socket record,
+  // independently from history sampling. This means a fast jump is still
+  // detected even when TagEvent intentionally skips that history point.
+  void Promise.all(
+    records.map((record) =>
+      evaluateRecord(record).catch((error) => {
+        log("ANOMALY DETECTION ERROR:", error?.message || error);
+      }),
+    ),
+  );
 
   enqueueHistorySave(records);
 }

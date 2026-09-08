@@ -5,6 +5,7 @@
 
 const TagLatest = require("../models/TagLatest");
 const { getAssetTagIds } = require("./assetFilter");
+const { markStale } = require("./anomalyDetector");
 
 let monitorTimer = null;
 let latestActiveTags = new Map();
@@ -71,6 +72,16 @@ async function refreshActiveTags() {
   }
 
   latestActiveTags = next;
+
+  // Stale detection is a state transition rule. The detector records one
+  // TAG_STALE anomaly when a tag crosses the timeout, rather than writing the
+  // same anomaly every monitor tick.
+  try {
+    await markStale([...next.values()]);
+  } catch (error) {
+    console.error("[TagMonitor] anomaly check failed:", error.message);
+  }
+
   return next;
 }
 

@@ -7,6 +7,7 @@ const express = require("express");
 const TagEvent = require("../models/TagEvent");
 const TagLatest = require("../models/TagLatest");
 const { getAssetTagIds, isAssetOrKnownAsset } = require("../services/assetFilter");
+const { evaluateRecord } = require("../services/anomalyDetector");
 
 const router = express.Router();
 
@@ -210,6 +211,17 @@ router.post("/", async (req, res) => {
         await TagLatest.bulkWrite(latestOperations, { ordered: false });
       }
     }
+
+    // Keep the existing POST /tag-events contract intact, while also feeding
+    // normalized records into the anomaly engine. The detector is independent
+    // from history sampling and has its own duplicate/cooldown protection.
+    void Promise.all(
+      documents.map((document) =>
+        evaluateRecord(document).catch((error) => {
+          console.error("[TagEvent] anomaly detection failed:", error.message);
+        }),
+      ),
+    );
 
     console.log(
       `[TagEvent] Saved ${events.length} event(s), ` +
