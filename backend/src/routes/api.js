@@ -9,7 +9,7 @@ const tagEventsRouter = require("./tagEvents");
 const adminRouter = require("./admin");
 const analyticsRouter = require("./analytics");
 const { getActiveTags, refreshActiveTags } = require("../services/tagMonitor");
-const { getCachedOrFetch, refreshStaticData } = require("../services/staticDataCache");
+const { getCached, getCachedOrFetch, refreshStaticData } = require("../services/staticDataCache");
 const TagLatest = require("../models/TagLatest");
 const { getAssetTagIds, getTagMetadata } = require("../services/assetFilter");
 const authRouter = require("./auth");
@@ -275,16 +275,18 @@ router.get("/zone", async (req, res) => {
 
 router.get("/anchor", async (req, res) => {
   try {
-    // Anchors are static configuration, just like floors/zones. Read MongoDB
-    // first so a temporary/retired UNAI anchor endpoint cannot make the
-    // Building page fail. If the cache is empty, try UNAI once and persist the
-    // result through getCachedOrFetch().
-    const data = await getCachedOrFetch(
-      "anchor",
-      () => fetchFromApi(process.env.APIANCHOR_URL, "Failed to get anchors"),
-    );
+    // IMPORTANT: Anchor data is static configuration. Never make the Home or
+    // Building page call the upstream UNAI anchor endpoint on every page load.
+    // A cache miss used to trigger an immediate UNAI request, and repeated
+    // refreshes could therefore produce HTTP 429. MongoDB is now the only
+    // source used by this read endpoint.
+    //
+    // To populate/update the cache, use the existing POST /api/refresh-static
+    // operational endpoint when the upstream API is available. This keeps the
+    // normal read path completely isolated from the UNAI rate limit.
+    const cached = await getCached("anchor");
 
-    const filtered = data.filter((anchor) => {
+    const filtered = cached.filter((anchor) => {
       if (req.query.buildingId != null) {
         const buildingId = anchor?.building_id ?? anchor?.buildingId;
         if (buildingId != null && String(buildingId) !== String(req.query.buildingId)) return false;
@@ -296,13 +298,18 @@ router.get("/anchor", async (req, res) => {
       return true;
     });
 
-    return res.json(filtered);
+    if (cached.length === 0) {
+      console.warn("[API] /anchor MongoDB cache is empty; returning [] without calling UNAI");
+    } else {
+      console.log(`[API] /anchor MongoDB cache HIT (${cached.length} records)`);
+    }
+
+    return res.status(200).json(filtered);
   } catch (error) {
-    // A 404 from the upstream anchor endpoint is not a reason to fail the
-    // Building page. getCachedOrFetch normally already returned cache data;
-    // this final fallback also handles a completely empty cache gracefully.
-    console.warn("[API] /anchor upstream unavailable:", error.message);
-    return res.json([]);
+    // Anchor is non-critical static infrastructure for Home. Never turn a
+    // MongoDB read failure into an upstream retry storm or an HTTP 429.
+    console.error("[API] /anchor MongoDB read failed:", error.message);
+    return res.status(200).json([]);
   }
 });
 
