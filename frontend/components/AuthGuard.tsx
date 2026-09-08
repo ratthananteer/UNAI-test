@@ -11,6 +11,7 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const [checking, setChecking] = useState(!PUBLIC_PATHS.includes(pathname));
   const [user, setUser] = useState<User | null>(null);
+  const [loggingOut, setLoggingOut] = useState(false);
 
   useEffect(() => {
     if (PUBLIC_PATHS.includes(pathname)) {
@@ -48,6 +49,38 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
     return () => { cancelled = true; };
   }, [pathname, router]);
 
+  async function handleLogout() {
+    if (loggingOut) return;
+
+    setLoggingOut(true);
+
+    try {
+      // This is the real logout: the backend invalidates the current session
+      // and clears the HttpOnly authentication cookie.
+      const response = await fetch("/api/auth/logout", {
+        method: "POST",
+        credentials: "include",
+        cache: "no-store",
+      });
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data?.error || "Logout failed");
+      }
+
+      // Remove the authenticated user from the client immediately so the
+      // protected UI cannot remain visible while navigation is happening.
+      setUser(null);
+
+      // Replace the history entry so Back does not simply return to the
+      // authenticated page.
+      window.location.replace("/");
+    } catch (error) {
+      console.error("[Auth] logout error:", error);
+      setLoggingOut(false);
+    }
+  }
+
   if (PUBLIC_PATHS.includes(pathname)) return <>{children}</>;
 
   if (checking) {
@@ -61,24 +94,31 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
     );
   }
 
-  return <>{user && <AuthUserBar user={user} />}{children}</>;
+  return <>{user && <AuthUserBar user={user} onLogout={handleLogout} loggingOut={loggingOut} />}{children}</>;
 }
 
-function AuthUserBar({ user }: { user: User }) {
-  const router = useRouter();
-  async function logout() {
-    await fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
-    router.replace("/");
-    router.refresh();
-  }
+function AuthUserBar({
+  user,
+  onLogout,
+  loggingOut,
+}: {
+  user: User;
+  onLogout: () => void;
+  loggingOut: boolean;
+}) {
   return (
     <div className="fixed right-4 top-4 z-[100] flex items-center gap-2 rounded-2xl border border-slate-200 bg-white/95 px-3 py-2 shadow-lg backdrop-blur">
       <div className="hidden text-right sm:block">
         <p className="text-xs font-semibold text-slate-800">{user.username}</p>
         <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{user.role}</p>
       </div>
-      <button type="button" onClick={logout} className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-900">
-        Sign out
+      <button
+        type="button"
+        onClick={onLogout}
+        disabled={loggingOut}
+        className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {loggingOut ? "Signing out…" : "Sign out"}
       </button>
     </div>
   );
