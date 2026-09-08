@@ -12,35 +12,27 @@ const BACKEND_URL =
 const AUTH_COOKIE = "unai_auth";
 
 const HOP_BY_HOP_HEADERS = new Set([
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-  "content-length",
-  "host",
+  "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+  "te", "trailer", "transfer-encoding", "upgrade", "content-length", "host",
 ]);
 
-async function proxy(
-  request: NextRequest,
-  context: { params: Promise<{ path: string[] }> },
-) {
+async function proxy(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
   const { path } = await context.params;
   const suffix = path.map((part) => encodeURIComponent(part)).join("/");
   const isLogout = request.method === "POST" && suffix === "auth/logout";
+  const hasAuthCookie = request.cookies.has(AUTH_COOKIE);
   const target = `${BACKEND_URL.replace(/\/$/, "")}/api/${suffix}${request.nextUrl.search}`;
+
+  if (isLogout) {
+    console.log("[AUTH][PROXY] logout request received", { method: request.method, suffix, hasAuthCookie, target });
+  }
 
   const headers = new Headers();
   request.headers.forEach((value, key) => {
     if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase())) headers.set(key, value);
   });
 
-  const body = ["GET", "HEAD"].includes(request.method)
-    ? undefined
-    : await request.arrayBuffer();
+  const body = ["GET", "HEAD"].includes(request.method) ? undefined : await request.arrayBuffer();
 
   let upstream: Response;
   try {
@@ -54,10 +46,7 @@ async function proxy(
   } catch (error) {
     console.error("[API Proxy] Backend request failed:", target, error);
     return NextResponse.json(
-      {
-        error: "Backend unavailable",
-        details: error instanceof Error ? error.message : String(error),
-      },
+      { error: "Backend unavailable", details: error instanceof Error ? error.message : String(error) },
       { status: 502 },
     );
   }
@@ -69,18 +58,22 @@ async function proxy(
     }
   });
 
-  // Preserve backend Set-Cookie headers (login/register and logout).
-  // Node's fetch Headers supports getSetCookie(), which avoids incorrectly
-  // combining multiple Set-Cookie headers into one value.
-  const setCookies =
-    typeof upstream.headers.getSetCookie === "function"
-      ? upstream.headers.getSetCookie()
-      : upstream.headers.get("set-cookie");
+  const setCookies = typeof upstream.headers.getSetCookie === "function"
+    ? upstream.headers.getSetCookie()
+    : upstream.headers.get("set-cookie");
 
   if (Array.isArray(setCookies)) {
     for (const cookie of setCookies) responseHeaders.append("set-cookie", cookie);
   } else if (setCookies) {
     responseHeaders.set("set-cookie", setCookies);
+  }
+
+  if (isLogout) {
+    console.log("[AUTH][PROXY] backend logout response", {
+      status: upstream.status,
+      ok: upstream.ok,
+      hasSetCookie: Array.isArray(setCookies) ? setCookies.length > 0 : Boolean(setCookies),
+    });
   }
 
   const response = new NextResponse(upstream.body, {
@@ -89,10 +82,6 @@ async function proxy(
     headers: responseHeaders,
   });
 
-  // The browser talks to Next.js, not directly to the backend. Explicitly
-  // delete the host-side HttpOnly cookie on logout as a second layer of
-  // protection. This prevents a stale cookie from making /api/auth/me think
-  // the user is still logged in immediately after signing out.
   if (isLogout) {
     response.cookies.set({
       name: AUTH_COOKIE,
@@ -103,35 +92,16 @@ async function proxy(
       path: "/",
       maxAge: 0,
     });
+    console.log("[AUTH][PROXY] browser auth cookie explicitly cleared", { cookie: AUTH_COOKIE });
   }
 
   return response;
 }
 
-export async function GET(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
-  return proxy(request, context);
-}
-
-export async function POST(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
-  return proxy(request, context);
-}
-
-export async function PUT(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
-  return proxy(request, context);
-}
-
-export async function PATCH(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
-  return proxy(request, context);
-}
-
-export async function DELETE(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
-  return proxy(request, context);
-}
-
-export async function OPTIONS(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
-  return proxy(request, context);
-}
-
-export async function HEAD(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
-  return proxy(request, context);
-}
+export async function GET(request: NextRequest, context: { params: Promise<{ path: string[] }> }) { return proxy(request, context); }
+export async function POST(request: NextRequest, context: { params: Promise<{ path: string[] }> }) { return proxy(request, context); }
+export async function PUT(request: NextRequest, context: { params: Promise<{ path: string[] }> }) { return proxy(request, context); }
+export async function PATCH(request: NextRequest, context: { params: Promise<{ path: string[] }> }) { return proxy(request, context); }
+export async function DELETE(request: NextRequest, context: { params: Promise<{ path: string[] }> }) { return proxy(request, context); }
+export async function OPTIONS(request: NextRequest, context: { params: Promise<{ path: string[] }> }) { return proxy(request, context); }
+export async function HEAD(request: NextRequest, context: { params: Promise<{ path: string[] }> }) { return proxy(request, context); }

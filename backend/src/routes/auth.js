@@ -9,7 +9,6 @@ const {
   authenticateRequest,
   setAuthCookie,
   clearAuthCookie,
-  authRequired,
 } = require("../services/auth");
 
 const router = express.Router();
@@ -32,12 +31,7 @@ router.post("/register", async (req, res) => {
     const exists = await User.exists({ username });
     if (exists) return res.status(409).json({ error: "Username is already registered." });
 
-    const user = await User.create({
-      username,
-      password: hashPassword(password),
-      role: "user",
-    });
-
+    const user = await User.create({ username, password: hashPassword(password), role: "user" });
     const token = createToken(user, true);
     setAuthCookie(res, token, user, true);
     return res.status(201).json({ user: publicUser(user), message: "Registration successful" });
@@ -65,7 +59,6 @@ router.post("/login", async (req, res) => {
 
     user.lastLoginAt = new Date();
     await user.save();
-
     const token = createToken(user, remember);
     setAuthCookie(res, token, user, remember);
     return res.json({ user: publicUser(user) });
@@ -76,18 +69,49 @@ router.post("/login", async (req, res) => {
 });
 
 router.get("/me", async (req, res) => {
+  const hasAuthCookie = String(req.headers.cookie || "").split(";").some((item) => item.trim().startsWith("unai_auth="));
   const user = await authenticateRequest(req);
+  console.log("[AUTH][BACKEND] /me", {
+    hasAuthCookie,
+    authenticated: Boolean(user),
+    username: user?.username,
+    role: user?.role,
+  });
   if (!user) return res.status(401).json({ authenticated: false });
   return res.json({ authenticated: true, user });
 });
 
-router.post("/logout", authRequired(), async (req, res) => {
+// Logout is intentionally idempotent: even if the JWT is already invalid or
+// expired, always clear the browser cookie. This prevents a broken/stale
+// session from blocking logout at authRequired() before the handler runs.
+router.post("/logout", async (req, res) => {
+  const hasAuthCookie = String(req.headers.cookie || "").split(";").some((item) => item.trim().startsWith("unai_auth="));
+  console.log("[AUTH][BACKEND] POST /logout", { hasAuthCookie });
+
   try {
-    await User.findByIdAndUpdate(req.user.id, { $inc: { sessionVersion: 1 } });
+    const user = await authenticateRequest(req);
+    console.log("[AUTH][BACKEND] logout authentication", {
+      authenticated: Boolean(user),
+      username: user?.username,
+      userId: user?.id,
+    });
+
+    if (user?.id) {
+      const result = await User.findByIdAndUpdate(user.id, { $inc: { sessionVersion: 1 } });
+      console.log("[AUTH][BACKEND] session invalidated", {
+        userId: user.id,
+        updated: Boolean(result),
+      });
+    } else {
+      console.log("[AUTH][BACKEND] no valid session; clearing cookie anyway");
+    }
   } catch (error) {
-    console.error("[Auth] logout session invalidation error:", error);
+    console.error("[AUTH][BACKEND] logout invalidation error:", error);
+  } finally {
+    clearAuthCookie(res);
+    console.log("[AUTH][BACKEND] auth cookie cleared");
   }
-  clearAuthCookie(res);
+
   return res.json({ ok: true });
 });
 

@@ -15,34 +15,50 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (PUBLIC_PATHS.includes(pathname)) {
+      console.log("[AUTH][GUARD] public path, skip session check", { pathname });
       setChecking(false);
       return;
     }
 
     let cancelled = false;
     setChecking(true);
+    console.log("[AUTH][GUARD] checking session", { pathname });
 
     fetch("/api/auth/me", {
       cache: "no-store",
       credentials: "include",
     })
       .then(async (response) => {
+        console.log("[AUTH][GUARD] /api/auth/me response", {
+          status: response.status,
+          ok: response.ok,
+        });
         if (!response.ok) throw new Error("unauthenticated");
         return response.json() as Promise<{ authenticated: boolean; user: User }>;
       })
       .then((data) => {
         if (cancelled) return;
+        console.log("[AUTH][GUARD] session result", {
+          authenticated: data?.authenticated,
+          username: data?.user?.username,
+          role: data?.user?.role,
+        });
         if (!data.authenticated || !data.user) {
+          console.log("[AUTH][GUARD] unauthenticated -> redirect /", { pathname });
           router.replace("/");
           return;
         }
         if (pathname.startsWith("/admin") && data.user.role !== "admin") {
+          console.log("[AUTH][GUARD] non-admin -> redirect /home", {
+            username: data.user.username,
+          });
           router.replace("/home");
           return;
         }
         setUser(data.user);
       })
-      .catch(() => {
+      .catch((error) => {
+        console.error("[AUTH][GUARD] session check failed", error);
         if (!cancelled) router.replace("/");
       })
       .finally(() => {
@@ -55,26 +71,35 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
   }, [pathname, router]);
 
   async function handleLogout() {
-    if (loggingOut) return;
+    if (loggingOut) {
+      console.log("[AUTH][CLIENT] logout ignored: already logging out");
+      return;
+    }
 
     setLoggingOut(true);
     setUser(null);
+    console.log("[AUTH][CLIENT] logout button clicked", {
+      pathname,
+    });
+    console.log("[AUTH][CLIENT] sending POST /api/auth/logout");
 
     try {
-      // The backend invalidates the JWT sessionVersion and the Next.js API
-      // proxy also removes the browser-side HttpOnly cookie.
-      await fetch("/api/auth/logout", {
+      const response = await fetch("/api/auth/logout", {
         method: "POST",
         credentials: "include",
         cache: "no-store",
       });
+
+      const body = await response.text();
+      console.log("[AUTH][CLIENT] logout response", {
+        status: response.status,
+        ok: response.ok,
+        body,
+      });
     } catch (error) {
-      // Logout is intentionally fail-closed on the client. Even if the
-      // backend is temporarily unavailable, do not keep showing the private UI.
-      console.error("[Auth] logout request error:", error);
+      console.error("[AUTH][CLIENT] logout request error", error);
     } finally {
-      // Force a fresh request to the login page. Do not use router.push/replace
-      // here because a client-side transition can preserve stale auth state.
+      console.log("[AUTH][CLIENT] redirecting to / after logout");
       window.location.replace("/");
     }
   }
