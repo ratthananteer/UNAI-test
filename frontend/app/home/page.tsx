@@ -270,7 +270,7 @@ export default function Home() {
               Indoor Location Platform
             </div>
             <h1 className="text-4xl font-bold tracking-tight text-slate-900 md:text-5xl">
-              Building Overview
+              UNAI Real-Time Location System
             </h1>
             <p className="mt-3 max-w-2xl text-slate-500">
               Places, buildings and positioning infrastructure connected to your backend API.
