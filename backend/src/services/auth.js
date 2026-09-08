@@ -93,19 +93,63 @@ function validateCredentials(username, password) {
   return null;
 }
 
+function getConfiguredAdmin() {
+  const username = normalizeUsername(process.env.AUTH_ADMIN_USERNAME);
+  const password = process.env.AUTH_ADMIN_PASSWORD;
+
+  if (!username || !password) return null;
+
+  const validationError = validateCredentials(username, password);
+  if (validationError) {
+    throw new Error(`AUTH_ADMIN credentials invalid: ${validationError}`);
+  }
+
+  return { username, password };
+}
+
+function safeEqualStrings(left, right) {
+  const a = Buffer.from(String(left || ""));
+  const b = Buffer.from(String(right || ""));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function isConfiguredAdmin(username, password) {
+  const configured = getConfiguredAdmin();
+  if (!configured) return false;
+  return (
+    normalizeUsername(username) === configured.username &&
+    safeEqualStrings(password, configured.password)
+  );
+}
+
 function createToken(user, remember) {
   const now = Math.floor(Date.now() / 1000);
+  const isEnvAdmin = user.authType === "env-admin";
   const ttl = user.role === "admin"
     ? ADMIN_TOKEN_MINUTES * 60
     : (remember ? USER_TOKEN_DAYS * 24 * 60 * 60 : 24 * 60 * 60);
 
   return signJwt({
-    sub: String(user._id),
+    sub: String(user._id || user.id),
     username: user.username,
     role: user.role,
+    authType: isEnvAdmin ? "env-admin" : "mongo",
     sv: user.sessionVersion || 0,
     iat: now,
     exp: now + ttl,
+  });
+}
+
+function createEnvAdminToken(username) {
+  const now = Math.floor(Date.now() / 1000);
+  return signJwt({
+    sub: `env-admin:${normalizeUsername(username)}`,
+    username: normalizeUsername(username),
+    role: "admin",
+    authType: "env-admin",
+    sv: 0,
+    iat: now,
+    exp: now + ADMIN_TOKEN_MINUTES * 60,
   });
 }
 
@@ -132,10 +176,22 @@ async function authenticateRequest(req) {
 
   try {
     const payload = verifyJwt(token);
+
+    if (payload.authType === "env-admin") {
+      const configured = getConfiguredAdmin();
+      if (!configured || payload.role !== "admin" || payload.username !== configured.username) return null;
+      return {
+        id: String(payload.sub),
+        username: configured.username,
+        role: "admin",
+        authType: "env-admin",
+      };
+    }
+
     const user = await User.findById(payload.sub).select("username role sessionVersion").lean();
     if (!user) return null;
     if (Number(user.sessionVersion || 0) !== Number(payload.sv || 0)) return null;
-    return { id: String(user._id), username: user.username, role: user.role };
+    return { id: String(user._id), username: user.username, role: user.role, authType: "mongo" };
   } catch {
     return null;
   }
@@ -193,23 +249,14 @@ function adminRequired() {
   };
 }
 
+// Render environment credentials are an optional server-only admin identity.
+// They are validated at startup but are NOT copied into MongoDB. This keeps
+// the admin login independent from the users collection.
 async function ensureBootstrapAdmin() {
-  const username = normalizeUsername(process.env.AUTH_ADMIN_USERNAME);
-  const password = process.env.AUTH_ADMIN_PASSWORD;
-  if (!username || !password) return;
-
-  const validationError = validateCredentials(username, password);
-  if (validationError) throw new Error(`AUTH_ADMIN credentials invalid: ${validationError}`);
-
-  const existing = await User.findOne({ username }).select("_id role");
-  if (existing) return;
-
-  await User.create({
-    username,
-    password: hashPassword(password),
-    role: "admin",
-  });
-  console.log(`[Auth] Bootstrap admin created: ${username}`);
+  const configured = getConfiguredAdmin();
+  if (configured) {
+    console.log(`[Auth] Environment admin enabled: ${configured.username}`);
+  }
 }
 
 module.exports = {
@@ -218,7 +265,9 @@ module.exports = {
   verifyPassword,
   normalizeUsername,
   validateCredentials,
+  isConfiguredAdmin,
   createToken,
+  createEnvAdminToken,
   authenticateRequest,
   setAuthCookie,
   clearAuthCookie,

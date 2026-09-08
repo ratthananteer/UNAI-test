@@ -14,6 +14,7 @@ require("dotenv").config({
 const { connectMongo } = require("./services/mongo.js");
 const { optimizeDatabase } = require("./services/dbOptimization.js");
 const { startTagMonitor } = require("./services/tagMonitor.js");
+const { ensureBootstrapAdmin } = require("./services/auth.js");
 
 // Static data is synchronized on demand from the Home page/API.
 // Do not authenticate with UNAI during backend startup.
@@ -34,6 +35,11 @@ async function startServer() {
 
     // Ensure production indexes exist before starting high-frequency tag work.
     await optimizeDatabase();
+
+    // Validate/announce optional Render environment-admin credentials. This
+    // does not create or modify a MongoDB User document.
+    await ensureBootstrapAdmin();
+
     startTagMonitor();
 
     app.listen(PORT, "0.0.0.0", () => {

@@ -5,7 +5,9 @@ const {
   verifyPassword,
   normalizeUsername,
   validateCredentials,
+  isConfiguredAdmin,
   createToken,
+  createEnvAdminToken,
   authenticateRequest,
   setAuthCookie,
   clearAuthCookie,
@@ -57,6 +59,21 @@ router.post("/login", async (req, res) => {
       return res.status(400).json({ error: "Username and password are required." });
     }
 
+    // Server-only admin credentials from Render. This path deliberately does
+    // not create/read a MongoDB user, so the admin can exist only in env vars.
+    if (isConfiguredAdmin(username, password)) {
+      const adminUser = {
+        id: `env-admin:${username}`,
+        username,
+        role: "admin",
+        authType: "env-admin",
+      };
+      const token = createEnvAdminToken(username);
+      setAuthCookie(res, token, adminUser, remember);
+      console.log("[Auth] Environment admin login successful", { username });
+      return res.json({ user: publicUser(adminUser) });
+    }
+
     const user = await User.findOne({ username }).select("+password");
     if (!user || !verifyPassword(password, user.password)) {
       return res.status(401).json({ error: "Invalid username or password." });
@@ -83,7 +100,7 @@ router.get("/me", async (req, res) => {
     role: user?.role,
   });
   if (!user) return res.status(401).json({ authenticated: false });
-  return res.json({ authenticated: true, user });
+  return res.json({ authenticated: true, user: publicUser(user) });
 });
 
 // Logout is intentionally idempotent: even if the JWT is already invalid or
@@ -101,14 +118,16 @@ router.post("/logout", async (req, res) => {
       userId: user?.id,
     });
 
-    if (user?.id) {
+    // Mongo users use sessionVersion invalidation. Environment admins have no
+    // MongoDB record, so clearing the HttpOnly cookie is sufficient.
+    if (user?.id && user.authType !== "env-admin") {
       const result = await User.findByIdAndUpdate(user.id, { $inc: { sessionVersion: 1 } });
       console.log("[AUTH][BACKEND] session invalidated", {
         userId: user.id,
         updated: Boolean(result),
       });
     } else {
-      console.log("[AUTH][BACKEND] no valid session; clearing cookie anyway");
+      console.log("[AUTH][BACKEND] no Mongo session to invalidate; clearing cookie anyway");
     }
   } catch (error) {
     console.error("[AUTH][BACKEND] logout invalidation error:", error);
