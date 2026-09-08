@@ -1,8 +1,7 @@
 // BUILDING DETAIL PAGE:
 // Server-side loads building configuration and the MongoDB current-tag snapshot.
 // Local development talks to the local Express backend; production uses the
-// configured BACKEND_URL. This avoids accidentally calling an old Render
-// deployment during `next dev` and receiving stale/missing routes such as 404 /api/floors.
+// configured BACKEND_URL.
 
 import Link from "next/link";
 import { BuildingMapModes } from "../../../components/map/BuildingLiveMap";
@@ -13,7 +12,7 @@ const BACKEND_URL = (
   process.env.BACKEND_URL ||
   (process.env.NODE_ENV === "development"
     ? "http://localhost:4000"
-    : "https://unai-test.onrender.com")
+    : "https://unai-backend.onrender.com")
 ).replace(/\/$/, "");
 
 function isDataItem(value: unknown): value is DataItem {
@@ -25,32 +24,19 @@ function getId(value: unknown): string | number | undefined {
 }
 
 function getString(value: unknown): string {
-  return typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
+  return typeof value === "string" || typeof value === "number" || typeof value === "boolean"
     ? String(value)
     : "";
 }
 
 function unwrapItems(json: unknown): DataItem[] {
   if (Array.isArray(json)) return json.filter(isDataItem);
-
   if (json && typeof json === "object") {
     const object = json as DataItem;
-    for (const candidate of [
-      object.data,
-      object.items,
-      object.results,
-      object.tags,
-      object.floors,
-      object.buildings,
-      object.anchors,
-      object.zones,
-    ]) {
+    for (const candidate of [object.data, object.items, object.results, object.tags, object.floors, object.buildings, object.anchors, object.zones]) {
       if (Array.isArray(candidate)) return candidate.filter(isDataItem);
     }
   }
-
   return [];
 }
 
@@ -59,38 +45,58 @@ async function getApi(path: string, fallbackPaths: string[] = []): Promise<DataI
 
   for (let index = 0; index < paths.length; index += 1) {
     const currentPath = paths[index];
+    const url = `${BACKEND_URL}${currentPath}`;
+    const startedAt = Date.now();
+
+    console.log("[BUILDING][RENDER][API] request", {
+      path: currentPath,
+      url,
+      backend: BACKEND_URL,
+      environment: process.env.NODE_ENV,
+    });
 
     try {
-      const response = await fetch(`${BACKEND_URL}${currentPath}`, {
-        cache: "no-store",
+      const response = await fetch(url, { cache: "no-store" });
+      const elapsedMs = Date.now() - startedAt;
+
+      console.log("[BUILDING][RENDER][API] response", {
+        path: currentPath,
+        status: response.status,
+        ok: response.ok,
+        elapsedMs,
       });
 
       if (response.ok) {
-        return unwrapItems(await response.json());
+        const json = await response.json();
+        const items = unwrapItems(json);
+        console.log("[BUILDING][RENDER][API] parsed", {
+          path: currentPath,
+          itemCount: items.length,
+        });
+        return items;
       }
 
-      // A 404 here is normally caused by an older backend/frontend process.
-      // Try the compatibility route before giving up, but do not hide other
-      // HTTP errors behind a misleading fallback.
       if (response.status === 404 && index < paths.length - 1) {
-        console.warn(
-          `[Building] ${currentPath} returned HTTP 404; trying ${paths[index + 1]}`,
-        );
+        console.warn(`[Building] ${currentPath} returned HTTP 404; trying ${paths[index + 1]}`);
         continue;
       }
 
-      console.error(`[Building] ${currentPath} returned HTTP ${response.status}`);
+      console.error("[BUILDING][RENDER][API] failed", {
+        path: currentPath,
+        status: response.status,
+      });
       return [];
     } catch (error) {
+      console.error("[BUILDING][RENDER][API] exception", {
+        path: currentPath,
+        url,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
       if (index < paths.length - 1) {
-        console.warn(
-          `[Building] ${currentPath} failed; trying ${paths[index + 1]}`,
-          error,
-        );
+        console.warn(`[Building] ${currentPath} failed; trying ${paths[index + 1]}`);
         continue;
       }
-
-      console.error(`[Building] ${currentPath} failed:`, error);
       return [];
     }
   }
@@ -104,18 +110,19 @@ export default async function BuildingPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
+  const renderStartedAt = Date.now();
 
-  // Load both the MongoDB latest snapshot and the UNAI tag metadata. MongoDB
-  // is preferred because it contains the latest coordinates, but metadata is
-  // a deliberate fallback so a newly opened Building page can still render
-  // tags before TagLatest has received its first realtime packet.
+  console.log("[BUILDING][RENDER] ===== BUILDING PAGE START =====", {
+    id,
+    backendUrl: BACKEND_URL,
+    nodeEnv: process.env.NODE_ENV,
+    timestamp: new Date().toISOString(),
+  });
+
   const [buildingResponse, floorResponse, anchorResponse, dbTagResponse, tagMetadataResponse, zoneResponse] =
     await Promise.all([
       getApi("/api/v1/get_all_building"),
-      getApi(
-        `/api/floors?buildingId=${encodeURIComponent(id)}`,
-        [`/api/v1/get_all_floor?buildingId=${encodeURIComponent(id)}`],
-      ),
+      getApi(`/api/floors?buildingId=${encodeURIComponent(id)}`, [`/api/v1/get_all_floor?buildingId=${encodeURIComponent(id)}`]),
       getApi(`/api/anchor?buildingId=${encodeURIComponent(id)}`),
       getApi(`/api/db-tags?buildingId=${encodeURIComponent(id)}`),
       getApi("/api/tag"),
@@ -127,9 +134,6 @@ export default async function BuildingPage({
   const anchors = anchorResponse;
   const zones = zoneResponse;
 
-  // Merge by tag ID. MongoDB wins for live coordinates/status; /api/tag fills
-  // missing metadata and acts as the cold-start source. This prevents the
-  // Building map from becoming completely empty when TagLatest is still cold.
   const tagById = new Map<string, DataItem>();
   for (const tag of tagMetadataResponse) {
     const tagId = getId(tag.id ?? tag.tagId ?? tag.tag_id);
@@ -139,24 +143,17 @@ export default async function BuildingPage({
     const tagId = getId(tag.id ?? tag.tagId ?? tag.tag_id);
     if (tagId === undefined) continue;
     const previous = tagById.get(String(tagId));
-
-    // TagLatest is the live-position source, but it can legitimately contain
-    // null fields when a socket packet did not provide building/floor/name
-    // metadata. Do not let those nulls erase valid /api/tag metadata; otherwise
-    // BuildingLiveMap cannot associate the tag with its floor and renders 0 tags.
     if (!previous) {
       tagById.set(String(tagId), tag);
       continue;
     }
-
     const merged: DataItem = { ...previous };
     for (const [key, value] of Object.entries(tag)) {
-      if (value !== null && value !== undefined && value !== "") {
-        merged[key] = value;
-      }
+      if (value !== null && value !== undefined && value !== "") merged[key] = value;
     }
     tagById.set(String(tagId), merged);
   }
+
   const tags = Array.from(tagById.values()).filter((tag) => {
     const tagBuildingId = getId(tag.buildingId ?? tag.building_id ?? tag.building);
     return tagBuildingId === undefined || String(tagBuildingId) === id;
@@ -168,35 +165,39 @@ export default async function BuildingPage({
   });
 
   const buildingName = building
-    ? getString(building.name ?? building.building_name ?? building.title) ||
-      `Building ${id}`
+    ? getString(building.name ?? building.building_name ?? building.title) || `Building ${id}`
     : `Building ${id}`;
 
   const buildingFloors = floors.filter((floor) => {
     const floorBuildingId = getId(floor.building_id ?? floor.buildingId);
     if (floorBuildingId !== undefined) return String(floorBuildingId) === id;
-
     const buildingObject = floor.building;
     if (isDataItem(buildingObject)) {
-      const nestedId = getId(
-        buildingObject.id ??
-          buildingObject.building_id ??
-          buildingObject.buildingId,
-      );
+      const nestedId = getId(buildingObject.id ?? buildingObject.building_id ?? buildingObject.buildingId);
       if (nestedId !== undefined) return String(nestedId) === id;
     }
-
-    // Some cached UNAI floor records do not contain a building reference.
     return true;
+  });
+
+  console.log("[BUILDING][RENDER] ===== BUILDING PAGE DATA READY =====", {
+    id,
+    buildingFound: Boolean(building),
+    buildingName,
+    buildings: buildings.length,
+    floors: buildingFloors.length,
+    allFloors: floors.length,
+    anchors: anchors.length,
+    tags: tags.length,
+    dbTags: dbTagResponse.length,
+    tagMetadata: tagMetadataResponse.length,
+    zones: zones.length,
+    elapsedMs: Date.now() - renderStartedAt,
   });
 
   return (
     <main className="min-h-screen bg-gray-50 p-6 text-gray-900">
       <div className="mx-auto max-w-7xl">
-        <Link href="/home" className="text-sm text-blue-600 hover:underline">
-          ← Back to Home
-        </Link>
-
+        <Link href="/home" className="text-sm text-blue-600 hover:underline">← Back to Home</Link>
         <div className="mt-4">
           <h1 className="text-3xl font-bold">{buildingName}</h1>
           <p className="mt-1 text-sm text-gray-500">Building ID: {id}</p>
@@ -207,10 +208,7 @@ export default async function BuildingPage({
           <Stat label="Anchors" value={anchors.length} />
           <Stat label="Tags" value={tags.length} />
           <Stat label="Zones" value={zones.length} />
-          <Stat
-            label="Building"
-            value={building ? "Available" : "Unavailable"}
-          />
+          <Stat label="Building" value={building ? "Available" : "Unavailable"} />
         </section>
 
         <BuildingMapModes
@@ -238,21 +236,9 @@ export default async function BuildingPage({
 }
 
 function Stat({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div className="rounded-xl border bg-white p-4 shadow-sm">
-      <div className="text-sm text-gray-500">{label}</div>
-      <div className="mt-1 text-2xl font-semibold">{value}</div>
-    </div>
-  );
+  return <div className="rounded-xl border bg-white p-4 shadow-sm"><div className="text-sm text-gray-500">{label}</div><div className="mt-1 text-2xl font-semibold">{value}</div></div>;
 }
 
 function ApiStatus({ name, available }: { name: string; available: boolean }) {
-  return (
-    <div className="flex items-center justify-between rounded-lg border px-4 py-3">
-      <span>{name}</span>
-      <span className="text-sm font-medium">
-        {available ? "Available" : "Unavailable"}
-      </span>
-    </div>
-  );
+  return <div className="flex items-center justify-between rounded-lg border px-4 py-3"><span>{name}</span><span className="text-sm font-medium">{available ? "Available" : "Unavailable"}</span></div>;
 }
