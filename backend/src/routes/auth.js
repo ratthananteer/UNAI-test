@@ -13,6 +13,11 @@ const {
 
 const router = express.Router();
 
+// Deployment marker: this must appear once in the unai-backend Render logs
+// after a new deploy. It lets us distinguish the new auth code from an old
+// container that is still serving traffic.
+console.log("[AUTH][BACKEND] auth routes loaded - logout-debug-v2");
+
 function publicUser(user) {
   return {
     id: String(user._id || user.id),

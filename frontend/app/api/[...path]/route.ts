@@ -21,6 +21,15 @@ async function proxy(request: NextRequest, context: { params: Promise<{ path: st
   const suffix = path.map((part) => encodeURIComponent(part)).join("/");
   const isLogout = request.method === "POST" && suffix === "auth/logout";
   const hasAuthCookie = request.cookies.has(AUTH_COOKIE);
+
+  // Server-side marker: this appears in the unai-frontend Render logs when
+  // the browser actually reaches this Next.js API handler. Never log cookie
+  // values or JWTs.
+  console.log("[AUTH][PROXY] request", {
+    method: request.method,
+    path: `/api/${suffix}`,
+    hasAuthCookie,
+  });
   const target = `${BACKEND_URL.replace(/\/$/, "")}/api/${suffix}${request.nextUrl.search}`;
 
   if (isLogout) {
@@ -94,6 +103,12 @@ async function proxy(request: NextRequest, context: { params: Promise<{ path: st
     });
     console.log("[AUTH][PROXY] browser auth cookie explicitly cleared", { cookie: AUTH_COOKIE });
   }
+
+  console.log("[AUTH][PROXY] response", {
+    method: request.method,
+    path: `/api/${suffix}`,
+    status: response.status,
+  });
 
   return response;
 }
