@@ -9,6 +9,8 @@ const BACKEND_URL =
     ? "https://unai-backend.onrender.com"
     : "http://localhost:4000");
 
+const AUTH_COOKIE = "unai_auth";
+
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
   "keep-alive",
@@ -28,6 +30,7 @@ async function proxy(
 ) {
   const { path } = await context.params;
   const suffix = path.map((part) => encodeURIComponent(part)).join("/");
+  const isLogout = request.method === "POST" && suffix === "auth/logout";
   const target = `${BACKEND_URL.replace(/\/$/, "")}/api/${suffix}${request.nextUrl.search}`;
 
   const headers = new Headers();
@@ -66,8 +69,9 @@ async function proxy(
     }
   });
 
-  // Preserve the backend auth cookie. Node 24 exposes getSetCookie(), which
-  // correctly handles multiple Set-Cookie headers from the upstream response.
+  // Preserve backend Set-Cookie headers (login/register and logout).
+  // Node's fetch Headers supports getSetCookie(), which avoids incorrectly
+  // combining multiple Set-Cookie headers into one value.
   const setCookies =
     typeof upstream.headers.getSetCookie === "function"
       ? upstream.headers.getSetCookie()
@@ -79,11 +83,29 @@ async function proxy(
     responseHeaders.set("set-cookie", setCookies);
   }
 
-  return new NextResponse(upstream.body, {
+  const response = new NextResponse(upstream.body, {
     status: upstream.status,
     statusText: upstream.statusText,
     headers: responseHeaders,
   });
+
+  // The browser talks to Next.js, not directly to the backend. Explicitly
+  // delete the host-side HttpOnly cookie on logout as a second layer of
+  // protection. This prevents a stale cookie from making /api/auth/me think
+  // the user is still logged in immediately after signing out.
+  if (isLogout) {
+    response.cookies.set({
+      name: AUTH_COOKIE,
+      value: "",
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      path: "/",
+      maxAge: 0,
+    });
+  }
+
+  return response;
 }
 
 export async function GET(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {

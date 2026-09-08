@@ -22,7 +22,10 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
     let cancelled = false;
     setChecking(true);
 
-    fetch("/api/auth/me", { cache: "no-store" })
+    fetch("/api/auth/me", {
+      cache: "no-store",
+      credentials: "include",
+    })
       .then(async (response) => {
         if (!response.ok) throw new Error("unauthenticated");
         return response.json() as Promise<{ authenticated: boolean; user: User }>;
@@ -46,38 +49,33 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
         if (!cancelled) setChecking(false);
       });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [pathname, router]);
 
   async function handleLogout() {
     if (loggingOut) return;
 
     setLoggingOut(true);
+    setUser(null);
 
     try {
-      // This is the real logout: the backend invalidates the current session
-      // and clears the HttpOnly authentication cookie.
-      const response = await fetch("/api/auth/logout", {
+      // The backend invalidates the JWT sessionVersion and the Next.js API
+      // proxy also removes the browser-side HttpOnly cookie.
+      await fetch("/api/auth/logout", {
         method: "POST",
         credentials: "include",
         cache: "no-store",
       });
-
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(data?.error || "Logout failed");
-      }
-
-      // Remove the authenticated user from the client immediately so the
-      // protected UI cannot remain visible while navigation is happening.
-      setUser(null);
-
-      // Replace the history entry so Back does not simply return to the
-      // authenticated page.
-      window.location.replace("/");
     } catch (error) {
-      console.error("[Auth] logout error:", error);
-      setLoggingOut(false);
+      // Logout is intentionally fail-closed on the client. Even if the
+      // backend is temporarily unavailable, do not keep showing the private UI.
+      console.error("[Auth] logout request error:", error);
+    } finally {
+      // Force a fresh request to the login page. Do not use router.push/replace
+      // here because a client-side transition can preserve stale auth state.
+      window.location.replace("/");
     }
   }
 
@@ -94,7 +92,12 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
     );
   }
 
-  return <>{user && <AuthUserBar user={user} onLogout={handleLogout} loggingOut={loggingOut} />}{children}</>;
+  return (
+    <>
+      {user && <AuthUserBar user={user} onLogout={handleLogout} loggingOut={loggingOut} />}
+      {children}
+    </>
+  );
 }
 
 function AuthUserBar({
