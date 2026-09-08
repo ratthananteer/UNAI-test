@@ -6,7 +6,7 @@ export const runtime = "nodejs";
 const BACKEND_URL =
   process.env.BACKEND_URL ||
   (process.env.NODE_ENV === "production"
-    ? "https://unai-backend.onrender.com"
+    ? "https://unai-test.onrender.com"
     : "http://localhost:4000");
 
 const AUTH_COOKIE = "unai_auth";
