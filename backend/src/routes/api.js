@@ -12,8 +12,13 @@ const { getActiveTags, refreshActiveTags } = require("../services/tagMonitor");
 const { getCachedOrFetch, refreshStaticData } = require("../services/staticDataCache");
 const TagLatest = require("../models/TagLatest");
 const { getAssetTagIds, getTagMetadata } = require("../services/assetFilter");
+const authRouter = require("./auth");
+const { authRequired, adminRequired } = require("../services/auth");
 
 const router = express.Router();
+
+// Authentication is intentionally separate from the RTLS data routes.
+router.use("/auth", authRouter);
 
 function asArray(value, keys = []) {
   if (Array.isArray(value)) return value;
@@ -96,12 +101,30 @@ router.get("/health", (req, res) => {
   res.json({ ok: true, service: "unai-backend", timestamp: new Date().toISOString() });
 });
 
+// The Home page requests a UNAI API access token lazily. This is an internal
+// server-to-server credential exchange and must remain public to the browser
+// because the browser does not have an app session yet. The actual UNAI
+// credentials stay on the backend and are never sent to the browser.
+router.post("/auth/token", async (req, res) => {
+  try {
+    const token = await generateAccessToken();
+    return res.json({ access_token: token });
+  } catch (error) {
+    console.error("/api/auth/token error:", error);
+    return res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// Everything below this point is private. The browser authenticates with the
+// HttpOnly cookie; JavaScript never receives the app JWT itself.
+router.use(authRequired());
+
 // Analytics dashboard.
 router.use("/analytics", analyticsRouter);
 
 // Historical tag events and admin cleanup.
 router.use("/tag-events", tagEventsRouter);
-router.use("/admin", adminRouter);
+router.use("/admin", adminRequired(), adminRouter);
 
 // Current tag state from MongoDB TagLatest.
 router.get("/db-tags", async (req, res) => {
@@ -295,18 +318,6 @@ router.get("/socket-topic", async (req, res) => {
   } catch (error) {
     console.error("/api/socket-topic error:", error);
     return res.status(error.status || 500).json({ error: error.message, details: error.body || undefined });
-  }
-});
-
-// Optional explicit token endpoint for server-side/admin diagnostics. The
-// browser does not need to call this for normal Home/Building operation.
-router.post("/auth/token", async (req, res) => {
-  try {
-    const token = await generateAccessToken();
-    return res.json({ access_token: token });
-  } catch (error) {
-    console.error("/api/auth/token error:", error);
-    return res.status(error.status || 500).json({ error: error.message });
   }
 });
 
