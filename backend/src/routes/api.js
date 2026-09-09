@@ -359,6 +359,58 @@ router.get("/v1/get_all_building", async (req, res) => {
   }
 });
 
+// New UNAI tag-location APIs. These are deliberately exposed as additive
+// backend routes: existing /tag and /db-tags consumers keep their behaviour,
+// while the Building page can opt into the richer last-location read model.
+// The upstream detail endpoint expects its identifier in the `value` query
+// parameter, where value = tag_id.
+function getTagLocationApiUrl(name, fallbackPath) {
+  const configured = process.env[name];
+  if (configured) return configured;
+  return `https://rtls.lailab.online${fallbackPath}`;
+}
+
+router.get("/v1/get_all_tag_last_location", async (req, res) => {
+  try {
+    const url = getTagLocationApiUrl(
+      "APITAG_LAST_LOCATION_URL",
+      "/api/v1/get_all_tag_last_location",
+    );
+    const data = await fetchFromApi(url, "Failed to get all tag last locations");
+    return res.json(data);
+  } catch (error) {
+    console.error("/api/v1/get_all_tag_last_location error:", error);
+    return res.status(error.status || 500).json({
+      error: "Failed to get all tag last locations",
+      details: error.message,
+    });
+  }
+});
+
+router.get("/v1/get_last_location_by_tag_id", async (req, res) => {
+  try {
+    const value = req.query.value;
+    if (value === undefined || value === null || String(value).trim() === "") {
+      return res.status(400).json({ error: "value (tag_id) is required" });
+    }
+
+    const baseUrl = getTagLocationApiUrl(
+      "APITAG_LAST_LOCATION_BY_ID_URL",
+      "/api/v1/get_last_location_by_tag_id",
+    );
+    const separator = baseUrl.includes("?") ? "&" : "?";
+    const url = `${baseUrl}${separator}value=${encodeURIComponent(String(value))}`;
+    const data = await fetchFromApi(url, "Failed to get last location by tag ID");
+    return res.json(data);
+  } catch (error) {
+    console.error("/api/v1/get_last_location_by_tag_id error:", error);
+    return res.status(error.status || 500).json({
+      error: "Failed to get last location by tag ID",
+      details: error.message,
+    });
+  }
+});
+
 async function getFloorsResponse(req, res) {
   try {
     // The Building page must never expose an upstream UNAI 404 as its own

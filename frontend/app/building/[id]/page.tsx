@@ -13,7 +13,7 @@ const BACKEND_URL = (
   process.env.BACKEND_URL ||
   (process.env.NODE_ENV === "development"
     ? "http://localhost:4000"
-    : "https://unai-test.onrender.com")
+    : "https://unai-backend.onrender.com")
 ).replace(/\/$/, "");
 
 function isDataItem(value: unknown): value is DataItem {
@@ -45,6 +45,7 @@ async function getApi(
   path: string,
   fallbackPaths: string[] = [],
   authCookie = "",
+  fallbackOnError = false,
 ): Promise<DataItem[]> {
   const paths = [path, ...fallbackPaths];
 
@@ -87,8 +88,8 @@ async function getApi(
         return items;
       }
 
-      if (response.status === 404 && index < paths.length - 1) {
-        console.warn(`[Building] ${currentPath} returned HTTP 404; trying ${paths[index + 1]}`);
+      if ((response.status === 404 || fallbackOnError) && index < paths.length - 1) {
+        console.warn(`[Building] ${currentPath} returned HTTP ${response.status}; trying ${paths[index + 1]}`);
         continue;
       }
 
@@ -135,12 +136,20 @@ export default async function BuildingPage({
     timestamp: new Date().toISOString(),
   });
 
-  const [buildingResponse, floorResponse, anchorResponse, dbTagResponse, tagMetadataResponse, zoneResponse] =
+  const [buildingResponse, floorResponse, anchorResponse, lastLocationResponse, tagMetadataResponse, zoneResponse] =
     await Promise.all([
       getApi("/api/v1/get_all_building", [], authCookie),
       getApi(`/api/floors?buildingId=${encodeURIComponent(id)}`, [`/api/v1/get_all_floor?buildingId=${encodeURIComponent(id)}`], authCookie),
       getApi(`/api/anchor?buildingId=${encodeURIComponent(id)}`, [], authCookie),
-      getApi(`/api/db-tags?buildingId=${encodeURIComponent(id)}`, [], authCookie),
+      // New API is the preferred current-position source for Building. The
+      // fallback preserves the existing MongoDB read model if UNAI is
+      // temporarily unavailable, so the main Building flow does not break.
+      getApi(
+        "/api/v1/get_all_tag_last_location",
+        [`/api/db-tags?buildingId=${encodeURIComponent(id)}`],
+        authCookie,
+        true,
+      ),
       getApi("/api/tag", [], authCookie),
       getApi(`/api/zone?buildingId=${encodeURIComponent(id)}`, [], authCookie),
     ]);
@@ -150,12 +159,16 @@ export default async function BuildingPage({
   const anchors = anchorResponse;
   const zones = zoneResponse;
 
+  // /get_all_tag_last_location already contains the rich tag metadata used by
+  // Building (name, group, zone, battery, lat/lon and lastSeenAt). Keep /tag as
+  // a compatibility source only: it fills fields when an older backend record
+  // is missing something, without changing the existing tag model.
   const tagById = new Map<string, DataItem>();
-  for (const tag of tagMetadataResponse) {
+  for (const tag of lastLocationResponse) {
     const tagId = getId(tag.id ?? tag.tagId ?? tag.tag_id);
     if (tagId !== undefined) tagById.set(String(tagId), tag);
   }
-  for (const tag of dbTagResponse) {
+  for (const tag of tagMetadataResponse) {
     const tagId = getId(tag.id ?? tag.tagId ?? tag.tag_id);
     if (tagId === undefined) continue;
     const previous = tagById.get(String(tagId));
@@ -163,21 +176,27 @@ export default async function BuildingPage({
       tagById.set(String(tagId), tag);
       continue;
     }
-    const merged: DataItem = { ...previous };
-    for (const [key, value] of Object.entries(tag)) {
+    // New last-location data wins. Metadata only fills fields that are absent
+    // from the new response, preventing stale metadata from overwriting the
+    // current x/y/lastSeenAt/group/zone values.
+    const merged: DataItem = { ...tag };
+    for (const [key, value] of Object.entries(previous)) {
       if (value !== null && value !== undefined && value !== "") merged[key] = value;
     }
     tagById.set(String(tagId), merged);
   }
+  // Keep the old MongoDB snapshot as a second compatibility fallback only
+  // when the new endpoint returns no records. This branch is intentionally not
+  // fetched separately; getApi above already falls back to /db-tags on 404 or
+  // transport failure.
+  const building = buildings.find((item) => {
+    const itemId = getId(item.id ?? item.building_id ?? item.buildingId);
+    return itemId !== undefined && String(itemId) === id;
+  });
 
   const tags = Array.from(tagById.values()).filter((tag) => {
     const tagBuildingId = getId(tag.buildingId ?? tag.building_id ?? tag.building);
     return tagBuildingId === undefined || String(tagBuildingId) === id;
-  });
-
-  const building = buildings.find((item) => {
-    const itemId = getId(item.id ?? item.building_id ?? item.buildingId);
-    return itemId !== undefined && String(itemId) === id;
   });
 
   const buildingName = building
@@ -204,7 +223,7 @@ export default async function BuildingPage({
     allFloors: floors.length,
     anchors: anchors.length,
     tags: tags.length,
-    dbTags: dbTagResponse.length,
+    lastLocations: lastLocationResponse.length,
     tagMetadata: tagMetadataResponse.length,
     zones: zones.length,
     elapsedMs: Date.now() - renderStartedAt,

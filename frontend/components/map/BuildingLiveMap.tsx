@@ -68,6 +68,8 @@ export default function BuildingLiveMap({
   const [followedTagId, setFollowedTagId] = useState("");
   const [userSearch, setUserSearch] = useState("");
   const [selectedUserTagId, setSelectedUserTagId] = useState("");
+  const [selectedLastLocation, setSelectedLastLocation] = useState<Item | undefined>();
+  const [lastLocationLoading, setLastLocationLoading] = useState(false);
 
   const getUserName = (tag: Item): string => {
     const first = str(tag.firstname ?? tag.first_name ?? tag.firstName, "").trim();
@@ -92,6 +94,72 @@ export default function BuildingLiveMap({
     if (!selectedUserTagId) return undefined;
     return tags.find((tag: Item) => String(tag.id ?? tag.tagId ?? tag.tag_id) === selectedUserTagId);
   }, [tags, selectedUserTagId]);
+
+  // Detail lookup is intentionally lazy: it runs only after the user follows
+  // or selects a tag, not for every tag on the Building page. The upstream
+  // endpoint expects `value` to be the tag_id.
+  useEffect(() => {
+    let cancelled = false;
+    if (!followedTagId.trim()) {
+      setSelectedLastLocation(undefined);
+      setLastLocationLoading(false);
+      return;
+    }
+
+    async function loadLastLocation() {
+      setLastLocationLoading(true);
+      try {
+        const response = await fetch(
+          `/api/v1/get_last_location_by_tag_id?value=${encodeURIComponent(followedTagId.trim())}`,
+          { cache: "no-store" },
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const json: unknown = await response.json();
+        if (cancelled) return;
+
+        const object = (() => {
+          if (!json || typeof json !== "object" || Array.isArray(json)) {
+            if (Array.isArray(json)) return json.find((item) => item && typeof item === "object") as Item | undefined;
+            return undefined;
+          }
+          const root = json as Item;
+          if (root.data && typeof root.data === "object" && !Array.isArray(root.data)) return root.data as Item;
+          if (Array.isArray(root.data)) return root.data.find((item) => item && typeof item === "object") as Item | undefined;
+          if (root.item && typeof root.item === "object" && !Array.isArray(root.item)) return root.item as Item;
+          if (root.result && typeof root.result === "object" && !Array.isArray(root.result)) return root.result as Item;
+          return root;
+        })();
+
+        if (object) {
+          setSelectedLastLocation(object);
+          console.log("[BUILDING] Loaded last location by tag ID", {
+            tagId: followedTagId,
+            hasPosition: object.x != null && object.y != null,
+            lastSeenAt: object.lastSeenAt ?? object.last_seen ?? object.timestamp ?? null,
+          });
+        } else {
+          setSelectedLastLocation(undefined);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.warn("[BUILDING] Last-location detail unavailable; keeping existing tag data:", error);
+          setSelectedLastLocation(undefined);
+        }
+      } finally {
+        if (!cancelled) setLastLocationLoading(false);
+      }
+    }
+
+    void loadLastLocation();
+    return () => {
+      cancelled = true;
+    };
+  }, [followedTagId]);
+
+  const selectedUserDisplay = useMemo(() => {
+    if (!selectedUser && !selectedLastLocation) return undefined;
+    return { ...(selectedUser ?? {}), ...(selectedLastLocation ?? {}) };
+  }, [selectedUser, selectedLastLocation]);
 
   const selectedFloor = useMemo(() => usableFloors.find((floor) => String(floorId(floor)) === String(selectedFloorId)), [usableFloors, selectedFloorId]);
 
@@ -150,7 +218,7 @@ export default function BuildingLiveMap({
           <select value={String(selectedFloorId)} onChange={(event) => setSelectedFloorId(event.target.value)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium outline-none focus:border-blue-500" aria-label="Select floor">{usableFloors.map((item) => { const value = floorId(item)!; return <option key={String(value)} value={String(value)}>{str(item.name ?? item.floor_name ?? item.title, `Floor ${String(value)}`)}</option>; })}</select>
         </div>
       </div>
-      {selectedUser && <div className="mx-4 mb-3 rounded-2xl border border-blue-100 bg-blue-50/70 p-4"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-wide text-blue-500">Selected User</p><h3 className="mt-1 text-lg font-bold text-slate-800">{getUserName(selectedUser)}</h3><p className="mt-1 text-xs text-slate-500">Tag ID: {String(selectedUser.id ?? selectedUser.tagId ?? selectedUser.tag_id ?? "—")}</p></div><div className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs"><span className="text-slate-500">Status <strong className={selectedUser.status === 1 ? "text-emerald-600" : "text-rose-600"}>{selectedUser.status === 1 ? "ONLINE" : "OFFLINE"}</strong></span><span className="text-slate-500">Group <strong className="text-slate-700">{str(selectedUser.group_name ?? selectedUser.groupName, "—")}</strong></span><span className="text-slate-500">Position <strong className="text-slate-700">X {str(selectedUser.x, "—")}, Y {str(selectedUser.y, "—")}</strong></span><span className="text-slate-500">Last seen <strong className="text-slate-700">{formatLastSeenValue(selectedUser.lastSeen ?? selectedUser.last_seen ?? selectedUser.lastSeenAt)}</strong></span></div></div></div>}
+      {selectedUserDisplay && <div className="mx-4 mb-3 rounded-2xl border border-blue-100 bg-blue-50/70 p-4"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-wide text-blue-500">Selected User</p><h3 className="mt-1 text-lg font-bold text-slate-800">{getUserName(selectedUserDisplay)}{lastLocationLoading && <span className="ml-2 text-xs font-medium text-blue-500">Updating...</span>}</h3><p className="mt-1 text-xs text-slate-500">Tag ID: {String(selectedUserDisplay.id ?? selectedUserDisplay.tagId ?? selectedUserDisplay.tag_id ?? "—")}</p></div><div className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs"><span className="text-slate-500">Status <strong className={Number(selectedUserDisplay.status) === 1 ? "text-emerald-600" : "text-rose-600"}>{Number(selectedUserDisplay.status) === 1 ? "ONLINE" : "OFFLINE"}</strong></span><span className="text-slate-500">Group <strong className="text-slate-700">{str(selectedUserDisplay.group_name ?? selectedUserDisplay.groupName, "—")}</strong></span><span className="text-slate-500">Position <strong className="text-slate-700">X {str(selectedUserDisplay.x, "—")}, Y {str(selectedUserDisplay.y, "—")}</strong></span><span className="text-slate-500">Last seen <strong className="text-slate-700">{formatLastSeenValue(selectedUserDisplay.lastSeen ?? selectedUserDisplay.last_seen ?? selectedUserDisplay.lastSeenAt ?? selectedUserDisplay.timestamp ?? selectedUserDisplay.date_now)}</strong></span></div></div></div>}
       <LiveMap placeId={placeId} buildingId={buildingId} floor={liveFloor} anchors={liveAnchors} tags={liveTags as Parameters<typeof LiveMap>[0]["tags"]} tagIdFilter={followedTagId} onTagSelect={(tag: LiveMapTag) => { const id = String(tag.id ?? tag.tagId ?? tag.tag_id ?? ""); setSelectedUserTagId(id); setFollowedTagId(id); setTagIdFilter(id); setUserSearch(getUserName(tag)); }} zones={liveZones} />
     </section>
   );
