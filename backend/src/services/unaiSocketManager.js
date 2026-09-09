@@ -43,6 +43,7 @@ let saveQueue = Promise.resolve();
 const SOCKET_URL = process.env.UNAI_SOCKET_URL || "https://socketx.lailab.online";
 const SOCKET_PATH = process.env.UNAI_SOCKET_PATH || "/ble/location5";
 const MAX_BACKOFF_MS = 60_000;
+const UPSTREAM_UNAVAILABLE_BACKOFF_MS = 30_000;
 const RATE_LIMIT_COOLDOWN_MS = 5 * 60_000;
 const SAVE_INTERVAL_MS = Math.max(
   500,
@@ -359,6 +360,35 @@ function normalizeTopics(topics) {
 
 function extractSocketToken(topics) {
   return topics.find((topic) => topic.socketToken)?.socketToken || null;
+}
+
+function getSocketHttpStatus(error) {
+  const description = error?.description;
+
+  if (typeof description === "number") return description;
+
+  const candidates = [
+    error?.message,
+    description?.message,
+    description,
+    error?.data?.message,
+  ];
+
+  for (const candidate of candidates) {
+    const text = String(candidate ?? "");
+    const match = text.match(/(?:response|status)[^\d]*(\d{3})/i);
+    if (match) return Number(match[1]);
+
+    const direct = text.match(/^\s*(4\d\d|5\d\d)\s*$/);
+    if (direct) return Number(direct[1]);
+  }
+
+  return null;
+}
+
+function isUpstreamUnavailableError(error) {
+  const status = getSocketHttpStatus(error);
+  return status === 502 || status === 503 || status === 504;
 }
 
 function isRateLimitError(error) {
@@ -743,6 +773,25 @@ async function connect() {
       cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
       closeSocket();
       scheduleReconnect("rate_limit");
+      return;
+    }
+
+    // 502/503/504 means the WebSocket gateway/upstream is unavailable.
+    // Do NOT regenerate socket credentials here: the handshake already sent
+    // the cached socket_token, and an upstream failure does not prove that the
+    // token is invalid. Repeated immediate retries only add load to a failing
+    // gateway and can trigger the UNAI connection-attempt limiter.
+    if (isUpstreamUnavailableError(error)) {
+      const status = getSocketHttpStatus(error);
+      lastError = `UNAI socket upstream unavailable: HTTP ${status}`;
+      log(
+        `UPSTREAM UNAVAILABLE HTTP ${status}; keeping cached socket credentials`,
+      );
+      closeSocket();
+      scheduleReconnect(
+        "upstream_unavailable",
+        UPSTREAM_UNAVAILABLE_BACKOFF_MS,
+      );
       return;
     }
 
