@@ -652,6 +652,13 @@ async function regenerateTopics() {
       });
     } catch (error) {
       log(`Topic generation failed floor=${topic.floorId}:`, error?.message || error);
+      if (Number(error?.status) === 429 || isRateLimitError(error)) {
+        const retryAfter = Number(error?.retryAfterMs);
+        cooldownUntil = Date.now() + (Number.isFinite(retryAfter) && retryAfter > 0
+          ? Math.min(retryAfter, RATE_LIMIT_COOLDOWN_MS)
+          : RATE_LIMIT_COOLDOWN_MS);
+        throw error;
+      }
     }
   }
 
@@ -683,12 +690,12 @@ async function connect() {
   socket = io(SOCKET_URL, {
     path: SOCKET_PATH,
     query: { token },
-    // The UNAI Postman guide specifies Socket.IO client v3 and the custom
-    // handshake path /ble/location5, but it does not require WebSocket-only
-    // transport. Keep Socket.IO's normal polling -> WebSocket upgrade so the
-    // collector also works when a reverse proxy rejects a direct WS upgrade.
-    transports: ["polling", "websocket"],
-    upgrade: true,
+    // UNAI's documented Socket.IO v3 endpoint uses /ble/location5. The
+    // endpoint returns 404 for Engine.IO polling, so do not probe polling
+    // first. A direct WebSocket handshake avoids the known 404 and also
+    // avoids creating an extra failed connection attempt.
+    transports: ["websocket"],
+    upgrade: false,
     secure: true,
     reconnection: false,
     forceNew: true,
@@ -792,6 +799,17 @@ async function refreshTopics(floors = []) {
       });
     } catch (error) {
       log(`Topic generation failed floor=${floorId}:`, error?.message || error);
+      // Do not continue requesting the remaining floors after UNAI returns
+      // 429. Continuing would turn one rate-limit response into a burst of
+      // additional requests and make the cooldown worse.
+      if (Number(error?.status) === 429 || isRateLimitError(error)) {
+        const retryAfter = Number(error?.retryAfterMs);
+        cooldownUntil = Date.now() + (Number.isFinite(retryAfter) && retryAfter > 0
+          ? Math.min(retryAfter, RATE_LIMIT_COOLDOWN_MS)
+          : RATE_LIMIT_COOLDOWN_MS);
+        setState("RATE_LIMITED");
+        throw error;
+      }
     }
   }
 
@@ -820,7 +838,20 @@ async function start(options = {}) {
   } catch (error) {
     lastError = error?.message || String(error);
     log("START ERROR:", lastError);
-    scheduleReconnect("start_error");
+
+    if (Number(error?.status) === 429 || isRateLimitError(error)) {
+      const retryAfter = Number(error?.retryAfterMs);
+      const delay = Math.max(
+        1_000,
+        Number.isFinite(retryAfter) && retryAfter > 0
+          ? Math.min(retryAfter, RATE_LIMIT_COOLDOWN_MS)
+          : Math.max(1_000, cooldownUntil - Date.now()),
+      );
+      cooldownUntil = Date.now() + delay;
+      scheduleReconnect("rate_limit", delay);
+    } else {
+      scheduleReconnect("start_error");
+    }
   }
 
   return getStatus();

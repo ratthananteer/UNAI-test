@@ -8,7 +8,14 @@ const { getAccessToken, refreshAccessToken } = require("./unaiAuth");
 
 const socketTopicCache = new Map();
 const socketTopicPromises = new Map();
-const SOCKET_TOPIC_CACHE_MS = 5 * 60_000;
+// UNAI documentation states that socket_token expires after 30 days.
+// Cache topic credentials for 29 days and refresh them only when they are
+// missing/expired. This prevents reconnects or Home reloads from repeatedly
+// calling /gen_encrypt_topic and unnecessarily consuming the REST/API limit.
+const SOCKET_TOPIC_CACHE_MS = Math.max(
+  60_000,
+  Number(process.env.UNAI_SOCKET_TOPIC_CACHE_MS) || 29 * 24 * 60 * 60_000,
+);
 
 async function fetchFromApi(url, errorMessage, retryAfterUnauthorized = true) {
   if (!url) {
