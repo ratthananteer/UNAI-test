@@ -249,7 +249,6 @@ export type LiveMapProps = {
   anchors: Anchor[];
   tags: Tag[];
   tagIdFilter?: string;
-  groupFilters?: string[];
   onTagSelect?: (tag: Tag) => void;
   zones: Zone[];
 };
@@ -261,7 +260,6 @@ export default function LiveMap({
   anchors,
   tags: initialTags,
   tagIdFilter = "",
-  groupFilters = [],
   onTagSelect,
   zones,
 }: LiveMapProps) {
@@ -652,7 +650,6 @@ export default function LiveMap({
 
   const visibleTags = useMemo(() => {
     const filter = tagIdFilter.trim();
-    const selectedGroups = new Set(groupFilters.map((value) => String(value)));
 
     // Backend/MongoDB data is the initial source of truth for this page. Do not
     // replace it with an empty array while the Asset denylist or liveness check
@@ -661,16 +658,7 @@ export default function LiveMap({
       const id = String(tag.id ?? tag.tagId ?? tag.tag_id ?? "");
       if (!id || isAssetTag(tag) || assetTagIdsRef.current.has(id)) return false;
 
-      // Group filtering is opt-in. An empty selection means "show all groups".
-      // Support both group IDs and group names because UNAI/MongoDB payloads
-      // can provide either field depending on the source of the tag record.
-      if (selectedGroups.size > 0) {
-        const groupId = String(tag.group_id ?? tag.groupId ?? "");
-        const groupName = String(tag.group_name ?? tag.groupName ?? tag.group ?? "").trim();
-        if (!selectedGroups.has(groupId) && !selectedGroups.has(groupName)) return false;
-      }
-
-      // Liveness controls the ONLINE/OFFLINE indicator only. It must never
+        // Liveness controls the ONLINE/OFFLINE indicator only. It must never
       // remove a tag from the map: offline/stale tags still have useful last
       // coordinates and should remain visible until a newer position arrives.
       return true;
@@ -678,7 +666,7 @@ export default function LiveMap({
 
     if (!filter) return safeTags;
     return safeTags.filter((tag) => String(tag.id ?? tag.tagId ?? tag.tag_id ?? "") === filter);
-  }, [tags, activeTagIds, activeTagCheckReady, tagIdFilter, groupFilters]);
+  }, [tags, activeTagIds, activeTagCheckReady, tagIdFilter]);
 
   const socketTagGroups = useMemo(() => buildTagGroups(visibleTags), [visibleTags]);
 
