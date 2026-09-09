@@ -34,6 +34,7 @@ const listeners = new Set<Listener>();
 let retryTimer: number | null = null;
 let retryAttempt = 0;
 let rateLimitedUntil = 0;
+let authenticationRequired = false;
 
 const MAX_RETRY_MS = 60_000;
 const RATE_LIMIT_WAIT_MS = 5 * 60_000;
@@ -105,6 +106,10 @@ function clearRetryTimer() {
 }
 
 function scheduleRetry(reason: "disconnect" | "rate_limit" | "error") {
+  // A 401 from /api/realtime means the application session is missing or
+  // expired. Retrying the same SSE request cannot restore authentication and
+  // only creates a reconnect loop. Wait for a fresh login instead.
+  if (authenticationRequired) return;
   if (retryTimer !== null || listeners.size === 0) return;
 
   const now = Date.now();
@@ -144,7 +149,42 @@ function closeSharedSource() {
 
 async function connectShared(): Promise<void> {
   if (listeners.size === 0 || typeof window === "undefined") return;
+  if (authenticationRequired) return;
   if (eventSource || startPromise) return startPromise ?? Promise.resolve();
+
+  // EventSource cannot expose the HTTP response status from onerror. Check the
+  // app session explicitly first so an expired/missing cookie becomes a clear
+  // authentication state instead of an endless "disconnected" reconnect loop.
+  try {
+    const authResponse = await fetch("/api/auth/me", {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+      headers: { "Cache-Control": "no-store" },
+    });
+
+    if (authResponse.status === 401) {
+      authenticationRequired = true;
+      clearRetryTimer();
+      notifyStatus({
+        state: "error",
+        message: "Authentication required. Please sign in again.",
+      });
+      return;
+    }
+
+    if (!authResponse.ok) {
+      scheduleRetry("error");
+      return;
+    }
+  } catch (error) {
+    notifyStatus({
+      state: "error",
+      message: "Unable to verify the login session. Retrying...",
+    });
+    scheduleRetry("error");
+    return;
+  }
 
   const now = Date.now();
   if (now < rateLimitedUntil) {
@@ -215,6 +255,10 @@ async function connectShared(): Promise<void> {
 
         if (listeners.size === 0) return;
 
+        // The EventSource API does not expose the HTTP status here. Before
+        // retrying, the next connectShared() call verifies /api/auth/me and
+        // stops permanently if the session has expired.
+
         // EventSource already performs its own automatic reconnect. We close it
         // deliberately and use one controlled timer instead, because the UNAI
         // upstream has a connection-attempt limiter and browser-native retries
@@ -242,6 +286,10 @@ export async function subscribeUnaiRealtime(options: RealtimeOptions): Promise<(
   listeners.add(listener);
 
   if (listeners.size === 1) {
+    // A new subscription after a previous 401 is allowed to re-check the
+    // session. This is useful after the user logs in again without a full app
+    // reload.
+    authenticationRequired = false;
     await connectShared();
   } else if (eventSource) {
     options.onStatus?.({ state: "connected", message: "Using shared realtime stream." });
@@ -257,6 +305,7 @@ export async function subscribeUnaiRealtime(options: RealtimeOptions): Promise<(
       closeSharedSource();
       retryAttempt = 0;
       rateLimitedUntil = 0;
+      authenticationRequired = false;
     }
   };
 }

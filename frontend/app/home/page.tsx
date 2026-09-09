@@ -35,6 +35,8 @@ async function getApi(path: string): Promise<ApiResponse> {
   // Use Next.js proxy so the browser never connects directly to localhost:4000.
   const response = await fetch(path, {
     cache: "no-store",
+    credentials: "include",
+    headers: { "Cache-Control": "no-store" },
   });
 
   if (!response.ok) {
@@ -53,9 +55,11 @@ async function getApi(path: string): Promise<ApiResponse> {
       // The backend may return a non-JSON error body.
     }
 
-    throw new Error(
+    const error = new Error(
       `Failed to fetch ${path}: HTTP ${response.status}${details ? ` — ${details}` : ""}`,
     );
+    (error as Error & { status?: number }).status = response.status;
+    throw error;
   }
 
   return response.json() as Promise<ApiResponse>;
@@ -251,8 +255,16 @@ export default function Home() {
       } catch (err) {
         if (!cancelled) {
           const message = err instanceof Error ? err.message : String(err);
+          const status = err instanceof Error ? (err as Error & { status?: number }).status : undefined;
           setError(message);
           console.error("[UNAI HOME] API loading failed:", message);
+
+          // Do not keep a protected Home page in a broken state when the app
+          // session has expired. The backend deliberately returns 401 for all
+          // private data routes, so the correct recovery is a fresh login.
+          if (status === 401) {
+            window.location.replace("/");
+          }
         }
       } finally {
         if (!cancelled) setLoading(false);
