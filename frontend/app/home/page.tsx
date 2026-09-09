@@ -2,9 +2,17 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import { subscribeUnaiRealtime, type RealtimeState } from "../../lib/unaiRealtime";
 
 type ApiRecord = Record<string, unknown>;
 type ApiResponse = ApiRecord[] | ApiRecord;
+
+type ScalarId = string | number | undefined;
+
+function getScalarId(item: ApiRecord): ScalarId {
+  const value = item.id ?? item.tagId ?? item.tag_id ?? item.tagID;
+  return typeof value === "string" || typeof value === "number" ? value : undefined;
+}
 
 type Anchor = ApiRecord & { status?: number };
 type Tag = ApiRecord & {
@@ -96,6 +104,8 @@ export default function Home() {
   const [buildingData, setBuildingData] = useState<ApiResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [realtimeState, setRealtimeState] = useState<RealtimeState>("loading");
+  const [realtimeMessage, setRealtimeMessage] = useState("Starting shared realtime stream...");
   const [panelVisibility, setPanelVisibility] = useState({
     stats: true,
     tags: true,
@@ -103,6 +113,94 @@ export default function Home() {
     buildings: true,
     api: true,
   });
+
+  // HOME realtime uses the same backend-owned SSE connection as LiveMap.
+  // There is no direct UNAI Socket.IO connection in this page. The shared
+  // client deduplicates subscribers and controls reconnect/backoff, while the
+  // backend owns the single upstream UNAI socket.
+  useEffect(() => {
+    let cancelled = false;
+    let unsubscribe: (() => void) | null = null;
+
+    void subscribeUnaiRealtime({
+      onStatus: ({ state, message }) => {
+        if (cancelled) return;
+        setRealtimeState(state);
+        setRealtimeMessage(message);
+      },
+      onTag: ({ payload }) => {
+        if (cancelled) return;
+
+        const records = Array.isArray(payload) ? payload : [];
+        if (!records.length) return;
+
+        setTagData((current) => {
+          const currentItems = getItems(current ?? []);
+          const next = [...currentItems];
+
+          for (const record of records) {
+            if (!record || typeof record !== "object") continue;
+            const item = record as ApiRecord;
+            const rawId = item.tagId ?? item.tag_id ?? item.tagID ?? item.id;
+            const id: ScalarId =
+              typeof rawId === "string" || typeof rawId === "number" ? rawId : undefined;
+            if (id == null || String(id) === "") continue;
+
+            const tagId = String(id);
+            const index = next.findIndex(
+              (tag) => String(tag.tagId ?? tag.tag_id ?? tag.id ?? "") === tagId,
+            );
+            const timestampValue = item.timestamp ?? item.time ?? item.lastSeenAt ?? item.receivedAt;
+            let lastSeen: string | undefined;
+            if (typeof timestampValue === "number") {
+              const date = new Date(timestampValue < 100_000_000_000 ? timestampValue * 1000 : timestampValue);
+              if (!Number.isNaN(date.getTime())) lastSeen = date.toISOString();
+            } else if (typeof timestampValue === "string") {
+              const date = new Date(timestampValue);
+              if (!Number.isNaN(date.getTime())) lastSeen = date.toISOString();
+            }
+
+            const livePatch: Tag = {
+              ...(index >= 0 ? (next[index] as Tag) : {}),
+              ...item,
+              id,
+              tagId: id,
+              buildingId: (item.buildingId ?? item.building_id ?? item.building ?? (index >= 0 ? (next[index] as Tag).buildingId : null)) as string | number | null,
+              floorId: (item.floorId ?? item.floor_id ?? item.floor ?? (index >= 0 ? (next[index] as Tag).floorId : null)) as string | number | null,
+              groupId: (item.groupId ?? item.group_id ?? (index >= 0 ? (next[index] as Tag).groupId : null)) as string | number | null,
+              groupName: (item.groupName ?? item.group_name ?? (index >= 0 ? (next[index] as Tag).groupName : null)) as string | null,
+              tagName: (item.tagName ?? item.tag_name ?? (index >= 0 ? (next[index] as Tag).tagName : null)) as string | null,
+              x: typeof item.x === "number" ? item.x : Number.isFinite(Number(item.x)) ? Number(item.x) : (index >= 0 ? (next[index] as Tag).x : null),
+              y: typeof item.y === "number" ? item.y : Number.isFinite(Number(item.y)) ? Number(item.y) : (index >= 0 ? (next[index] as Tag).y : null),
+              z: typeof item.z === "number" ? item.z : Number.isFinite(Number(item.z)) ? Number(item.z) : (index >= 0 ? (next[index] as Tag).z : null),
+              status: 1,
+              statusText: "ONLINE",
+              ...(lastSeen ? { lastSeen } : {}),
+            };
+
+            if (index >= 0) next[index] = livePatch;
+            else next.push(livePatch);
+          }
+
+          return next;
+        });
+      },
+    }).then((cleanup) => {
+      if (cancelled) cleanup();
+      else unsubscribe = cleanup;
+    }).catch((subscriptionError) => {
+      if (!cancelled) {
+        console.error("[UNAI HOME] Shared realtime subscription failed:", subscriptionError);
+        setRealtimeState("error");
+        setRealtimeMessage("Realtime stream could not be started.");
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
+  }, []);
 
   useEffect(() => {
     const savedPanels = localStorage.getItem("adminPanelVisibility");
@@ -133,9 +231,8 @@ export default function Home() {
         // /api/auth/token from the browser: every real UNAI API request already
         // obtains/reuses the backend token, and the token must never be exposed
         // to the frontend.
-        // HOME gets its initial snapshot from the backend. Realtime updates are
-        // delivered separately through the backend-owned SSE stream below.
-        // The browser never receives a UNAI token and never connects to UNAI.
+        // HOME gets its current snapshot from MongoDB-backed backend routes.
+        // The browser does not connect to UNAI directly.
         const [anchors, tags, places, buildings] = await Promise.all([
           getApi("/api/anchor"),
           // Current tag location/status comes from MongoDB. This endpoint uses
@@ -148,9 +245,6 @@ export default function Home() {
         if (cancelled) return;
 
         setAnchorData(anchors);
-        // Keep the MongoDB snapshot as the initial state. The SSE stream below
-        // will merge live updates into this same state without replacing the
-        // backend-owned connection architecture.
         setTagData(getItems(tags) as Tag[]);
         setPlaceData(places);
         setBuildingData(buildings);
@@ -169,92 +263,6 @@ export default function Home() {
 
     return () => {
       cancelled = true;
-    };
-  }, []);
-
-  // Realtime tag updates come from ONE backend-owned SSE stream. The backend
-  // owns the single UNAI Socket.IO connection and broadcasts normalized tag
-  // updates to every Home tab. There is no browser-side UNAI token generation,
-  // polling loop, or direct connection to socket.lailab.online.
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    let source: EventSource | null = null;
-    let cancelled = false;
-
-    const mergeTags = (incoming: unknown) => {
-      if (!incoming || typeof incoming !== "object") return;
-      const record = incoming as Record<string, unknown>;
-      const rawTags = record.tags;
-      if (!Array.isArray(rawTags)) return;
-
-      setTagData((current) => {
-        const existing = current ? (getItems(current) as Tag[]) : [];
-        const byId = new Map(existing.map((tag) => [String(tag.tagId ?? tag.id), tag]));
-
-        for (const raw of rawTags) {
-          if (!raw || typeof raw !== "object") continue;
-          const item = raw as Record<string, unknown>;
-          const id = item.tagId ?? item.id;
-          if (id == null) continue;
-
-          const tagId = String(id);
-          const timestamp = item.timestamp;
-          const lastSeen = timestamp != null ? String(timestamp) : undefined;
-          const status = item.status === 0 || item.status === "0" ? 0 : 1;
-          const statusText = status === 1 ? "ONLINE" : "OFFLINE";
-          byId.set(tagId, {
-            ...(byId.get(tagId) ?? {}),
-            ...item,
-            id: tagId,
-            tagId,
-            status,
-            statusText,
-            lastSeen,
-          } as Tag);
-        }
-
-        return [...byId.values()];
-      });
-    };
-
-    const connect = () => {
-      if (cancelled) return;
-      source = new EventSource("/api/realtime");
-
-      source.addEventListener("snapshot", (event) => {
-        try {
-          mergeTags(JSON.parse((event as MessageEvent).data));
-        } catch (error) {
-          console.error("[UNAI HOME][REALTIME] invalid snapshot:", error);
-        }
-      });
-
-      source.addEventListener("tags", (event) => {
-        try {
-          mergeTags(JSON.parse((event as MessageEvent).data));
-        } catch (error) {
-          console.error("[UNAI HOME][REALTIME] invalid tag event:", error);
-        }
-      });
-
-      source.addEventListener("heartbeat", () => {
-        // Heartbeats keep proxies/load balancers from closing an idle SSE stream.
-      });
-
-      source.addEventListener("error", () => {
-        // EventSource performs its own reconnect using the server-provided
-        // retry interval. We intentionally do not create another source here.
-        console.warn("[UNAI HOME][REALTIME] stream temporarily unavailable; waiting for SSE reconnect");
-      });
-    };
-
-    connect();
-
-    return () => {
-      cancelled = true;
-      source?.close();
-      source = null;
     };
   }, []);
 
@@ -310,9 +318,13 @@ export default function Home() {
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={async () => {
+          <div className="flex items-center gap-2">
+            <Link href="/anomalies" className="rounded-2xl bg-white px-5 py-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-100">
+              Anomaly Center
+            </Link>
+            <button
+              type="button"
+              onClick={async () => {
               console.log("[AUTH][HOME] logout button clicked");
               try {
                 const response = await fetch("/api/auth/logout", {
@@ -332,11 +344,12 @@ export default function Home() {
               } finally {
                 window.location.replace("/");
               }
-            }}
-            className="rounded-2xl bg-white px-5 py-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-100"
-          >
-            Log out
-          </button>
+              }}
+              className="rounded-2xl bg-white px-5 py-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-100"
+            >
+              Log out
+            </button>
+          </div>
         </header>
 
         {error && (
@@ -350,6 +363,15 @@ export default function Home() {
             Loading building data...
           </div>
         )}
+
+        <div className="mb-6 flex flex-wrap items-center gap-3 rounded-2xl border border-slate-200 bg-white px-5 py-3 text-sm shadow-sm">
+          <span className={`h-2.5 w-2.5 rounded-full ${realtimeState === "connected" ? "bg-emerald-500" : realtimeState === "rate_limited" ? "bg-amber-500" : realtimeState === "connecting" || realtimeState === "loading" ? "bg-amber-400" : "bg-rose-500"}`} />
+          <span className="font-semibold text-slate-700">Realtime</span>
+          <span className="text-slate-500">{realtimeMessage}</span>
+          <span className="ml-auto rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide text-slate-500">
+            {realtimeState.replace("_", " ")}
+          </span>
+        </div>
 
         {panelVisibility.stats && (
           <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
@@ -370,7 +392,7 @@ export default function Home() {
               icon="T"
               iconClass="bg-sky-50 text-sky-600"
               items={tags.map((tag, index) => ({
-                id: tag.tagId ?? tag.id,
+                id: getScalarId(tag),
                 name: getName(tag, `Tag ${index + 1}`),
                 status: tag.status === 1 ? "ONLINE" : "OFFLINE",
                 detail: `${locationText(tag)} · Last seen: ${formatLastSeen(tag.lastSeen)}`,
@@ -385,7 +407,7 @@ export default function Home() {
               icon="⌖"
               iconClass="bg-cyan-50 text-cyan-600"
               items={places.map((place, index) => ({
-                id: place.id,
+                id: getScalarId(place),
                 name: getName(place, `Place ${index + 1}`),
               }))}
             />
@@ -398,7 +420,7 @@ export default function Home() {
               icon="▥"
               iconClass="bg-violet-50 text-violet-600"
               items={buildings.map((building, index) => ({
-                id: building.id,
+                id: getScalarId(building),
                 name: getName(building, `Building ${index + 1}`),
               }))}
               linkPrefix="/building/"
@@ -410,7 +432,7 @@ export default function Home() {
           <section className="mt-6 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
             <div className="mb-5 flex flex-col gap-1">
               <h2 className="text-xl font-semibold text-slate-900">Tag Groups & Locations</h2>
-              <p className="text-sm text-slate-400">Initial state from MongoDB, then live updates from the shared backend realtime stream.</p>
+              <p className="text-sm text-slate-400">Current tag state from MongoDB.</p>
             </div>
 
             {tagGroups.length === 0 ? (
@@ -517,7 +539,7 @@ function DataListCard({
   subtitle: string;
   icon: string;
   iconClass: string;
-  items: { id?: unknown; name: string; status?: string; detail?: string }[];
+  items: { id?: string | number; name: string; status?: string; detail?: string }[];
   linkPrefix?: string;
 }) {
   const listId = `${title.toLowerCase()}-datalist`;

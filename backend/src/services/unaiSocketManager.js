@@ -22,6 +22,12 @@ let healthTimer = null;
 let reconnectAttempt = 0;
 let cooldownUntil = 0;
 let currentTopics = [];
+// Keep the floor configuration separately from generated socket credentials.
+// If UNAI returns HTTP 429 while generating the first topic, currentTopics can
+// legitimately be empty. We still need the original floor list so the manager
+// can regenerate credentials after the cooldown instead of getting stuck in
+// WAITING_FOR_TOKEN forever.
+let configuredFloors = [];
 let lastMessageAt = 0;
 let lastConnectedAt = 0;
 let lastError = null;
@@ -432,6 +438,37 @@ function backoffDelay() {
   return Math.min(MAX_BACKOFF_MS, base + jitter);
 }
 
+async function reconnectAfterCooldown() {
+  if (!started) return;
+
+  // A rate-limit can happen before the first socket exists, while generating
+  // the floor topic credentials. In that case `connect()` has no token to use.
+  // Regenerate the topics from the saved floor configuration first, then make
+  // exactly one socket connection attempt.
+  if (!currentTopics.length && configuredFloors.length) {
+    try {
+      await refreshTopics(configuredFloors);
+    } catch (error) {
+      lastError = error?.message || String(error);
+      log("TOPIC RETRY ERROR:", lastError);
+      if (Number(error?.status) === 429 || isRateLimitError(error)) {
+        const retryAfter = Number(error?.retryAfterMs);
+        cooldownUntil = Date.now() + (
+          Number.isFinite(retryAfter) && retryAfter > 0
+            ? Math.min(retryAfter, RATE_LIMIT_COOLDOWN_MS)
+            : RATE_LIMIT_COOLDOWN_MS
+        );
+        scheduleReconnect("rate_limit", Math.max(1_000, cooldownUntil - Date.now()));
+      } else {
+        scheduleReconnect("topic_retry_error");
+      }
+      return;
+    }
+  }
+
+  await connect();
+}
+
 function scheduleReconnect(reason, explicitDelay = null) {
   if (!started || reconnectTimer) return;
 
@@ -447,7 +484,7 @@ function scheduleReconnect(reason, explicitDelay = null) {
 
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    void connect();
+    void reconnectAfterCooldown();
   }, delay);
 }
 
@@ -707,7 +744,8 @@ async function connect() {
   const token = extractSocketToken(currentTopics);
   if (!token) {
     setState("WAITING_FOR_TOKEN");
-    log("No socket_token available; waiting for topic generation");
+    log("No socket_token available; scheduling topic generation retry");
+    if (configuredFloors.length) scheduleReconnect("waiting_for_token", 5_000);
     return;
   }
 
@@ -832,6 +870,11 @@ async function connect() {
 
 async function refreshTopics(floors = []) {
   const list = Array.isArray(floors) ? floors : [];
+  // Preserve the original floor configuration across rate-limit failures so a
+  // later retry can regenerate credentials without requiring another caller to
+  // invoke start().
+  if (list.length) configuredFloors = list.map((floor) => ({ ...floor }));
+
   const results = [];
 
   for (const floor of list) {
@@ -871,11 +914,14 @@ async function start(options = {}) {
   if (started) return getStatus();
 
   started = true;
+  configuredFloors = Array.isArray(options.floors)
+    ? options.floors.map((floor) => ({ ...floor }))
+    : [];
   setState("STARTING");
   startHealthMonitor();
 
   try {
-    await refreshTopics(options.floors || []);
+    await refreshTopics(configuredFloors);
 
     if (!currentTopics.length) {
       setState("WAITING_FOR_TOPICS");
@@ -914,6 +960,7 @@ function stop() {
   reconnectAttempt = 0;
   closeSocket();
   currentTopics = [];
+  configuredFloors = [];
   lastSavedPositions.clear();
   setState("STOPPED");
 }

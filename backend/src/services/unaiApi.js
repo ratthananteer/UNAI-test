@@ -8,6 +8,11 @@ const { getAccessToken, refreshAccessToken } = require("./unaiAuth");
 
 const socketTopicCache = new Map();
 const socketTopicPromises = new Map();
+// One process-wide cooldown protects all callers/floors when UNAI returns
+// HTTP 429. Without this guard, separate pages or floor requests could each
+// retry the same upstream endpoint and extend the rate-limit window.
+let socketTopicRateLimitedUntil = 0;
+const SOCKET_TOPIC_RATE_LIMIT_FALLBACK_MS = 5 * 60 * 1000;
 // UNAI documentation states that socket_token expires after 30 days.
 // Cache topic credentials for 29 days and refresh them only when they are
 // missing/expired. This prevents reconnects or Home reloads from repeatedly
@@ -58,6 +63,16 @@ async function fetchFromApi(url, errorMessage, retryAfterUnauthorized = true) {
 
 async function generateSocketTopic(floorID) {
   const key = String(floorID);
+  const now = Date.now();
+  if (now < socketTopicRateLimitedUntil) {
+    const error = new Error(
+      `Failed to generate socket topic: HTTP 429 (rate limited; retry after ${Math.ceil((socketTopicRateLimitedUntil - now) / 1000)}s)`,
+    );
+    error.status = 429;
+    error.retryAfterMs = socketTopicRateLimitedUntil - now;
+    throw error;
+  }
+
   const cached = socketTopicCache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
 
@@ -115,9 +130,14 @@ async function generateSocketTopicRequest(floorID) {
     error.body = data;
     if (response.status === 429) {
       const retryAfter = Number(response.headers.get("retry-after"));
-      error.retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0
-        ? Math.min(retryAfter * 1000, 5 * 60 * 1000)
-        : 60_000;
+      const retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(retryAfter * 1000, SOCKET_TOPIC_RATE_LIMIT_FALLBACK_MS)
+        : SOCKET_TOPIC_RATE_LIMIT_FALLBACK_MS;
+      socketTopicRateLimitedUntil = Math.max(
+        socketTopicRateLimitedUntil,
+        Date.now() + retryAfterMs,
+      );
+      error.retryAfterMs = retryAfterMs;
       error.message = `Failed to generate socket topic: HTTP 429 (rate limited; retry after ${Math.ceil(error.retryAfterMs / 1000)}s)`;
     }
     throw error;
