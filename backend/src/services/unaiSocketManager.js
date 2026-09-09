@@ -10,9 +10,9 @@ const { evaluateRecord } = require("./anomalyDetector");
 // HISTORICAL SOCKET COLLECTOR
 // ---------------------------
 // One backend Socket.IO connection subscribes to every known floor topic.
-// The UNAI Postman documentation specifies socketx.lailab.online with
-// handshake path /ble/location5, query parameter token, and /join messages
-// such as: unai/[encrypt_topic]/tag.
+// Keep the same UNAI Socket endpoint used by the original working Building
+// implementation. The new last-location HTTP APIs are only the initial/current
+// snapshot; they must never replace the realtime Socket transport.
 
 let socket = null;
 let started = false;
@@ -45,9 +45,11 @@ const realtimeListeners = new Set();
 const lastSavedPositions = new Map();
 let saveQueue = Promise.resolve();
 
-// UNAI Postman: https://socketx.lailab.online + /ble/location5
-const SOCKET_URL = process.env.UNAI_SOCKET_URL || "https://socketx.lailab.online";
-const SOCKET_PATH = process.env.UNAI_SOCKET_PATH || "/ble/location5";
+// IMPORTANT: these defaults intentionally preserve the endpoint used by the
+// original working Building/LiveMap flow. They can still be overridden through
+// UNAI_SOCKET_URL / UNAI_SOCKET_PATH when a deployment explicitly requires it.
+const SOCKET_URL = process.env.UNAI_SOCKET_URL || "https://socket.lailab.online";
+const SOCKET_PATH = process.env.UNAI_SOCKET_PATH || "/ble/location";
 const MAX_BACKOFF_MS = 60_000;
 const UPSTREAM_UNAVAILABLE_BACKOFF_MS = 30_000;
 const RATE_LIMIT_COOLDOWN_MS = 5 * 60_000;
@@ -758,10 +760,10 @@ async function connect() {
   socket = io(SOCKET_URL, {
     path: SOCKET_PATH,
     query: { token },
-    // UNAI's documented Socket.IO v3 endpoint uses /ble/location5. The
-    // endpoint returns 404 for Engine.IO polling, so do not probe polling
-    // first. A direct WebSocket handshake avoids the known 404 and also
-    // avoids creating an extra failed connection attempt.
+    // Keep the original direct-WebSocket transport. Do not probe polling
+    // first because the RTLS Socket endpoint is intended to be consumed as a
+    // WebSocket stream and an unnecessary failed transport attempt can count
+    // toward the upstream connection-attempt limiter.
     transports: ["websocket"],
     upgrade: false,
     secure: true,
