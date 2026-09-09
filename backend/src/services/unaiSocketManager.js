@@ -683,16 +683,17 @@ async function connect() {
   socket = io(SOCKET_URL, {
     path: SOCKET_PATH,
     query: { token },
-    // UNAI's supplied client/documentation uses Socket.IO v3. The
-    // /ble/location5 endpoint also does not expose a working polling
-    // handshake, so use WebSocket only. This prevents a failed EIO=3
-    // WebSocket attempt from turning into a noisy polling 404/CORS loop.
-    transports: ["websocket"],
-    upgrade: false,
+    // The UNAI Postman guide specifies Socket.IO client v3 and the custom
+    // handshake path /ble/location5, but it does not require WebSocket-only
+    // transport. Keep Socket.IO's normal polling -> WebSocket upgrade so the
+    // collector also works when a reverse proxy rejects a direct WS upgrade.
+    transports: ["polling", "websocket"],
+    upgrade: true,
     secure: true,
     reconnection: false,
     forceNew: true,
     timeout: 10_000,
+    autoConnect: false,
   });
 
   // Critical diagnostic: do not guess UNAI's event envelope. This shows the
@@ -723,6 +724,13 @@ async function connect() {
   socket.on("connect_error", async (error) => {
     lastError = error?.message || String(error);
     log("CONNECT ERROR:", lastError);
+    log("CONNECT ERROR DETAILS", {
+      description: error?.description || null,
+      context: error?.context ? String(error.context).slice(0, 1000) : null,
+      transport: socket?.io?.engine?.transport?.name || null,
+      url: SOCKET_URL,
+      path: SOCKET_PATH,
+    });
 
     if (isRateLimitError(error)) {
       cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
@@ -761,6 +769,9 @@ async function connect() {
   socket.on("clientBox", handleTagPayload);
   socket.on("tag", handleTagPayload);
   socket.on("message", handleTagPayload);
+
+  // Start only after every diagnostic/error listener has been attached.
+  socket.connect();
 }
 
 async function refreshTopics(floors = []) {
