@@ -14,8 +14,8 @@ const { getCached, getCachedOrFetch, refreshStaticData } = require("../services/
 const TagLatest = require("../models/TagLatest");
 const { getAssetTagIds, getTagMetadata } = require("../services/assetFilter");
 const { start: startRealtimeCollector, subscribeRealtime, getStatus: getRealtimeStatus } = require("../services/unaiSocketManager");
-const authRouter = require("./auth");
 const { authRequired, adminRequired } = require("../services/auth");
+const authRouter = require("./auth");
 
 const router = express.Router();
 
@@ -103,11 +103,11 @@ router.get("/health", (req, res) => {
   res.json({ ok: true, service: "unai-backend", timestamp: new Date().toISOString() });
 });
 
-// The Home page requests a UNAI API access token lazily. This is an internal
-// server-to-server credential exchange and must remain public to the browser
-// because the browser does not have an app session yet. The actual UNAI
-// credentials stay on the backend and are never sent to the browser.
-router.post("/auth/token", async (req, res) => {
+// Legacy/internal token endpoint. Keep it server-backed but require the app
+// session so an unauthenticated browser cannot force UNAI token generation.
+// The current Home/LiveMap flow does not call this endpoint; realtime is
+// delivered through the backend-owned SSE stream.
+router.post("/auth/token", authRequired(), async (req, res) => {
   try {
     const token = await generateAccessToken();
     return res.json({ access_token: token });
@@ -194,11 +194,11 @@ async function ensureRealtimeCollector() {
 function ensureRealtimeHeartbeat() {
   if (realtimeHeartbeat) return;
   realtimeHeartbeat = setInterval(() => {
-    const message = `event: heartbeat\\ndata: ${JSON.stringify({
+    const message = `event: heartbeat\ndata: ${JSON.stringify({
       timestamp: new Date().toISOString(),
       clients: realtimeClients.size,
       collector: getRealtimeStatus(),
-    })}\\n\\n`;
+    })}\n\n`;
     for (const client of realtimeClients) {
       try {
         client.write(message);
@@ -235,7 +235,7 @@ router.get("/realtime", async (req, res) => {
   res.flushHeaders?.();
   // Tell EventSource to wait 30s before reconnecting if the backend stream is
   // temporarily unavailable. This avoids a browser reconnect storm.
-  res.write(`retry: 30000\\n\\n`);
+  res.write(`retry: 30000\n\n`);
 
   const client = res;
   realtimeClients.add(client);
@@ -244,7 +244,7 @@ router.get("/realtime", async (req, res) => {
   const send = (eventName, payload) => {
     if (client.writableEnded || client.destroyed) return;
     try {
-      client.write(`event: ${eventName}\\ndata: ${JSON.stringify(payload)}\\n\\n`);
+      client.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
     } catch {
       realtimeClients.delete(client);
     }

@@ -1,7 +1,7 @@
 // LIVE RTLS MAP
 // Displays the current floor image, zones, anchors, active tags and realtime data.
-// UNAI Socket.IO is owned by lib/unaiRealtime. This component intentionally has
-// no direct Socket.IO connection or reconnect timer.
+// Realtime transport is owned by lib/unaiRealtime, which uses the backend's
+// shared SSE stream. This component never opens a direct UNAI socket.
 
 "use client";
 
@@ -295,6 +295,7 @@ export default function LiveMap({
     setActiveTagIds(
       new Set(
         safeInitialTags
+          .filter((tag) => Number(tag.status) === 1)
           .map((tag) => String(tag.id ?? tag.tagId ?? tag.tag_id ?? ""))
           .filter(Boolean),
       ),
@@ -564,10 +565,10 @@ export default function LiveMap({
             pendingTagUpdatesRef.current.set(id, update);
           });
 
-          // History persistence remains immediate so a UI performance
-          // optimization never silently drops historical socket positions.
-          void saveTagEvents(changedUpdates, eventName);
-
+          // History is persisted by the backend collector from the same
+          // upstream Socket.IO stream. The browser must not POST the same
+          // realtime packet again, otherwise multiple Building tabs multiply
+          // MongoDB writes. This UI only updates its local view.
           if (tagFlushFrameRef.current === null) {
             tagFlushFrameRef.current = window.requestAnimationFrame(() => {
               tagFlushFrameRef.current = null;

@@ -1,7 +1,6 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
 type ApiRecord = Record<string, unknown>;
@@ -91,7 +90,6 @@ function formatLastSeen(value?: string): string {
 }
 
 export default function Home() {
-  const router = useRouter();
   const [anchorData, setAnchorData] = useState<ApiResponse | null>(null);
   const [tagData, setTagData] = useState<ApiResponse | null>(null);
   const [placeData, setPlaceData] = useState<ApiResponse | null>(null);
@@ -203,13 +201,15 @@ export default function Home() {
           const tagId = String(id);
           const timestamp = item.timestamp;
           const lastSeen = timestamp != null ? String(timestamp) : undefined;
+          const status = item.status === 0 || item.status === "0" ? 0 : 1;
+          const statusText = status === 1 ? "ONLINE" : "OFFLINE";
           byId.set(tagId, {
             ...(byId.get(tagId) ?? {}),
             ...item,
             id: tagId,
             tagId,
-            status: 1,
-            statusText: "ONLINE",
+            status,
+            statusText,
             lastSeen,
           } as Tag);
         }
@@ -276,7 +276,7 @@ export default function Home() {
   );
 
   const tagGroups = Array.from(
-    tags.reduce((groups, tag, index) => {
+    tags.reduce((groups, tag) => {
       const groupKey = String(tag.groupId ?? tag.groupName ?? "ungrouped");
       const groupName = tag.groupName || (groupKey === "ungrouped" ? "Ungrouped" : `Group ${groupKey}`);
       const existing = groups.get(groupKey) ?? { id: groupKey, name: groupName, tags: [] as Tag[] };
