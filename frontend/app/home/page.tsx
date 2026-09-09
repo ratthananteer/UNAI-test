@@ -135,9 +135,9 @@ export default function Home() {
         // /api/auth/token from the browser: every real UNAI API request already
         // obtains/reuses the backend token, and the token must never be exposed
         // to the frontend.
-        // HOME IS API/MONGODB DATA ONLY.
-        // No Socket.IO connection, socket token, or UNAI live stream is used here.
-        // Live positioning is intentionally handled only by the Building page.
+        // HOME gets its initial snapshot from the backend. Realtime updates are
+        // delivered separately through the backend-owned SSE stream below.
+        // The browser never receives a UNAI token and never connects to UNAI.
         const [anchors, tags, places, buildings] = await Promise.all([
           getApi("/api/anchor"),
           // Current tag location/status comes from MongoDB. This endpoint uses
@@ -150,8 +150,9 @@ export default function Home() {
         if (cancelled) return;
 
         setAnchorData(anchors);
-        // Home displays the backend/API status directly. There is deliberately
-        // no browser-side socket state or live UNAI connection on this page.
+        // Keep the MongoDB snapshot as the initial state. The SSE stream below
+        // will merge live updates into this same state without replacing the
+        // backend-owned connection architecture.
         setTagData(getItems(tags) as Tag[]);
         setPlaceData(places);
         setBuildingData(buildings);
@@ -173,57 +174,87 @@ export default function Home() {
     };
   }, []);
 
-  // Refresh only the tag status/lastSeen data. Static place/building/anchor data
-  // stays on the initial load, while MongoDB TagMonitor updates tag freshness.
+  // Realtime tag updates come from ONE backend-owned SSE stream. The backend
+  // owns the single UNAI Socket.IO connection and broadcasts normalized tag
+  // updates to every Home tab. There is no browser-side UNAI token generation,
+  // polling loop, or direct connection to socket.lailab.online.
   useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    let source: EventSource | null = null;
     let cancelled = false;
-    let refreshInFlight = false;
-    let timer: number | null = null;
-    let retryDelay = 30_000;
 
-    const refreshTagStatus = async () => {
-      // Never overlap polling requests. This is especially important when the
-      // browser tab wakes up after being backgrounded and multiple timers can
-      // otherwise fire close together.
-      if (refreshInFlight || cancelled) return;
-      refreshInFlight = true;
+    const mergeTags = (incoming: unknown) => {
+      if (!incoming || typeof incoming !== "object") return;
+      const record = incoming as Record<string, unknown>;
+      const rawTags = record.tags;
+      if (!Array.isArray(rawTags)) return;
 
-      try {
-        const data = await getApi("/api/db-tags");
-        if (!cancelled) {
-          setTagData(getItems(data) as Tag[]);
-          retryDelay = 30_000;
-        }
-      } catch (err) {
-        if (!cancelled) {
-          const message = err instanceof Error ? err.message : String(err);
-          console.error("[UNAI HOME] Tag status refresh failed:", message);
+      setTagData((current) => {
+        const existing = current ? (getItems(current) as Tag[]) : [];
+        const byId = new Map(existing.map((tag) => [String(tag.tagId ?? tag.id), tag]));
 
-          // A 429 means the proxy/backend is rate-limiting us. Do not retry
-          // every few seconds; back off to protect the API and keep the Home
-          // page usable with the last successful tag snapshot.
-          if (/HTTP 429|rate.?limit|too many requests/i.test(message)) {
-            retryDelay = Math.min(Math.max(retryDelay * 2, 60_000), 5 * 60_000);
-          } else {
-            retryDelay = Math.min(Math.max(retryDelay, 30_000) * 2, 5 * 60_000);
-          }
+        for (const raw of rawTags) {
+          if (!raw || typeof raw !== "object") continue;
+          const item = raw as Record<string, unknown>;
+          const id = item.tagId ?? item.id;
+          if (id == null) continue;
+
+          const tagId = String(id);
+          const timestamp = item.timestamp;
+          const lastSeen = timestamp != null ? String(timestamp) : undefined;
+          byId.set(tagId, {
+            ...(byId.get(tagId) ?? {}),
+            ...item,
+            id: tagId,
+            tagId,
+            status: 1,
+            statusText: "ONLINE",
+            lastSeen,
+          } as Tag);
         }
-      } finally {
-        refreshInFlight = false;
-        if (!cancelled) {
-          timer = window.setTimeout(() => void refreshTagStatus(), retryDelay);
-        }
-      }
+
+        return [...byId.values()];
+      });
     };
 
-    // The initial Home load already fetches /api/db-tags. Start the lightweight
-    // status refresh after 30 seconds instead of immediately making a second
-    // request, then use backoff if the backend/proxy returns HTTP 429.
-    timer = window.setTimeout(() => void refreshTagStatus(), 30_000);
+    const connect = () => {
+      if (cancelled) return;
+      source = new EventSource("/api/realtime");
+
+      source.addEventListener("snapshot", (event) => {
+        try {
+          mergeTags(JSON.parse((event as MessageEvent).data));
+        } catch (error) {
+          console.error("[UNAI HOME][REALTIME] invalid snapshot:", error);
+        }
+      });
+
+      source.addEventListener("tags", (event) => {
+        try {
+          mergeTags(JSON.parse((event as MessageEvent).data));
+        } catch (error) {
+          console.error("[UNAI HOME][REALTIME] invalid tag event:", error);
+        }
+      });
+
+      source.addEventListener("heartbeat", () => {
+        // Heartbeats keep proxies/load balancers from closing an idle SSE stream.
+      });
+
+      source.addEventListener("error", () => {
+        // EventSource performs its own reconnect using the server-provided
+        // retry interval. We intentionally do not create another source here.
+        console.warn("[UNAI HOME][REALTIME] stream temporarily unavailable; waiting for SSE reconnect");
+      });
+    };
+
+    connect();
 
     return () => {
       cancelled = true;
-      if (timer !== null) window.clearTimeout(timer);
+      source?.close();
+      source = null;
     };
   }, []);
 
@@ -379,7 +410,7 @@ export default function Home() {
           <section className="mt-6 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
             <div className="mb-5 flex flex-col gap-1">
               <h2 className="text-xl font-semibold text-slate-900">Tag Groups & Locations</h2>
-              <p className="text-sm text-slate-400">Current location from the latest MongoDB TagEvent — no Home socket connection.</p>
+              <p className="text-sm text-slate-400">Initial state from MongoDB, then live updates from the shared backend realtime stream.</p>
             </div>
 
             {tagGroups.length === 0 ? (

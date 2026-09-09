@@ -13,6 +13,7 @@ const { getActiveTags, refreshActiveTags } = require("../services/tagMonitor");
 const { getCached, getCachedOrFetch, refreshStaticData } = require("../services/staticDataCache");
 const TagLatest = require("../models/TagLatest");
 const { getAssetTagIds, getTagMetadata } = require("../services/assetFilter");
+const { start: startRealtimeCollector, subscribeRealtime, getStatus: getRealtimeStatus } = require("../services/unaiSocketManager");
 const authRouter = require("./auth");
 const { authRequired, adminRequired } = require("../services/auth");
 
@@ -127,6 +128,158 @@ router.use("/analytics", analyticsRouter);
 router.use("/tag-events", tagEventsRouter);
 router.use("/anomalies", anomaliesRouter);
 router.use("/admin", adminRequired(), adminRouter);
+
+// Backend-owned realtime stream.
+//
+// The browser connects to this endpoint, never to UNAI directly. The first
+// subscriber lazily starts one shared UNAI collector for all floors already
+// present in MongoDB. Additional Home/Building tabs only become SSE clients of
+// this backend stream; they do not create another UNAI socket or token request.
+let realtimeCollectorPromise = null;
+const realtimeClients = new Set();
+let realtimeHeartbeat = null;
+
+function floorRecordsFromCache(rows) {
+  const floors = [];
+  const seen = new Set();
+
+  for (const row of rows || []) {
+    const floor = row?.data ?? row;
+    if (!floor || typeof floor !== "object") continue;
+    const floorId = floor.id ?? floor.floor_id ?? floor.floorId ?? floor.floorID ?? floor.floor;
+    if (floorId == null || typeof floorId === "object") continue;
+    const key = String(floorId);
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const building = floor.building;
+    floors.push({
+      id: key,
+      buildingId:
+        floor.building_id ??
+        floor.buildingId ??
+        floor.buildingID ??
+        (building && typeof building === "object" ? building.id ?? building.building_id ?? building.buildingId : null),
+    });
+  }
+
+  return floors;
+}
+
+async function ensureRealtimeCollector() {
+  if (getRealtimeStatus().started) return;
+  if (realtimeCollectorPromise) return realtimeCollectorPromise;
+
+  realtimeCollectorPromise = (async () => {
+    const StaticData = require("../models/StaticData");
+    const rows = await StaticData.find({ type: "floor" })
+      .select({ _id: 0, data: 1 })
+      .sort({ external_id: 1 })
+      .lean();
+    const floors = floorRecordsFromCache(rows);
+
+    if (!floors.length) {
+      throw new Error("No floor configuration is available in MongoDB; realtime collector was not started.");
+    }
+
+    console.log(`[Realtime] Starting shared UNAI collector for ${floors.length} floor(s)`);
+    await startRealtimeCollector({ floors });
+  })().finally(() => {
+    realtimeCollectorPromise = null;
+  });
+
+  return realtimeCollectorPromise;
+}
+
+function ensureRealtimeHeartbeat() {
+  if (realtimeHeartbeat) return;
+  realtimeHeartbeat = setInterval(() => {
+    const message = `event: heartbeat\\ndata: ${JSON.stringify({
+      timestamp: new Date().toISOString(),
+      clients: realtimeClients.size,
+      collector: getRealtimeStatus(),
+    })}\\n\\n`;
+    for (const client of realtimeClients) {
+      try {
+        client.write(message);
+      } catch {
+        realtimeClients.delete(client);
+      }
+    }
+
+    if (realtimeClients.size === 0) {
+      clearInterval(realtimeHeartbeat);
+      realtimeHeartbeat = null;
+    }
+  }, 15_000);
+}
+
+router.get("/realtime", async (req, res) => {
+  try {
+    await ensureRealtimeCollector();
+  } catch (error) {
+    console.error("[Realtime] collector start failed:", error.message);
+    return res.status(503).json({
+      error: "Realtime collector is unavailable",
+      details: error.message,
+    });
+  }
+
+  res.status(200);
+  res.set({
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.flushHeaders?.();
+  // Tell EventSource to wait 30s before reconnecting if the backend stream is
+  // temporarily unavailable. This avoids a browser reconnect storm.
+  res.write(`retry: 30000\\n\\n`);
+
+  const client = res;
+  realtimeClients.add(client);
+  ensureRealtimeHeartbeat();
+
+  const send = (eventName, payload) => {
+    if (client.writableEnded || client.destroyed) return;
+    try {
+      client.write(`event: ${eventName}\\ndata: ${JSON.stringify(payload)}\\n\\n`);
+    } catch {
+      realtimeClients.delete(client);
+    }
+  };
+
+  const unsubscribe = subscribeRealtime((records) => {
+    send("tags", {
+      timestamp: new Date().toISOString(),
+      tags: records,
+    });
+  });
+
+  // Immediately give the page a MongoDB snapshot. The following SSE events are
+  // live UNAI updates from the same backend collector.
+  try {
+    const snapshot = await getDbTags();
+    send("snapshot", {
+      timestamp: new Date().toISOString(),
+      tags: snapshot,
+    });
+  } catch (error) {
+    send("error", { message: "Failed to load realtime snapshot" });
+  }
+
+  req.on("close", () => {
+    unsubscribe();
+    realtimeClients.delete(client);
+    if (realtimeClients.size === 0 && realtimeHeartbeat) {
+      clearInterval(realtimeHeartbeat);
+      realtimeHeartbeat = null;
+    }
+  });
+
+  return undefined;
+});
 
 // Current tag state from MongoDB TagLatest.
 router.get("/db-tags", async (req, res) => {

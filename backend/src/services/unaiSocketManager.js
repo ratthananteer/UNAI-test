@@ -3,6 +3,7 @@ const { io } = require("socket.io-client");
 const { generateSocketTopic } = require("./unaiApi");
 const { refreshAccessToken } = require("./unaiAuth");
 const TagEvent = require("../models/TagEvent");
+const TagLatest = require("../models/TagLatest");
 const { getAssetTagIds, isAssetOrKnownAsset } = require("./assetFilter");
 const { evaluateRecord } = require("./anomalyDetector");
 
@@ -28,6 +29,12 @@ let lastSocketEvent = null;
 let savedEventCount = 0;
 let ignoredAssetCount = 0;
 let invalidRecordCount = 0;
+
+// Frontend realtime subscribers receive normalized, already asset-filtered
+// records from this single backend collector. Pages never connect directly to
+// the UNAI socket, so opening Home in several tabs does not multiply upstream
+// connections or consume the UNAI connection-attempt limit.
+const realtimeListeners = new Set();
 
 const lastSavedPositions = new Map();
 let saveQueue = Promise.resolve();
@@ -530,10 +537,42 @@ function enqueueHistorySave(records) {
 
       if (!documents.length) return;
 
+      // TagLatest is the live read model used by /api/db-tags and TagMonitor.
+      // Update it from the same sampled records as history. This keeps the
+      // latest timestamp fresh without writing a MongoDB document for every
+      // raw socket packet.
+      await TagLatest.bulkWrite(
+        documents.map((document) => ({
+          updateOne: {
+            filter: { tagId: document.tagId },
+            update: {
+              $set: {
+                tagId: document.tagId,
+                buildingId: document.buildingId,
+                floorId: document.floorId,
+                groupId: document.groupId,
+                groupName: document.groupName,
+                tagName: document.tagName,
+                status: "ALIVE",
+                movementStatus: document.movementStatus,
+                isAsset: false,
+                x: document.x,
+                y: document.y,
+                z: document.z,
+                timestamp: document.timestamp,
+                receivedAt: document.receivedAt,
+              },
+            },
+            upsert: true,
+          },
+        })),
+        { ordered: false },
+      );
+
       try {
         const inserted = await TagEvent.insertMany(documents, { ordered: false });
         savedEventCount += inserted.length;
-        log(`HISTORY SAVED count=${inserted.length}`);
+        log(`HISTORY/LATEST SAVED count=${inserted.length}`);
       } catch (error) {
         const duplicateOnly =
           error?.code === 11000 ||
@@ -566,6 +605,17 @@ function handleTagPayload(payload) {
     // Keep a compact payload sample visible when UNAI changes its envelope.
     log("PAYLOAD SAMPLE", JSON.stringify(payload).slice(0, 3000));
     return;
+  }
+
+  // Forward normalized records to local backend subscribers before history
+  // sampling. The frontend receives the same single upstream stream and does
+  // not need its own UNAI token/socket.
+  for (const listener of realtimeListeners) {
+    try {
+      listener(records);
+    } catch (error) {
+      log("REALTIME LISTENER ERROR:", error?.message || error);
+    }
   }
 
   // Anomaly detection runs on every normalized non-asset socket record,
@@ -777,6 +827,15 @@ function stop() {
   setState("STOPPED");
 }
 
+function subscribeRealtime(listener) {
+  if (typeof listener !== "function") {
+    throw new TypeError("realtime listener must be a function");
+  }
+
+  realtimeListeners.add(listener);
+  return () => realtimeListeners.delete(listener);
+}
+
 function getStatus() {
   return {
     started,
@@ -804,5 +863,6 @@ module.exports = {
   stop,
   connect,
   refreshTopics,
+  subscribeRealtime,
   getStatus,
 };
