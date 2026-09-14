@@ -279,6 +279,7 @@ export default function LiveMap({
   // the entire map, including the SVG zone layer.
   const tagRenderSignatureRef = useRef<Map<string, string>>(new Map());
   const pendingTagUpdatesRef = useRef<Map<string, Tag>>(new Map());
+  const initialFloorIdRef = useRef<number | string | undefined>(floor.id);
   const tagFlushFrameRef = useRef<number | null>(null);
   const assetTagIdsRef = useRef<Set<string>>(new Set());
   const assetTagIdsReadyRef = useRef(false);
@@ -286,24 +287,62 @@ export default function LiveMap({
   // denylist has loaded. Socket payloads can omit usage_type, so this guard
   // prevents an Asset from briefly appearing during startup.
 
-  // Keep initial/API tags available immediately, but never allow an Asset into state.
+  // Keep initial/API tags available immediately, but never allow an older MongoDB
+  // snapshot to overwrite a newer realtime position already rendered by the map.
   useEffect(() => {
     const safeInitialTags = initialTags.filter((tag) => !isAssetTag(tag));
-    setTags(safeInitialTags);
+    const floorChanged = String(initialFloorIdRef.current ?? "") !== String(floor.id ?? "");
+    initialFloorIdRef.current = floor.id;
+
+    setTags((current) => {
+      if (floorChanged || current.length === 0) return safeInitialTags;
+
+      const currentById = new Map<string, Tag>();
+      for (const tag of current) {
+        const id = tag.id ?? tag.tagId ?? tag.tag_id;
+        if (id != null) currentById.set(String(id), tag);
+      }
+
+      for (const incoming of safeInitialTags) {
+        const id = incoming.id ?? incoming.tagId ?? incoming.tag_id;
+        if (id == null) continue;
+        const key = String(id);
+        const existing = currentById.get(key);
+        if (!existing) {
+          currentById.set(key, incoming);
+          continue;
+        }
+
+        // Realtime updates are explicitly marked below. Preserve them unless the
+        // incoming snapshot has a strictly newer timestamp. This makes /db-tags
+        // a fallback rather than an accidental source of truth for live motion.
+        if (existing._realtimeSource === true) {
+          const existingMs = eventTimeMs(existing._eventTimestamp ?? existing.timestamp ?? existing.lastSeenAt ?? existing.last_seen);
+          const incomingMs = eventTimeMs(incoming._eventTimestamp ?? incoming.timestamp ?? incoming.lastSeenAt ?? incoming.last_seen);
+          if (incomingMs === null || existingMs === null || existingMs >= incomingMs) continue;
+        }
+        currentById.set(key, { ...existing, ...incoming });
+      }
+
+      return Array.from(currentById.values()).filter((tag) => !isAssetTag(tag));
+    });
+
     const latestTimestamp = safeInitialTags
       .map((tag) => tag._eventTimestamp ?? tag.lastSeenAt ?? tag.last_seen ?? tag.timestamp ?? tag.created_at ?? tag.date_now)
       .map((value) => eventTime(value))
       .sort()
       .at(-1);
     if (latestTimestamp) setLastUpdate(new Date(latestTimestamp).toLocaleTimeString());
-    setActiveTagIds(
-      new Set(
-        safeInitialTags
-          .filter((tag) => Number(tag.status) === 1)
-          .map((tag) => String(tag.id ?? tag.tagId ?? tag.tag_id ?? ""))
-          .filter(Boolean),
-      ),
-    );
+    setActiveTagIds((current) => {
+      const next = new Set(current);
+      for (const tag of safeInitialTags) {
+        if (Number(tag.status) === 1) {
+          const id = tag.id ?? tag.tagId ?? tag.tag_id;
+          if (id != null) next.add(String(id));
+        }
+      }
+      return next;
+    });
     // activeTagCheckReady is intentionally controlled by the Asset denylist
     // loader below, not by initial API data.
   }, [initialTags, floor.id]);
@@ -341,6 +380,20 @@ export default function LiveMap({
       if (!Number.isNaN(date.getTime())) return date.toISOString();
     }
     return new Date().toISOString();
+  }
+
+  function eventTimeMs(value: unknown): number | null {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      const ms = value < 100000000000 ? value * 1000 : value;
+      return Number.isFinite(ms) ? ms : null;
+    }
+    if (typeof value === "string" && value.trim()) {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) return numeric < 100000000000 ? numeric * 1000 : numeric;
+      const parsed = Date.parse(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
   }
 
   async function saveTagEvents(updates: Tag[], eventName: string): Promise<void> {
@@ -473,7 +526,6 @@ export default function LiveMap({
   useEffect(() => {
     let cancelled = false;
     assetTagIdsReadyRef.current = false;
-    setActiveTagCheckReady(false);
     let unsubscribeRealtime: (() => void) | null = null;
 
     async function loadAssetTagIds(): Promise<boolean> {
@@ -504,6 +556,7 @@ export default function LiveMap({
     }
 
     async function startRealtime(): Promise<void> {
+      setActiveTagCheckReady(false);
       const loaded = await loadAssetTagIds();
       if (cancelled) return;
 
@@ -586,8 +639,9 @@ export default function LiveMap({
                   const tagId = update.id ?? update.tagId ?? update.tag_id;
                   if (tagId === undefined || tagId === null) continue;
                   const index = next.findIndex((tag) => sameId(tag.id ?? tag.tagId ?? tag.tag_id, tagId));
-                  if (index >= 0) next[index] = { ...next[index], ...update };
-                  else next.push(update);
+                  const normalizedUpdate = { ...update, _realtimeSource: true };
+                  if (index >= 0) next[index] = { ...next[index], ...normalizedUpdate };
+                  else next.push(normalizedUpdate);
                 }
                 return next.filter((tag) => !isAssetTag(tag) && !assetTagIdsRef.current.has(String(tag.id ?? tag.tagId ?? tag.tag_id)));
               });
