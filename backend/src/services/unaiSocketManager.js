@@ -711,7 +711,20 @@ function handleTagPayload(payload, eventName = lastSocketEvent) {
   const records = collectLocationRecords(filteredPayload);
   log(`PAYLOAD event=${eventName} records=${records.length}`);
 
-  if (records.length) {    log("POSITION DATA", records.slice(0, 20).map((record) => ({ tagId: record.tagId, buildingId: record.buildingId, floorId: record.floorId, x: record.x, y: record.y })));  }  if (!records.length) {
+  if (records.length) {
+    log(
+      "POSITION DATA",
+      records.slice(0, 20).map((record) => ({
+        tagId: record.tagId,
+        buildingId: record.buildingId,
+        floorId: record.floorId,
+        x: record.x,
+        y: record.y,
+      })),
+    );
+  }
+
+  if (!records.length) {
     // Keep a compact payload sample visible when UNAI changes its envelope.
     log("PAYLOAD SAMPLE", JSON.stringify(payload).slice(0, 3000));
     return;
@@ -746,33 +759,40 @@ function handleTagPayload(payload, eventName = lastSocketEvent) {
 }
 
 function subscribeTopic(topic) {
-  // UNAI's documented realtime-location protocol uses the encrypted topic
-  // returned by /gen_encrypt_topic: `unai/{encrypt_topic}/tag`. This is the
-  // primary subscription. The wildcard room can acknowledge /join while
-  // delivering no tag locations on the current gateway.
+  // The existing UNAI Building implementation used the wildcard floor room
+  // `unai/*/*/{floorId}/tag` over the same single Socket.IO connection and was
+  // able to receive live movement. Keep that known-working room as the primary
+  // subscription. The encrypted room remains a secondary compatibility join
+  // because the official UNAI documentation also supports it.
+  const wildcardTopic = `unai/*/*/${topic.floorId}/tag`;
   const encryptedTopic = topic.encryptTopic
     ? `unai/${topic.encryptTopic}/tag`
     : null;
-  const wildcardTopic = `unai/*/*/${topic.floorId}/tag`;
-  const tagTopic = encryptedTopic || wildcardTopic;
 
-  socket.emit("/join", tagTopic);
-  log(`JOIN floor=${topic.floorId} mode=${encryptedTopic ? "encrypted" : "wildcard"} topic=${tagTopic}`);
+  socket.emit("/join", wildcardTopic);
+  log(`JOIN floor=${topic.floorId} mode=wildcard topic=${wildcardTopic}`);
+
+  if (encryptedTopic && encryptedTopic !== wildcardTopic) {
+    socket.emit("/join", encryptedTopic);
+    log(`JOIN floor=${topic.floorId} mode=encrypted topic=${encryptedTopic}`);
+  }
+
   log("JOIN SENT", {
     floorId: topic.floorId,
-    mode: encryptedTopic ? "encrypted" : "wildcard",
-    topic: tagTopic,
+    wildcardTopic,
+    encryptedTopic,
     hasEncryptTopic: Boolean(topic.encryptTopic),
   });
 
-  // Compatibility probe: if the encrypted room is accepted but produces no
-  // location packets, probe the legacy wildcard rooms on the SAME socket after
-  // a short grace period. No second socket or token request is created.
-  if (encryptedTopic && !topicFallbackTimer) {
+  // Keep one compatibility timer for the whole socket. If neither room has
+  // produced a real tag position, retry the wildcard rooms once on the SAME
+  // connection. Never create another socket or request another token here.
+  if (!topicFallbackTimer) {
     topicFallbackTimer = setTimeout(() => {
       topicFallbackTimer = null;
       if (!started || !socket?.connected || lastTagMessageAt) return;
-      log("No tag location received from encrypted topics; probing legacy wildcard topics on the existing socket");
+
+      log("No tag location received after initial joins; retrying wildcard tag rooms on the existing socket");
       currentTopics.forEach((currentTopic) => {
         socket?.emit("/join", `unai/*/*/${currentTopic.floorId}/tag`);
       });
