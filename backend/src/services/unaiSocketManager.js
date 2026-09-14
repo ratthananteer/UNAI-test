@@ -758,6 +758,74 @@ function handleTagPayload(payload, eventName = lastSocketEvent) {
   enqueueHistorySave(records);
 }
 
+function buildInitLocationPayload(topic) {
+  return {
+    action: "get_init_unai_location",
+    customId: "backend_history_collector",
+    socketGetInitId: socket?.id || null,
+    getMode: "only",
+    get_topic: topic.encryptTopic,
+    get_floor: String(topic.floorId),
+  };
+}
+
+function broadcastToRoom(room, data) {
+  if (!socket?.connected) return;
+  socket.emit("/broadcastToRoom", {
+    room,
+    data,
+    option: {},
+  });
+}
+
+function subscribeInitTopics(topic) {
+  if (!socket?.connected) return;
+
+  // UNAI's documented realtime protocol requires an initialization handshake
+  // before the encrypted tag room starts producing clientBox updates. The
+  // normal tag-room joins below are intentionally kept; this handshake is an
+  // additional prerequisite, not a replacement for realtime subscription.
+  socket.emit("/join", "init_unai_location_tag");
+  socket.emit("/join", "init_unai_location_anchor");
+  socket.emit("/join", "init_unai_location_tag_received");
+  socket.emit("/join", "init_unai_location_anchor_received");
+
+  const payload = buildInitLocationPayload(topic);
+  broadcastToRoom("init_unai_location", payload);
+
+  log("INIT REQUEST SENT", {
+    floorId: topic.floorId,
+    encryptTopic: topic.encryptTopic,
+    socketGetInitId: payload.socketGetInitId,
+  });
+}
+
+function acknowledgeInitTopic(eventName, payload) {
+  if (!socket?.connected || !payload || typeof payload !== "object") return;
+
+  const isTag = eventName === "init_unai_location_tag";
+  const isAnchor = eventName === "init_unai_location_anchor";
+  if (!isTag && !isAnchor) return;
+
+  const receivedRoom = isTag
+    ? "init_unai_location_tag_received"
+    : "init_unai_location_anchor_received";
+  const acknowledgement = {
+    ...payload,
+    action: isTag
+      ? "init_unai_location_tag_received"
+      : "init_unai_location_anchor_received",
+  };
+
+  broadcastToRoom(receivedRoom, acknowledgement);
+  socket.emit(eventName + "_received", acknowledgement);
+  log("INIT ACK SENT", {
+    eventName,
+    receivedRoom,
+    floorId: firstValue(payload, ["get_floor", "floorId", "floor_id"]),
+  });
+}
+
 function subscribeTopic(topic) {
   // The existing UNAI Building implementation used the wildcard floor room
   // `unai/*/*/{floorId}/tag` over the same single Socket.IO connection and was
@@ -768,6 +836,8 @@ function subscribeTopic(topic) {
   const encryptedTopic = topic.encryptTopic
     ? `unai/${topic.encryptTopic}/tag`
     : null;
+
+  subscribeInitTopics(topic);
 
   socket.emit("/join", wildcardTopic);
   log(`JOIN floor=${topic.floorId} mode=wildcard topic=${wildcardTopic}`);
@@ -874,6 +944,16 @@ async function connect() {
       event,
       JSON.stringify(args).slice(0, 5000),
     );
+
+    // The documented UNAI protocol returns initial tag/anchor data before the
+    // realtime room becomes active. Acknowledge each init payload immediately,
+    // then continue passing the payload through the normal tolerant parser.
+    if (event === "init_unai_location_tag" || event === "init_unai_location_anchor") {
+      args.forEach((payload) => {
+        const parsed = parseSocketPayload(payload);
+        acknowledgeInitTopic(event, asObject(parsed));
+      });
+    }
 
     // UNAI deployments do not always use the same event name for the tag
     // stream. Do not restrict the collector to clientBox/tag/message: inspect
