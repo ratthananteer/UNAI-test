@@ -205,7 +205,25 @@ export default function BuildingLiveMap({
           if (itemBuilding != null && typeof itemBuilding !== "object" && String(itemBuilding) !== String(buildingId)) return false;
           return tagBelongsToFloor(item, selectedFloorId, selectedFloorName);
         });
-        setLiveLocationTags(current);
+
+        // Do not replace the state every polling tick when MongoDB still
+        // contains the same snapshot. BuildingLiveMap passes this state into
+        // LiveMap as initialTags; changing the array/object identity every 2s
+        // would make LiveMap re-run its initial-data effect and overwrite a
+        // newer Socket/SSE position with the older polled snapshot.
+        setLiveLocationTags((previous) => {
+          const signature = (item: Item) => {
+            const id = item.id ?? item.tagId ?? item.tag_id ?? "";
+            const timestamp = item.timestamp ?? item.lastSeenAt ?? item.last_seen ?? item.created_at ?? item.date_now ?? "";
+            return `${String(id)}|${String(item.x ?? "")}|${String(item.y ?? "")}|${String(timestamp)}`;
+          };
+          if (previous.length === current.length) {
+            const previousSignature = previous.map(signature).sort().join(";;");
+            const currentSignature = current.map(signature).sort().join(";;");
+            if (previousSignature === currentSignature) return previous;
+          }
+          return current;
+        });
       } catch (error) {
         if (!cancelled) console.warn("[BUILDING] Live last-location refresh unavailable; keeping socket/API snapshot:", error);
       }

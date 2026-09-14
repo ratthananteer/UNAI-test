@@ -678,14 +678,32 @@ function enqueueHistorySave(records) {
     });
 }
 
-function handleTagPayload(payload) {
+function parseSocketPayload(payload) {
+  if (typeof payload !== "string") return payload;
+
+  const text = payload.trim();
+  if (!text) return payload;
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return payload;
+  }
+}
+
+function handleTagPayload(payload, eventName = lastSocketEvent) {
   lastMessageAt = Date.now();
 
-  const filteredPayload = filterAssetPayload(payload);
+  // Socket.IO deployments can deliver the actual location envelope as a JSON
+  // string (not a JavaScript object). The old collector treated that string as
+  // a non-object and therefore returned zero records. Parse it before applying
+  // the same tolerant envelope walker used by the browser.
+  const parsedPayload = parseSocketPayload(payload);
+  const filteredPayload = filterAssetPayload(parsedPayload);
   if (filteredPayload === undefined) return;
 
   const records = collectLocationRecords(filteredPayload);
-  log(`PAYLOAD event=${lastSocketEvent} records=${records.length}`);
+  log(`PAYLOAD event=${eventName} records=${records.length}`);
 
   if (!records.length) {
     // Keep a compact payload sample visible when UNAI changes its envelope.
@@ -799,6 +817,14 @@ async function connect() {
       event,
       JSON.stringify(args).slice(0, 5000),
     );
+
+    // UNAI deployments do not always use the same event name for the tag
+    // stream. Do not restrict the collector to clientBox/tag/message: inspect
+    // every application event and let collectLocationRecords decide whether
+    // its payload actually contains a tag position. Lifecycle events are
+    // ignored to avoid treating connection metadata as location data.
+    if (event === "connect" || event === "disconnect" || event === "connect_error") return;
+    args.forEach((payload) => handleTagPayload(payload, event));
   });
 
   socket.on("connect", () => {
@@ -877,11 +903,9 @@ async function connect() {
     if (started) scheduleReconnect("disconnect");
   });
 
-  // UNAI Postman documents clientBox for general data. Keep the compatibility
-  // listeners because some deployments use tag/message for the same payload.
-  socket.on("clientBox", handleTagPayload);
-  socket.on("tag", handleTagPayload);
-  socket.on("message", handleTagPayload);
+  // `socket.onAny` above is now the single application-event ingestion path.
+  // Keeping separate clientBox/tag/message listeners would process those
+  // packets twice and could duplicate SSE notifications/logging.
 
   // Start only after every diagnostic/error listener has been attached.
   socket.connect();
