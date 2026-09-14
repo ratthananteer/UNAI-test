@@ -50,7 +50,7 @@ function notifyStatus(status: RealtimeStatus) {
   }
 }
 
-function matchesScope(options: RealtimeOptions, record: unknown): boolean {
+function matchesScope(options: RealtimeOptions, record: unknown): record is Record<string, unknown> {
   if (!record || typeof record !== "object") return false;
   const item = record as Record<string, unknown>;
 
@@ -86,6 +86,17 @@ function emitTagPayload(payload: unknown, eventName: string) {
 
     const scoped = records.filter((record) => matchesScope(listener.options, record));
     if (!scoped.length) continue;
+
+    console.log("[Realtime] POSITION DATA RECEIVED", {
+      eventName,
+      count: scoped.length,
+      positions: scoped.slice(0, 20).map((record) => ({
+        tagId: record.tagId,
+        floorId: record.floorId,
+        x: record.x,
+        y: record.y,
+      })),
+    });
 
     try {
       listener.options.onTag?.({

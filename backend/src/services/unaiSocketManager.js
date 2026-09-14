@@ -711,7 +711,7 @@ function handleTagPayload(payload, eventName = lastSocketEvent) {
   const records = collectLocationRecords(filteredPayload);
   log(`PAYLOAD event=${eventName} records=${records.length}`);
 
-  if (!records.length) {
+  if (records.length) {    log("POSITION DATA", records.slice(0, 20).map((record) => ({ tagId: record.tagId, buildingId: record.buildingId, floorId: record.floorId, x: record.x, y: record.y })));  }  if (!records.length) {
     // Keep a compact payload sample visible when UNAI changes its envelope.
     log("PAYLOAD SAMPLE", JSON.stringify(payload).slice(0, 3000));
     return;
