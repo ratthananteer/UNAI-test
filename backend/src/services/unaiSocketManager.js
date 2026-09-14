@@ -18,6 +18,7 @@ let socket = null;
 let started = false;
 let state = "STOPPED";
 let reconnectTimer = null;
+let topicFallbackTimer = null;
 let healthTimer = null;
 let reconnectAttempt = 0;
 let cooldownUntil = 0;
@@ -29,6 +30,7 @@ let currentTopics = [];
 // WAITING_FOR_TOKEN forever.
 let configuredFloors = [];
 let lastMessageAt = 0;
+let lastTagMessageAt = 0;
 let lastConnectedAt = 0;
 let lastError = null;
 let lastSocketEvent = null;
@@ -437,12 +439,18 @@ function clearReconnectTimer() {
   reconnectTimer = null;
 }
 
+function clearTopicFallbackTimer() {
+  if (topicFallbackTimer) clearTimeout(topicFallbackTimer);
+  topicFallbackTimer = null;
+}
+
 function clearHealthTimer() {
   if (healthTimer) clearInterval(healthTimer);
   healthTimer = null;
 }
 
 function closeSocket() {
+  clearTopicFallbackTimer();
   if (!socket) return;
   socket.removeAllListeners();
   socket.disconnect();
@@ -514,8 +522,8 @@ function startHealthMonitor() {
     if (!started) return;
 
     const now = Date.now();
-    const secondsSinceMessage = lastMessageAt
-      ? Math.round((now - lastMessageAt) / 1000)
+    const secondsSinceMessage = lastTagMessageAt
+      ? Math.round((now - lastTagMessageAt) / 1000)
       : null;
 
     log("HEALTH", {
@@ -692,8 +700,6 @@ function parseSocketPayload(payload) {
 }
 
 function handleTagPayload(payload, eventName = lastSocketEvent) {
-  lastMessageAt = Date.now();
-
   // Socket.IO deployments can deliver the actual location envelope as a JSON
   // string (not a JavaScript object). The old collector treated that string as
   // a non-object and therefore returned zero records. Parse it before applying
@@ -710,6 +716,9 @@ function handleTagPayload(payload, eventName = lastSocketEvent) {
     log("PAYLOAD SAMPLE", JSON.stringify(payload).slice(0, 3000));
     return;
   }
+
+  lastMessageAt = Date.now();
+  lastTagMessageAt = lastMessageAt;
 
   // Forward normalized records to local backend subscribers before history
   // sampling. The frontend receives the same single upstream stream and does
@@ -737,28 +746,38 @@ function handleTagPayload(payload, eventName = lastSocketEvent) {
 }
 
 function subscribeTopic(topic) {
-  // The deployed UNAI RTLS gateway used by the original working Building flow
-  // accepts the floor room form `unai/*/*/{floorId}/tag`. The API still needs
-  // generateSocketTopic() because its socket_token authenticates the connection,
-  // but using the returned encrypt_topic here can result in a successful socket
-  // connection + `joinedRoom` with no location messages on this gateway.
-  // Keep encrypted topics available as an explicit opt-in for deployments that
-  // require the documented form.
-  const topicMode = String(process.env.UNAI_SOCKET_TOPIC_MODE || "wildcard")
-    .trim()
-    .toLowerCase();
-  const tagTopic = topicMode === "encrypted" && topic.encryptTopic
+  // UNAI's documented realtime-location protocol uses the encrypted topic
+  // returned by /gen_encrypt_topic: `unai/{encrypt_topic}/tag`. This is the
+  // primary subscription. The wildcard room can acknowledge /join while
+  // delivering no tag locations on the current gateway.
+  const encryptedTopic = topic.encryptTopic
     ? `unai/${topic.encryptTopic}/tag`
-    : `unai/*/*/${topic.floorId}/tag`;
+    : null;
+  const wildcardTopic = `unai/*/*/${topic.floorId}/tag`;
+  const tagTopic = encryptedTopic || wildcardTopic;
 
   socket.emit("/join", tagTopic);
-  log(`JOIN floor=${topic.floorId} mode=${topicMode} topic=${tagTopic}`);
+  log(`JOIN floor=${topic.floorId} mode=${encryptedTopic ? "encrypted" : "wildcard"} topic=${tagTopic}`);
   log("JOIN SENT", {
     floorId: topic.floorId,
-    mode: topicMode,
+    mode: encryptedTopic ? "encrypted" : "wildcard",
     topic: tagTopic,
     hasEncryptTopic: Boolean(topic.encryptTopic),
   });
+
+  // Compatibility probe: if the encrypted room is accepted but produces no
+  // location packets, probe the legacy wildcard rooms on the SAME socket after
+  // a short grace period. No second socket or token request is created.
+  if (encryptedTopic && !topicFallbackTimer) {
+    topicFallbackTimer = setTimeout(() => {
+      topicFallbackTimer = null;
+      if (!started || !socket?.connected || lastTagMessageAt) return;
+      log("No tag location received from encrypted topics; probing legacy wildcard topics on the existing socket");
+      currentTopics.forEach((currentTopic) => {
+        socket?.emit("/join", `unai/*/*/${currentTopic.floorId}/tag`);
+      });
+    }, 5_000);
+  }
 }
 
 async function regenerateTopics() {
@@ -849,6 +868,8 @@ async function connect() {
     reconnectAttempt = 0;
     cooldownUntil = 0;
     lastConnectedAt = Date.now();
+    lastMessageAt = 0;
+    lastTagMessageAt = 0;
     lastError = null;
     setState("CONNECTED");
     log(`CONNECTED socketId=${socket.id}`);
@@ -1016,6 +1037,7 @@ async function start(options = {}) {
 function stop() {
   started = false;
   clearReconnectTimer();
+  clearTopicFallbackTimer();
   clearHealthTimer();
   cooldownUntil = 0;
   reconnectAttempt = 0;
@@ -1047,7 +1069,8 @@ function getStatus() {
     reconnectAttempt,
     cooldownUntil: cooldownUntil || null,
     lastConnectedAt: lastConnectedAt || null,
-    lastMessageAt: lastMessageAt || null,
+    lastMessageAt: lastTagMessageAt || lastMessageAt || null,
+    lastTagMessageAt: lastTagMessageAt || null,
     lastSocketEvent,
     lastError,
     savedEventCount,

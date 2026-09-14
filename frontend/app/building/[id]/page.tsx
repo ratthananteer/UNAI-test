@@ -144,11 +144,16 @@ export default async function BuildingPage({
       // New API is the preferred current-position source for Building. The
       // fallback preserves the existing MongoDB read model if UNAI is
       // temporarily unavailable, so the main Building flow does not break.
+      // The upstream `/v1/get_all_tag_last_location` endpoint currently returns
+      // HTTP 404 in production. MongoDB TagLatest is already the backend live
+      // read model populated by the shared Socket collector, so use it directly
+      // for the initial Building snapshot. Keep the old UNAI endpoint only as an
+      // optional fallback for deployments where it is explicitly restored.
       getApi(
-        "/api/v1/get_all_tag_last_location",
-        [`/api/db-tags?buildingId=${encodeURIComponent(id)}`],
+        `/api/db-tags?buildingId=${encodeURIComponent(id)}`,
+        ["/api/v1/get_all_tag_last_location"],
         authCookie,
-        true,
+        false,
       ),
       getApi("/api/tag", [], authCookie),
       getApi(`/api/zone?buildingId=${encodeURIComponent(id)}`, [], authCookie),
