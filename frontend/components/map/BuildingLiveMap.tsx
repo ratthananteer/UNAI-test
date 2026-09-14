@@ -188,10 +188,14 @@ export default function BuildingLiveMap({
     const refresh = async () => {
       if (selectedFloorId === undefined) return;
       try {
-        let response = await fetch("/api/v1/get_all_tag_last_location", { cache: "no-store" });
-        if (response.status === 404) {
-          response = await fetch(`/api/db-tags?buildingId=${encodeURIComponent(String(buildingId))}`, { cache: "no-store" });
-        }
+        // Production `unai-r` may run an older backend deployment without the
+        // additive last-location route. Building live movement must therefore
+        // use the authenticated MongoDB TagLatest read model, which is already
+        // updated by the shared realtime collector and is available at /db-tags.
+        const response = await fetch(
+          `/api/db-tags?buildingId=${encodeURIComponent(String(buildingId))}`,
+          { cache: "no-store" },
+        );
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const items = extractItems(await response.json());
         if (cancelled) return;
