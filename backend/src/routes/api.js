@@ -38,8 +38,8 @@ function isAsset(item) {
 }
 
 const DB_TAGS_CACHE_MS = Math.max(
-  5_000,
-  Number(process.env.DB_TAGS_CACHE_MS) || 5_000,
+  0,
+  Number(process.env.DB_TAGS_CACHE_MS) || 0,
 );
 let dbTagsCache = null;
 let dbTagsCacheAt = 0;
