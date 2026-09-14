@@ -242,6 +242,28 @@ export default function BuildingLiveMap({
     return { ...(selectedUser ?? {}), ...(selectedLastLocation ?? {}) };
   }, [selectedUser, selectedLastLocation]);
 
+  // Keep this hook unconditional. The previous implementation declared this
+  // useMemo after the early "no floor" return, which violates React's Rules of
+  // Hooks and can destabilize the Building map when floor data arrives/changes.
+  const liveTags = useMemo(() => {
+    if (selectedFloorId === undefined) return [];
+
+    const merged = new Map<string, Item>();
+    for (const tag of tags.filter((item) => tagBelongsToFloor(item, selectedFloorId, selectedFloorName))) {
+      const id = tag.id ?? tag.tagId ?? tag.tag_id;
+      if (id != null) merged.set(String(id), tag);
+    }
+    for (const location of liveLocationTags) {
+      const id = location.id ?? location.tagId ?? location.tag_id;
+      if (id == null) continue;
+      const key = String(id);
+      const base = merged.get(key);
+      if (base) merged.set(key, { ...base, ...location });
+      else merged.set(key, location);
+    }
+    return Array.from(merged.values()).filter((item) => tagBelongsToFloor(item, selectedFloorId, selectedFloorName));
+  }, [tags, liveLocationTags, selectedFloorId, selectedFloorName]);
+
   if (!selectedFloor || selectedFloorId === undefined) {
     return (
       <section className="mt-6 rounded-xl border bg-white p-6 shadow-sm">
@@ -271,22 +293,6 @@ export default function BuildingLiveMap({
     label: str(item.label ?? item.name ?? item.id, "Anchor"),
     status: typeof item.status === "number" ? item.status : undefined,
   }));
-  const liveTags = useMemo(() => {
-    const merged = new Map<string, Item>();
-    for (const tag of tags.filter((item) => tagBelongsToFloor(item, selectedFloorId, selectedFloorName))) {
-      const id = tag.id ?? tag.tagId ?? tag.tag_id;
-      if (id != null) merged.set(String(id), tag);
-    }
-    for (const location of liveLocationTags) {
-      const id = location.id ?? location.tagId ?? location.tag_id;
-      if (id == null) continue;
-      const key = String(id);
-      const base = merged.get(key);
-      if (base) merged.set(key, { ...base, ...location });
-      else merged.set(key, location);
-    }
-    return Array.from(merged.values()).filter((item) => tagBelongsToFloor(item, selectedFloorId, selectedFloorName));
-  }, [tags, liveLocationTags, selectedFloorId, selectedFloorName]);
   const liveZones = zones.filter((item) => belongsToFloor(item, selectedFloorId)).map((item) => ({
     id: idOf(item.id ?? item.zone_id ?? item.zoneId),
     name: str(item.name ?? item.zone_name ?? item.title, "Zone"),

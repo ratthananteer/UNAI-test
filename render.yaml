@@ -16,6 +16,18 @@ services:
         sync: false
       - key: UNAI_SOCKET_URL
         sync: false
+      - key: APIFLOOR_URL
+        value: https://rtls.lailab.online/api/v1/get_all_floor
+      - key: APIANCHOR_URL
+        value: https://rtls.lailab.online/api/v1/get_all_anchor
+      - key: APIZONE_URL
+        value: https://rtls.lailab.online/api/v1/get_all_zone
+      - key: APIPLACE_URL
+        value: https://rtls.lailab.online/api/v1/get_all_place
+      - key: APIBUILDING_URL
+        value: https://rtls.lailab.online/api/v1/get_all_building
+      - key: APITAG_URL
+        value: https://rtls.lailab.online/api/v1/get_all_tag
       - key: TAG_ALIVE_TIMEOUT_SECONDS
         value: "10"
       - key: TAG_SCREEN_INTERVAL_SECONDS
@@ -39,5 +51,12 @@ services:
     dockerfilePath: ./frontend/Dockerfile
     dockerContext: ./frontend
     envVars:
+      # Frontend Next.js rewrites /api/* requests to the backend service.
+      # Resolve the backend's actual Render URL instead of hard-coding an old
+      # onrender.com hostname (for example, unai-r). This keeps /api/realtime,
+      # /api/db-tags and /api/active-tags on the same backend deployment.
       - key: BACKEND_URL
-        value: https://unai-test.onrender.com
+        fromService:
+          type: web
+          name: unai-backend
+          envVarKey: RENDER_EXTERNAL_URL
