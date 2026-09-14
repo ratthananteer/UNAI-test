@@ -247,12 +247,20 @@ function collectLocationRecords(value, output = [], parentContext = {}) {
   }
 
   const object = value;
+  const position = asObject(object.position);
+  const location = asObject(object.location);
   const context = {
     floorId: floorIdOf(object) ?? parentContext.floorId ?? null,
     buildingId: buildingIdOf(object) ?? parentContext.buildingId ?? null,
+    tagId: tagIdOf(object) ?? parentContext.tagId ?? null,
   };
 
-  const tagId = tagIdOf(object);
+  // UNAI has multiple payload envelopes. In particular, some clientBox/tag
+  // messages put tagId/floor/building on the parent object and x/y inside a
+  // nested `position` or `location` object. The previous collector only read
+  // top-level x/y, so it silently produced zero records even though the socket
+  // was connected. The browser parser already supported this shape; keep the
+  // backend collector equally tolerant so SSE + TagLatest receive movement.
   const x = numberValue(
     firstValue(object, [
       "x",
@@ -260,7 +268,9 @@ function collectLocationRecords(value, output = [], parentContext = {}) {
       "position_x",
       "location_x",
       "coordinate_x",
-    ]),
+    ]) ??
+      firstValue(position, ["x", "pos_x", "position_x", "coordinate_x"]) ??
+      firstValue(location, ["x", "pos_x", "position_x", "coordinate_x"]),
   );
   const y = numberValue(
     firstValue(object, [
@@ -269,12 +279,14 @@ function collectLocationRecords(value, output = [], parentContext = {}) {
       "position_y",
       "location_y",
       "coordinate_y",
-    ]),
+    ]) ??
+      firstValue(position, ["y", "pos_y", "position_y", "coordinate_y"]) ??
+      firstValue(location, ["y", "pos_y", "position_y", "coordinate_y"]),
   );
 
-  if (tagId && x !== null && y !== null) {
+  if (context.tagId && x !== null && y !== null) {
     output.push({
-      tagId,
+      tagId: context.tagId,
       floorId: context.floorId,
       buildingId: context.buildingId,
       x,
@@ -286,26 +298,31 @@ function collectLocationRecords(value, output = [], parentContext = {}) {
           "position_z",
           "location_z",
           "coordinate_z",
-        ]),
+        ]) ??
+          firstValue(position, ["z", "pos_z", "position_z", "coordinate_z"]) ??
+          firstValue(location, ["z", "pos_z", "position_z", "coordinate_z"]),
       ),
       timestamp: timestampValue(timestampFromRecord(object)),
-      groupId: firstValue(object, ["groupId", "group_id"]),
-      groupName: firstValue(object, ["groupName", "group_name"]),
+      groupId: firstValue(object, ["groupId", "group_id"]) ?? parentContext.groupId ?? null,
+      groupName: firstValue(object, ["groupName", "group_name"]) ?? parentContext.groupName ?? null,
       tagName: firstValue(object, [
         "tagName",
         "tag_name",
         "name",
         "label",
         "ui_display",
-      ]),
+      ]) ?? parentContext.tagName ?? null,
       rawData: object,
     });
   }
 
-  for (const child of Object.values(object)) {
-    if (child && typeof child === "object") {
-      collectLocationRecords(child, output, context);
-    }
+  // Once this object already produced a location record from its nested
+  // position/location fields, do not walk those coordinate containers again;
+  // otherwise the same tag update would be emitted twice to SSE/MongoDB.
+  for (const [key, child] of Object.entries(object)) {
+    if (!child || typeof child !== "object") continue;
+    if ((key === "position" || key === "location") && context.tagId && x !== null && y !== null) continue;
+    collectLocationRecords(child, output, context);
   }
 
   return output;
