@@ -188,7 +188,10 @@ export default function BuildingLiveMap({
     const refresh = async () => {
       if (selectedFloorId === undefined) return;
       try {
-        const response = await fetch("/api/v1/get_all_tag_last_location", { cache: "no-store" });
+        let response = await fetch("/api/v1/get_all_tag_last_location", { cache: "no-store" });
+        if (response.status === 404) {
+          response = await fetch(`/api/db-tags?buildingId=${encodeURIComponent(String(buildingId))}`, { cache: "no-store" });
+        }
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const items = extractItems(await response.json());
         if (cancelled) return;
