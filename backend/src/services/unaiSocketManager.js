@@ -737,10 +737,28 @@ function handleTagPayload(payload, eventName = lastSocketEvent) {
 }
 
 function subscribeTopic(topic) {
-  const tagTopic = `unai/${topic.encryptTopic}/tag`;
+  // The deployed UNAI RTLS gateway used by the original working Building flow
+  // accepts the floor room form `unai/*/*/{floorId}/tag`. The API still needs
+  // generateSocketTopic() because its socket_token authenticates the connection,
+  // but using the returned encrypt_topic here can result in a successful socket
+  // connection + `joinedRoom` with no location messages on this gateway.
+  // Keep encrypted topics available as an explicit opt-in for deployments that
+  // require the documented form.
+  const topicMode = String(process.env.UNAI_SOCKET_TOPIC_MODE || "wildcard")
+    .trim()
+    .toLowerCase();
+  const tagTopic = topicMode === "encrypted" && topic.encryptTopic
+    ? `unai/${topic.encryptTopic}/tag`
+    : `unai/*/*/${topic.floorId}/tag`;
+
   socket.emit("/join", tagTopic);
-  log(`JOIN floor=${topic.floorId} topic=${tagTopic}`);
-  log("JOIN SENT", { floorId: topic.floorId, topic: tagTopic });
+  log(`JOIN floor=${topic.floorId} mode=${topicMode} topic=${tagTopic}`);
+  log("JOIN SENT", {
+    floorId: topic.floorId,
+    mode: topicMode,
+    topic: tagTopic,
+    hasEncryptTopic: Boolean(topic.encryptTopic),
+  });
 }
 
 async function regenerateTopics() {
