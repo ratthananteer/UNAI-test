@@ -70,6 +70,7 @@ export default function BuildingLiveMap({
   const [selectedUserTagId, setSelectedUserTagId] = useState("");
   const [selectedLastLocation, setSelectedLastLocation] = useState<Item | undefined>();
   const [lastLocationLoading, setLastLocationLoading] = useState(false);
+  const [liveLocationTags, setLiveLocationTags] = useState<Item[]>([]);
 
   const getUserName = (tag: Item): string => {
     const first = str(tag.firstname ?? tag.first_name ?? tag.firstName, "").trim();
@@ -156,6 +157,54 @@ export default function BuildingLiveMap({
     };
   }, [followedTagId]);
 
+  // The last-location API is the authoritative current-position fallback for
+  // Building. Keep a lightweight poll so the map still moves when the shared
+  // SSE/socket collector is temporarily disconnected or the upstream socket
+  // envelope changes. This only updates the local map; history writes remain
+  // owned by the backend collector.
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | null = null;
+
+    const extractItems = (json: unknown): Item[] => {
+      if (Array.isArray(json)) return json.filter((item): item is Item => Boolean(item && typeof item === "object" && !Array.isArray(item)));
+      if (!json || typeof json !== "object") return [];
+      const root = json as Item;
+      for (const value of [root.data, root.items, root.results, root.tags]) {
+        if (Array.isArray(value)) return value.filter((item): item is Item => Boolean(item && typeof item === "object" && !Array.isArray(item)));
+      }
+      if (root.tag && typeof root.tag === "object" && !Array.isArray(root.tag)) return [root.tag as Item];
+      return [];
+    };
+
+    const refresh = async () => {
+      if (selectedFloorId === undefined) return;
+      try {
+        const response = await fetch("/api/v1/get_all_tag_last_location", { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const items = extractItems(await response.json());
+        if (cancelled) return;
+
+        const current = items.filter((item) => {
+          const itemBuilding = item.buildingId ?? item.building_id ?? item.building;
+          const itemFloor = item.floorId ?? item.floor_id ?? item.floor ?? item.floorID;
+          if (itemBuilding != null && String(itemBuilding) !== String(buildingId)) return false;
+          return itemFloor == null || String(itemFloor) === String(selectedFloorId);
+        });
+        setLiveLocationTags(current);
+      } catch (error) {
+        if (!cancelled) console.warn("[BUILDING] Live last-location refresh unavailable; keeping socket/API snapshot:", error);
+      }
+    };
+
+    void refresh();
+    timer = window.setInterval(() => void refresh(), 2000);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [buildingId, selectedFloorId]);
+
   const selectedUserDisplay = useMemo(() => {
     if (!selectedUser && !selectedLastLocation) return undefined;
     return { ...(selectedUser ?? {}), ...(selectedLastLocation ?? {}) };
@@ -192,7 +241,22 @@ export default function BuildingLiveMap({
     label: str(item.label ?? item.name ?? item.id, "Anchor"),
     status: typeof item.status === "number" ? item.status : undefined,
   }));
-  const liveTags = tags.filter((item) => tagBelongsToFloor(item, selectedFloorId));
+  const liveTags = useMemo(() => {
+    const merged = new Map<string, Item>();
+    for (const tag of tags.filter((item) => tagBelongsToFloor(item, selectedFloorId))) {
+      const id = tag.id ?? tag.tagId ?? tag.tag_id;
+      if (id != null) merged.set(String(id), tag);
+    }
+    for (const location of liveLocationTags) {
+      const id = location.id ?? location.tagId ?? location.tag_id;
+      if (id == null) continue;
+      const key = String(id);
+      const base = merged.get(key);
+      if (base) merged.set(key, { ...base, ...location });
+      else merged.set(key, location);
+    }
+    return Array.from(merged.values()).filter((item) => tagBelongsToFloor(item, selectedFloorId));
+  }, [tags, liveLocationTags, selectedFloorId]);
   const liveZones = zones.filter((item) => belongsToFloor(item, selectedFloorId)).map((item) => ({
     id: idOf(item.id ?? item.zone_id ?? item.zoneId),
     name: str(item.name ?? item.zone_name ?? item.title, "Zone"),
