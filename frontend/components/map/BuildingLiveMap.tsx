@@ -33,9 +33,13 @@ function belongsToFloor(item: Item, selectedId: string | number): boolean {
   return value === undefined || String(value) === String(selectedId);
 }
 
-function tagBelongsToFloor(item: Item, selectedId: string | number): boolean {
-  const value = idOf(item.floor_id ?? item.floorId ?? item.floor ?? item.floorID);
-  return value !== undefined && String(value) === String(selectedId);
+function tagBelongsToFloor(item: Item, selectedId: string | number, selectedName?: string): boolean {
+  const idValue = idOf(item.floor_id ?? item.floorId ?? item.floorID);
+  if (idValue !== undefined) return String(idValue) === String(selectedId);
+  const floorValue = item.floor;
+  if (floorValue !== undefined && floorValue !== null && typeof floorValue !== "object" && String(floorValue) === String(selectedId)) return true;
+  const itemFloorName = item.floor_name ?? item.floorName ?? item.floor_title;
+  return Boolean(selectedName && itemFloorName != null && String(itemFloorName).trim().toLowerCase() === selectedName.trim().toLowerCase());
 }
 
 export default function BuildingLiveMap({
@@ -60,6 +64,10 @@ export default function BuildingLiveMap({
   const usableFloors = useMemo(() => floors.filter((floor) => floorId(floor) !== undefined), [floors]);
   const [internalFloorId, setInternalFloorId] = useState<string | number | undefined>(floorId(usableFloors[0]));
   const selectedFloorId = controlledFloorId ?? internalFloorId;
+  const selectedFloor = useMemo(() => usableFloors.find((floor) => String(floorId(floor)) === String(selectedFloorId)), [usableFloors, selectedFloorId]);
+  const selectedFloorName = selectedFloor
+    ? str(selectedFloor.name ?? selectedFloor.floor_name ?? selectedFloor.title, `Floor ${String(selectedFloorId)}`)
+    : undefined;
   const setSelectedFloorId = (value: string | number) => {
     setInternalFloorId(value);
     onFloorChange?.(value);
@@ -187,9 +195,8 @@ export default function BuildingLiveMap({
 
         const current = items.filter((item) => {
           const itemBuilding = item.buildingId ?? item.building_id ?? item.building;
-          const itemFloor = item.floorId ?? item.floor_id ?? item.floor ?? item.floorID;
-          if (itemBuilding != null && String(itemBuilding) !== String(buildingId)) return false;
-          return itemFloor == null || String(itemFloor) === String(selectedFloorId);
+          if (itemBuilding != null && typeof itemBuilding !== "object" && String(itemBuilding) !== String(buildingId)) return false;
+          return tagBelongsToFloor(item, selectedFloorId, selectedFloorName);
         });
         setLiveLocationTags(current);
       } catch (error) {
@@ -203,14 +210,12 @@ export default function BuildingLiveMap({
       cancelled = true;
       if (timer !== null) window.clearInterval(timer);
     };
-  }, [buildingId, selectedFloorId]);
+  }, [buildingId, selectedFloorId, selectedFloorName]);
 
   const selectedUserDisplay = useMemo(() => {
     if (!selectedUser && !selectedLastLocation) return undefined;
     return { ...(selectedUser ?? {}), ...(selectedLastLocation ?? {}) };
   }, [selectedUser, selectedLastLocation]);
-
-  const selectedFloor = useMemo(() => usableFloors.find((floor) => String(floorId(floor)) === String(selectedFloorId)), [usableFloors, selectedFloorId]);
 
   if (!selectedFloor || selectedFloorId === undefined) {
     return (
@@ -243,7 +248,7 @@ export default function BuildingLiveMap({
   }));
   const liveTags = useMemo(() => {
     const merged = new Map<string, Item>();
-    for (const tag of tags.filter((item) => tagBelongsToFloor(item, selectedFloorId))) {
+    for (const tag of tags.filter((item) => tagBelongsToFloor(item, selectedFloorId, selectedFloorName))) {
       const id = tag.id ?? tag.tagId ?? tag.tag_id;
       if (id != null) merged.set(String(id), tag);
     }
@@ -255,8 +260,8 @@ export default function BuildingLiveMap({
       if (base) merged.set(key, { ...base, ...location });
       else merged.set(key, location);
     }
-    return Array.from(merged.values()).filter((item) => tagBelongsToFloor(item, selectedFloorId));
-  }, [tags, liveLocationTags, selectedFloorId]);
+    return Array.from(merged.values()).filter((item) => tagBelongsToFloor(item, selectedFloorId, selectedFloorName));
+  }, [tags, liveLocationTags, selectedFloorId, selectedFloorName]);
   const liveZones = zones.filter((item) => belongsToFloor(item, selectedFloorId)).map((item) => ({
     id: idOf(item.id ?? item.zone_id ?? item.zoneId),
     name: str(item.name ?? item.zone_name ?? item.title, "Zone"),

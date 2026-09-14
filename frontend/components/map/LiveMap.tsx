@@ -290,6 +290,12 @@ export default function LiveMap({
   useEffect(() => {
     const safeInitialTags = initialTags.filter((tag) => !isAssetTag(tag));
     setTags(safeInitialTags);
+    const latestTimestamp = safeInitialTags
+      .map((tag) => tag._eventTimestamp ?? tag.lastSeenAt ?? tag.last_seen ?? tag.timestamp ?? tag.created_at ?? tag.date_now)
+      .map((value) => eventTime(value))
+      .sort()
+      .at(-1);
+    if (latestTimestamp) setLastUpdate(new Date(latestTimestamp).toLocaleTimeString());
     setActiveTagIds(
       new Set(
         safeInitialTags
