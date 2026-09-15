@@ -946,9 +946,16 @@ function acknowledgeInitTopic(eventName, payload) {
   // get_floor and could make the server accept the room join while never
   // activating the realtime clientBox stream.
   const context = inferInitLocationContext(parsedPayload);
-  const floorId = context?.floorId ?? null;
-  const buildingId = context?.buildingId ?? null;
-  const placeId = context?.placeId ?? null;
+  // A valid UNAI floor can legitimately return an empty tag map (for example
+  // when no tag is currently initialized on that floor). In that case the
+  // empty object contains no floor/building/place metadata, but it still must
+  // receive the protocol ACK or the anchor response can never complete the
+  // two-event handshake. Use the topic that was used for the outstanding init
+  // request as the authoritative fallback.
+  const fallbackTopic = currentTopics[initTopicIndex] || null;
+  const floorId = context?.floorId ?? fallbackTopic?.floorId ?? null;
+  const buildingId = context?.buildingId ?? fallbackTopic?.buildingId ?? null;
+  const placeId = context?.placeId ?? fallbackTopic?.placeId ?? null;
   const topic = currentTopics.find((item) => {
     if (String(item.floorId) !== String(floorId)) return false;
     if (buildingId !== null && item.buildingId !== null && String(item.buildingId) !== String(buildingId)) return false;
@@ -962,7 +969,15 @@ function acknowledgeInitTopic(eventName, payload) {
       floorId,
       buildingId,
       placeId,
-      responseTopic: context?.topic ?? null,
+      responseTopic: context?.topic ?? fallbackTopic?.topic ?? null,
+      fallbackTopic: fallbackTopic
+        ? {
+            floorId: fallbackTopic.floorId,
+            buildingId: fallbackTopic.buildingId,
+            placeId: fallbackTopic.placeId,
+            encryptTopic: fallbackTopic.encryptTopic,
+          }
+        : null,
       candidates: currentTopics
         .filter((item) => String(item.floorId) === String(floorId))
         .map((item) => ({
