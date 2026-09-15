@@ -813,6 +813,34 @@ function subscribeInitTopics(topic) {
   });
 }
 
+function inferInitFloorId(payload) {
+  const parsedPayload = parseSocketPayload(payload);
+  if (!parsedPayload || typeof parsedPayload !== "object") return null;
+
+  // UNAI init responses are commonly maps keyed by tag/anchor id, e.g.
+  // { "1947": { floor_id: 8, ... }, "1980": { floor_id: 8, ... } }.
+  // Therefore the floor is not present on the response envelope itself. Walk
+  // the response until we find a concrete floor field and use that to correlate
+  // the response with the topic that requested it.
+  const queue = [parsedPayload];
+  const visited = new Set();
+
+  while (queue.length) {
+    const current = queue.shift();
+    if (!current || typeof current !== "object" || visited.has(current)) continue;
+    visited.add(current);
+
+    const floorId = floorIdOf(current);
+    if (floorId !== null) return String(floorId);
+
+    for (const child of Object.values(current)) {
+      if (child && typeof child === "object") queue.push(child);
+    }
+  }
+
+  return null;
+}
+
 function acknowledgeInitTopic(eventName, payload) {
   if (!socket?.connected) return;
   if (eventName !== "init_unai_location_tag" && eventName !== "init_unai_location_anchor") return;
@@ -840,7 +868,11 @@ function acknowledgeInitTopic(eventName, payload) {
   socket.emit("/join", receivedRoom);
   broadcastToRoom(receivedRoom, acknowledgement);
 
-  const floorId = firstValue(payload, ["get_floor", "floorId", "floor_id"]);
+  // The init response is a keyed object, not an envelope containing get_floor.
+  // Correlate it from the nested tag/anchor record instead of reading floorId
+  // from the root object (which produced floorId=undefined and prevented the
+  // encrypted live rooms from ever being joined).
+  const floorId = inferInitFloorId(parsedPayload);
   const topic = currentTopics.find((item) => String(item.floorId) === String(floorId));
   if (topic) {
     const encryptedTagTopic = `unai/${topic.encryptTopic}/tag`;
@@ -853,13 +885,15 @@ function acknowledgeInitTopic(eventName, payload) {
       encryptedTagTopic,
       encryptedAnchorTopic,
     });
+  } else {
+    log("INIT ACK FLOOR NOT RESOLVED", {
+      eventName,
+      floorId,
+      payloadKeys: Object.keys(parsedPayload).slice(0, 30),
+    });
   }
 
-  log("INIT ACK SENT", {
-    eventName,
-    receivedRoom,
-    floorId,
-  });
+  log("INIT ACK SENT", { eventName, receivedRoom, floorId });
 }
 
 function subscribeTopic(topic) {
