@@ -949,10 +949,25 @@ function subscribeTopic(topic) {
       topicFallbackTimer = null;
       if (!started || !socket?.connected || lastTagMessageAt) return;
 
-      log("No tag location received after init handshake; retrying encrypted tag rooms on the existing socket");
+      // Some UNAI gateway instances acknowledge `/join` asynchronously. Give
+      // the *_received room a chance to become active, then repeat the exact
+      // encrypted-room subscription once. This is deliberately bounded to one
+      // retry so a dead upstream cannot turn into a reconnect/rate-limit loop.
+      log("No clientBox/tag location after init handshake; retrying encrypted live rooms once");
       currentTopics.forEach((currentTopic) => {
-        socket?.emit("/join", `unai/${currentTopic.encryptTopic}/tag`);
+        const encryptedTagTopic = `unai/${currentTopic.encryptTopic}/tag`;
+        const encryptedAnchorTopic = `unai/${currentTopic.encryptTopic}/anchor`;
+        socket?.emit("/join", encryptedTagTopic);
+        socket?.emit("/join", encryptedAnchorTopic);
       });
+
+      setTimeout(() => {
+        if (!started || !socket?.connected || lastTagMessageAt) return;
+        log("No live clientBox after encrypted-room retry", {
+          topics: currentTopics.length,
+          lastSocketEvent,
+        });
+      }, 5_000);
     }, 10_000);
   }
 }
@@ -1112,6 +1127,15 @@ async function connect() {
 
   // Critical diagnostic: do not guess UNAI's event envelope. This shows the
   // actual event names emitted by the upstream Socket.IO server.
+  socket.on("joinedRoom", (payload) => {
+    const parsedPayload = parseSocketPayload(payload);
+    log("JOINED ROOM ACK", {
+      payloadType: typeof parsedPayload,
+      payload: parsedPayload,
+      socketId: socket?.id || null,
+    });
+  });
+
   socket.onAny((event, ...args) => {
     lastSocketEvent = event;
     log("SOCKET EVENT", event, {
