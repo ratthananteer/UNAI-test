@@ -931,20 +931,17 @@ function acknowledgeInitTopic(eventName, payload) {
   // before checking/spreading fields; otherwise the handshake silently stops
   // here and the encrypted live rooms are never joined.
   const parsedPayload = parseSocketPayload(payload);
-  if (!parsedPayload || typeof parsedPayload !== "object" || Array.isArray(parsedPayload)) return;
+  if (!parsedPayload || typeof parsedPayload !== "object") return;
 
   const isTag = eventName === "init_unai_location_tag";
   const receivedRoom = isTag
     ? "init_unai_location_tag_received"
     : "init_unai_location_anchor_received";
 
-  // The init response itself is a keyed map of tag/anchor records. It is NOT
-  // the acknowledgement envelope described by the UNAI protocol. The
-  // acknowledgement must repeat the original request fields (action,
-  // customId, socketGetInitId, getMode, get_topic, get_floor). Previously we
-  // spread the keyed response object here, which omitted get_mode/get_topic/
-  // get_floor and could make the server accept the room join while never
-  // activating the realtime clientBox stream.
+  // The init response is DATA, not the acknowledgement envelope. It may be a
+  // keyed object or an array depending on the UNAI gateway version. Never echo
+  // that response back to the *_received room: the protocol requires the
+  // original get_init_unai_location request fields to be acknowledged.
   const context = inferInitLocationContext(parsedPayload);
   // A valid UNAI floor can legitimately return an empty tag map (for example
   // when no tag is currently initialized on that floor). In that case the
