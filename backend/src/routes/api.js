@@ -131,15 +131,33 @@ async function getLastLocationData() {
   if (tagLastLocationRefreshPromise) return tagLastLocationRefreshPromise;
 
   tagLastLocationRefreshPromise = (async () => {
-    const url = getTagLocationApiUrl(
-      "APITAG_LAST_LOCATION_URL",
-      "/api/v1/get_all_tag_last_location",
-    );
-    const data = await fetchFromApi(url, "Failed to get all tag last locations");
-    await syncTagLatestFromLastLocation(data);
-    tagLastLocationCache = data;
-    tagLastLocationCacheAt = Date.now();
-    return data;
+    const url = process.env.APITAG_LAST_LOCATION_URL;
+    if (!url) {
+      // This endpoint is not available on every UNAI deployment. TagLatest is
+      // the canonical local read model, so do not repeatedly call a known
+      // missing upstream route and flood Render logs with HTTP 404s.
+      const fallback = await readDbTagsFromMongo();
+      tagLastLocationCache = fallback;
+      tagLastLocationCacheAt = Date.now();
+      return fallback;
+    }
+
+    try {
+      const data = await fetchFromApi(url, "Failed to get all tag last locations");
+      await syncTagLatestFromLastLocation(data);
+      tagLastLocationCache = data;
+      tagLastLocationCacheAt = Date.now();
+      return data;
+    } catch (error) {
+      if (Number(error?.status) === 404) {
+        console.warn("[TagLocation] upstream last-location endpoint is unavailable (404); using TagLatest fallback");
+        const fallback = await readDbTagsFromMongo();
+        tagLastLocationCache = fallback;
+        tagLastLocationCacheAt = Date.now();
+        return fallback;
+      }
+      throw error;
+    }
   })().finally(() => {
     tagLastLocationRefreshPromise = null;
   });
