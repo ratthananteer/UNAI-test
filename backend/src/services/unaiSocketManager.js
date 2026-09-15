@@ -25,6 +25,7 @@ let cooldownUntil = 0;
 let currentTopics = [];
 let initTopicIndex = 0;
 const initAckedEvents = new Map();
+const pendingInitRoomJoins = new Map();
 // Keep the floor configuration separately from generated socket credentials.
 // If UNAI returns HTTP 429 while generating the first topic, currentTopics can
 // legitimately be empty. We still need the original floor list so the manager
@@ -849,17 +850,8 @@ function broadcastToRoom(room, data) {
   });
 }
 
-function subscribeInitTopics(topic) {
+function sendInitLocationRequest(topic) {
   if (!socket?.connected) return;
-
-  // Follow the official UNAI handshake order exactly:
-  // 1) join init tag/anchor rooms
-  // 2) broadcast get_init_unai_location
-  // 3) wait for init_* responses
-  // 4) join *_received and send the acknowledgement payload
-  // 5) join encrypted tag/anchor rooms
-  socket.emit("/join", "init_unai_location_tag");
-  socket.emit("/join", "init_unai_location_anchor");
 
   const payload = buildInitLocationPayload(topic);
   broadcastToRoom("init_unai_location", payload);
@@ -868,6 +860,28 @@ function subscribeInitTopics(topic) {
     floorId: topic.floorId,
     encryptTopic: topic.encryptTopic,
     socketGetInitId: payload.socketGetInitId,
+  });
+}
+
+function subscribeInitTopics(topic) {
+  if (!socket?.connected) return;
+
+  // `/join` is asynchronous. Wait for both joinedRoom acknowledgements before
+  // broadcasting the init request; otherwise the request can race room setup.
+  const topicKey = `${topic.floorId}:${topic.buildingId ?? ""}:${topic.placeId ?? ""}`;
+  pendingInitRoomJoins.set(topicKey, {
+    topic,
+    joined: new Set(),
+    requestSent: false,
+  });
+
+  socket.emit("/join", "init_unai_location_tag");
+  socket.emit("/join", "init_unai_location_anchor");
+
+  log("INIT ROOMS JOIN REQUESTED", {
+    floorId: topic.floorId,
+    topicKey,
+    requiredRooms: ["init_unai_location_tag", "init_unai_location_anchor"],
   });
 }
 
@@ -1224,6 +1238,31 @@ async function connect() {
       payload: parsedPayload,
       socketId: socket?.id || null,
     });
+
+    const room = asObject(parsedPayload)?.room;
+    if (typeof room !== "string") return;
+    if (room !== "init_unai_location_tag" && room !== "init_unai_location_anchor") return;
+
+    for (const [topicKey, pending] of pendingInitRoomJoins.entries()) {
+      if (!pending || pending.requestSent) continue;
+
+      pending.joined.add(room);
+      log("INIT ROOM JOIN CONFIRMED", {
+        floorId: pending.topic.floorId,
+        room,
+        joinedCount: pending.joined.size,
+        requiredCount: 2,
+      });
+
+      if (
+        pending.joined.has("init_unai_location_tag") &&
+        pending.joined.has("init_unai_location_anchor")
+      ) {
+        pending.requestSent = true;
+        pendingInitRoomJoins.set(topicKey, pending);
+        sendInitLocationRequest(pending.topic);
+      }
+    }
   });
 
   socket.onAny((event, ...args) => {
@@ -1308,6 +1347,7 @@ async function connect() {
     });
     initTopicIndex = 0;
     initAckedEvents.clear();
+    pendingInitRoomJoins.clear();
     if (currentTopics.length) subscribeTopic(currentTopics[0]);
   });
 
@@ -1477,6 +1517,7 @@ function stop() {
   configuredFloors = [];
   initTopicIndex = 0;
   initAckedEvents.clear();
+  pendingInitRoomJoins.clear();
   lastSavedPositions.clear();
   setState("STOPPED");
 }
