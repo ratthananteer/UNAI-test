@@ -1347,6 +1347,41 @@ async function connect() {
     args.forEach((payload) => handleTagPayload(payload, event));
   });
 
+  // Attach protocol listeners BEFORE socket.connect(). The previous implementation
+  // registered clientBox/init listeners inside the `connect` callback. A fast UNAI
+  // gateway can deliver the first init response immediately after the handshake,
+  // which creates a race where the room ACK is visible but the init response is
+  // missed. Missing that response prevents the encrypted live stream from becoming
+  // active even though `/join` later reports success.
+  socket.on("clientBox", (payload) => {
+    lastSocketEvent = "clientBox";
+    const parsedPayload = parseSocketPayload(payload);
+    log("CLIENTBOX RECEIVED", {
+      payloadType: typeof parsedPayload,
+      payloadKeys: asObject(parsedPayload) ? Object.keys(parsedPayload).slice(0, 30) : [],
+      payloadPreview: typeof parsedPayload === "string"
+        ? parsedPayload.slice(0, 2000)
+        : JSON.stringify(parsedPayload).slice(0, 3000),
+    });
+    handleTagPayload(payload, "clientBox");
+  });
+
+  socket.on("init_unai_location_tag", (payload) => {
+    log("INIT TAG RESPONSE", {
+      payloadType: typeof payload,
+      payloadKeys: asObject(payload) ? Object.keys(payload).slice(0, 30) : [],
+    });
+    acknowledgeInitTopic("init_unai_location_tag", payload);
+  });
+
+  socket.on("init_unai_location_anchor", (payload) => {
+    log("INIT ANCHOR RESPONSE", {
+      payloadType: typeof payload,
+      payloadKeys: asObject(payload) ? Object.keys(payload).slice(0, 30) : [],
+    });
+    acknowledgeInitTopic("init_unai_location_anchor", payload);
+  });
+
   socket.on("connect", () => {
     reconnectAttempt = 0;
     cooldownUntil = 0;
@@ -1361,39 +1396,6 @@ async function connect() {
     // then requires the init handshake before encrypted tag rooms emit clientBox.
     socket.emit("/register", { customId: "backend_history_collector" });
 
-    // UNAI's documented realtime location transport emits the live tag/anchor
-    // stream through the `clientBox` application event. Keep an explicit
-    // listener in addition to the catch-all diagnostic listener so we can prove
-    // that the actual live packet reaches this process and normalize it exactly
-    // once. This is especially important because the current runtime had a
-    // successful socket/join handshake but no observed clientBox event.
-    socket.on("clientBox", (payload) => {
-      lastSocketEvent = "clientBox";
-      const parsedPayload = parseSocketPayload(payload);
-      log("CLIENTBOX RECEIVED", {
-        payloadType: typeof parsedPayload,
-        payloadKeys: asObject(parsedPayload) ? Object.keys(parsedPayload).slice(0, 30) : [],
-        payloadPreview: typeof parsedPayload === "string"
-          ? parsedPayload.slice(0, 2000)
-          : JSON.stringify(parsedPayload).slice(0, 3000),
-      });
-      handleTagPayload(payload, "clientBox");
-    });
-
-    socket.on("init_unai_location_tag", (payload) => {
-      log("INIT TAG RESPONSE", {
-        payloadType: typeof payload,
-        payloadKeys: asObject(payload) ? Object.keys(payload).slice(0, 30) : [],
-      });
-      acknowledgeInitTopic("init_unai_location_tag", payload);
-    });
-    socket.on("init_unai_location_anchor", (payload) => {
-      log("INIT ANCHOR RESPONSE", {
-        payloadType: typeof payload,
-        payloadKeys: asObject(payload) ? Object.keys(payload).slice(0, 30) : [],
-      });
-      acknowledgeInitTopic("init_unai_location_anchor", payload);
-    });
     initTopicIndex = 0;
     initAckedEvents.clear();
     pendingInitRoomJoins.clear();
