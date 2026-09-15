@@ -290,7 +290,7 @@ function filterAssetPayload(value) {
 function tagIdFromObjectKey(key) {
   if (key === undefined || key === null) return null;
   const text = String(key).trim();
-  if (!text || !/^\\d+$/.test(text)) return null;
+  if (!text || !/^\d+$/.test(text)) return null;
   return text;
 }
 
@@ -1250,7 +1250,12 @@ async function connect() {
     // every application event and let collectLocationRecords decide whether
     // its payload actually contains a tag position. Lifecycle events are
     // ignored to avoid treating connection metadata as location data.
-    if (event === "connect" || event === "disconnect" || event === "connect_error") return;
+    if (
+      event === "connect" ||
+      event === "disconnect" ||
+      event === "connect_error" ||
+      event === "clientBox"
+    ) return;
     args.forEach((payload) => handleTagPayload(payload, event));
   });
 
@@ -1267,6 +1272,26 @@ async function connect() {
     // Keep register for deployments that expose it; the UNAI realtime protocol
     // then requires the init handshake before encrypted tag rooms emit clientBox.
     socket.emit("/register", { customId: "backend_history_collector" });
+
+    // UNAI's documented realtime location transport emits the live tag/anchor
+    // stream through the `clientBox` application event. Keep an explicit
+    // listener in addition to the catch-all diagnostic listener so we can prove
+    // that the actual live packet reaches this process and normalize it exactly
+    // once. This is especially important because the current runtime had a
+    // successful socket/join handshake but no observed clientBox event.
+    socket.on("clientBox", (payload) => {
+      lastSocketEvent = "clientBox";
+      const parsedPayload = parseSocketPayload(payload);
+      log("CLIENTBOX RECEIVED", {
+        payloadType: typeof parsedPayload,
+        payloadKeys: asObject(parsedPayload) ? Object.keys(parsedPayload).slice(0, 30) : [],
+        payloadPreview: typeof parsedPayload === "string"
+          ? parsedPayload.slice(0, 2000)
+          : JSON.stringify(parsedPayload).slice(0, 3000),
+      });
+      handleTagPayload(payload, "clientBox");
+    });
+
     socket.on("init_unai_location_tag", (payload) => {
       log("INIT TAG RESPONSE", {
         payloadType: typeof payload,
