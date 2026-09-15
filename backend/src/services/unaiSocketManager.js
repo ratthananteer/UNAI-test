@@ -794,10 +794,14 @@ function broadcastToRoom(room, data) {
 function subscribeInitTopics(topic) {
   if (!socket?.connected) return;
 
+  // Follow the official UNAI handshake order exactly:
+  // 1) join init tag/anchor rooms
+  // 2) broadcast get_init_unai_location
+  // 3) wait for init_* responses
+  // 4) join *_received and send the acknowledgement payload
+  // 5) join encrypted tag/anchor rooms
   socket.emit("/join", "init_unai_location_tag");
   socket.emit("/join", "init_unai_location_anchor");
-  socket.emit("/join", "init_unai_location_tag_received");
-  socket.emit("/join", "init_unai_location_anchor_received");
 
   const payload = buildInitLocationPayload(topic);
   broadcastToRoom("init_unai_location", payload);
@@ -810,62 +814,70 @@ function subscribeInitTopics(topic) {
 }
 
 function acknowledgeInitTopic(eventName, payload) {
-  if (!socket?.connected || !payload || typeof payload !== "object") return;
+  if (!socket?.connected) return;
   if (eventName !== "init_unai_location_tag" && eventName !== "init_unai_location_anchor") return;
+
+  // Some UNAI deployments send the init response as JSON text. Normalize it
+  // before checking/spreading fields; otherwise the handshake silently stops
+  // here and the encrypted live rooms are never joined.
+  const parsedPayload = parseSocketPayload(payload);
+  if (!parsedPayload || typeof parsedPayload !== "object" || Array.isArray(parsedPayload)) return;
 
   const isTag = eventName === "init_unai_location_tag";
   const receivedRoom = isTag
     ? "init_unai_location_tag_received"
     : "init_unai_location_anchor_received";
   const acknowledgement = {
-    ...payload,
+    ...parsedPayload,
     action: receivedRoom,
     customId: "backend_history_collector",
     socketGetInitId: socket.id,
   };
 
+  // The official protocol joins the *_received room only after the initial
+  // init response arrives. Sending an *_received event directly is not
+  // equivalent and can leave the UNAI server waiting for the room message.
+  socket.emit("/join", receivedRoom);
   broadcastToRoom(receivedRoom, acknowledgement);
-  socket.emit(eventName + "_received", acknowledgement);
+
+  const floorId = firstValue(payload, ["get_floor", "floorId", "floor_id"]);
+  const topic = currentTopics.find((item) => String(item.floorId) === String(floorId));
+  if (topic) {
+    const encryptedTagTopic = `unai/${topic.encryptTopic}/tag`;
+    const encryptedAnchorTopic = `unai/${topic.encryptTopic}/anchor`;
+    socket.emit("/join", encryptedTagTopic);
+    socket.emit("/join", encryptedAnchorTopic);
+    log("LIVE ROOMS JOINED", {
+      floorId: topic.floorId,
+      eventName,
+      encryptedTagTopic,
+      encryptedAnchorTopic,
+    });
+  }
+
   log("INIT ACK SENT", {
     eventName,
     receivedRoom,
-    floorId: firstValue(payload, ["get_floor", "floorId", "floor_id"]),
+    floorId,
   });
 }
 
 function subscribeTopic(topic) {
-  // Use the documented UNAI initialization handshake first. A successful
-  // /join acknowledgement only proves room membership; it does not start the
-  // realtime tag stream. The init request asks UNAI to prepare the encrypted
-  // tag/anchor streams for this floor, after which the normal tag room is joined.
+  // Do not join the live encrypted rooms before the init handshake completes.
+  // UNAI documents the order as init request -> init response -> *_received
+  // acknowledgement -> encrypted tag/anchor room.
   subscribeInitTopics(topic);
 
-  const encryptedTopic = `unai/${topic.encryptTopic}/tag`;
-  const wildcardTopic = `unai/*/*/${topic.floorId}/tag`;
-
-  socket.emit("/join", encryptedTopic);
-  socket.emit("/join", wildcardTopic);
-  log(`JOIN floor=${topic.floorId} mode=encrypted topic=${encryptedTopic}`);
-  log(`JOIN floor=${topic.floorId} mode=wildcard topic=${wildcardTopic}`);
-  log("JOIN SENT", {
-    floorId: topic.floorId,
-    encryptedTopic,
-    wildcardTopic,
-  });
-
-  // Retry both room forms once on the SAME socket if no actual tag position
-  // has arrived. Never create another upstream connection here.
   if (!topicFallbackTimer) {
     topicFallbackTimer = setTimeout(() => {
       topicFallbackTimer = null;
       if (!started || !socket?.connected || lastTagMessageAt) return;
 
-      log("No tag location received after initial joins; retrying encrypted + wildcard tag rooms on the existing socket");
+      log("No tag location received after init handshake; retrying encrypted tag rooms on the existing socket");
       currentTopics.forEach((currentTopic) => {
         socket?.emit("/join", `unai/${currentTopic.encryptTopic}/tag`);
-        socket?.emit("/join", `unai/*/*/${currentTopic.floorId}/tag`);
       });
-    }, 5_000);
+    }, 10_000);
   }
 }
 
