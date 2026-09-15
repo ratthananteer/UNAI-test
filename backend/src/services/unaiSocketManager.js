@@ -296,6 +296,21 @@ function tagIdFromObjectKey(key) {
 }
 
 function collectLocationRecords(value, output = [], parentContext = {}, parentKey = null) {
+  // UNAI can wrap clientBox/location data in one or more JSON-string layers,
+  // especially inside the generic `message` event. The previous walker stopped
+  // at strings, so a valid location packet could be visible in SOCKET EVENT but
+  // never become a realtime record. Decode nested JSON strings before walking.
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return output;
+    try {
+      const parsed = JSON.parse(text);
+      return collectLocationRecords(parsed, output, parentContext, parentKey);
+    } catch {
+      return output;
+    }
+  }
+
   if (!value || typeof value !== "object") return output;
 
   if (Array.isArray(value)) {
@@ -1003,29 +1018,33 @@ function acknowledgeInitTopic(eventName, payload) {
   socket.emit("/join", receivedRoom);
   broadcastToRoom(receivedRoom, acknowledgement);
 
-  const encryptedTagTopic = `unai/${topic.encryptTopic}/tag`;
-  const encryptedAnchorTopic = `unai/${topic.encryptTopic}/anchor`;
-  socket.emit("/join", encryptedTagTopic);
-  socket.emit("/join", encryptedAnchorTopic);
-  log("LIVE ROOMS JOINED", {
-    floorId: topic.floorId,
-    buildingId: topic.buildingId,
-    placeId: topic.placeId,
-    responseTopic: context?.topic ?? null,
-    eventName,
-    encryptedTagTopic,
-    encryptedAnchorTopic,
-  });
-
   const topicKey = `${topic.floorId}:${topic.buildingId ?? ""}:${topic.placeId ?? ""}`;
   const acknowledged = initAckedEvents.get(topicKey) || new Set();
   acknowledged.add(eventName);
   initAckedEvents.set(topicKey, acknowledged);
 
+  // UNAI's documented handshake requires BOTH init responses to be acknowledged
+  // before entering the encrypted live rooms. Joining after only one response
+  // can race the second acknowledgement and leave the gateway subscribed but
+  // not publishing clientBox updates.
   if (
     acknowledged.has("init_unai_location_tag") &&
     acknowledged.has("init_unai_location_anchor")
   ) {
+    const encryptedTagTopic = `unai/${topic.encryptTopic}/tag`;
+    const encryptedAnchorTopic = `unai/${topic.encryptTopic}/anchor`;
+    socket.emit("/join", encryptedTagTopic);
+    socket.emit("/join", encryptedAnchorTopic);
+    log("LIVE ROOMS JOINED", {
+      floorId: topic.floorId,
+      buildingId: topic.buildingId,
+      placeId: topic.placeId,
+      responseTopic: context?.topic ?? null,
+      eventName,
+      encryptedTagTopic,
+      encryptedAnchorTopic,
+    });
+  }
     const completedIndex = currentTopics.findIndex(
       (item) => `${item.floorId}:${item.buildingId ?? ""}:${item.placeId ?? ""}` === topicKey,
     );
@@ -1039,7 +1058,6 @@ function acknowledgeInitTopic(eventName, payload) {
         totalTopics: currentTopics.length,
       });
     }
-  }
 
   log("INIT ACK SENT", {
     eventName,
@@ -1288,6 +1306,25 @@ async function connect() {
         preview: typeof value === "string" ? value.slice(0, 1000) : value,
       })),
     });
+
+    // Some gateway versions deliver the live clientBox envelope through the
+    // generic `message` event instead of emitting a literal `clientBox` event.
+    // Make that distinction explicit in the logs so a successful socket/join
+    // cannot be mistaken for a missing live stream, and feed the same tolerant
+    // parser below for either transport shape.
+    if (event === "message" || event === "data") {
+      for (const value of args) {
+        const preview = typeof value === "string" ? value : JSON.stringify(value);
+        if (/clientbox|taglocation|position/i.test(String(preview))) {
+          log("CLIENTBOX CANDIDATE", {
+            event,
+            payloadType: typeof value,
+            payloadPreview: String(preview).slice(0, 3000),
+          });
+        }
+      }
+    }
+
     log("SOCKET PING/PONG TRACE", {
       event,
       socketId: socket?.id || null,
