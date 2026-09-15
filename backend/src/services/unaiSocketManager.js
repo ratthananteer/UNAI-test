@@ -356,6 +356,7 @@ function normalizeTopic(topic) {
   if (!topic || typeof topic !== "object") return null;
   const floorId = firstValue(topic, ["floorId", "floor_id", "id"]);
   const buildingId = firstValue(topic, ["buildingId", "building_id"]);
+  const placeId = firstValue(topic, ["placeId", "place_id"]);
   const encryptTopic = firstValue(topic, [
     "encryptTopic",
     "encrypt_topic",
@@ -368,6 +369,7 @@ function normalizeTopic(topic) {
   return {
     floorId: String(floorId),
     buildingId: buildingId === undefined ? null : String(buildingId),
+    placeId: placeId === undefined ? null : String(placeId),
     encryptTopic: String(encryptTopic),
     socketToken: socketToken ? String(socketToken) : null,
   };
@@ -381,7 +383,7 @@ function normalizeTopics(topics) {
   for (const item of topics) {
     const topic = normalizeTopic(item);
     if (!topic) continue;
-    const key = `${topic.floorId}:${topic.encryptTopic}`;
+    const key = `${topic.floorId}:${topic.buildingId ?? ""}:${topic.placeId ?? ""}`;
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(topic);
@@ -813,15 +815,14 @@ function subscribeInitTopics(topic) {
   });
 }
 
-function inferInitFloorId(payload) {
+function inferInitLocationContext(payload) {
   const parsedPayload = parseSocketPayload(payload);
   if (!parsedPayload || typeof parsedPayload !== "object") return null;
 
-  // UNAI init responses are commonly maps keyed by tag/anchor id, e.g.
-  // { "1947": { floor_id: 8, ... }, "1980": { floor_id: 8, ... } }.
-  // Therefore the floor is not present on the response envelope itself. Walk
-  // the response until we find a concrete floor field and use that to correlate
-  // the response with the topic that requested it.
+  // UNAI init responses are keyed maps. The individual records carry the
+  // authoritative floor/building/place and plaintext topic, while the root
+  // object has only device/tag ids as keys. Keep all three ids so a reused
+  // floor id in another building cannot select the wrong encrypted topic.
   const queue = [parsedPayload];
   const visited = new Set();
 
@@ -831,7 +832,18 @@ function inferInitFloorId(payload) {
     visited.add(current);
 
     const floorId = floorIdOf(current);
-    if (floorId !== null) return String(floorId);
+    const buildingId = buildingIdOf(current);
+    const placeId = firstValue(current, ["placeId", "place_id", "placeID"]);
+    const topic = firstValue(current, ["topic"]);
+
+    if (floorId !== null || buildingId !== null || placeId !== undefined || topic !== undefined) {
+      return {
+        floorId,
+        buildingId: buildingId === null ? null : String(buildingId),
+        placeId: placeId === undefined ? null : String(placeId),
+        topic: topic === undefined ? null : String(topic),
+      };
+    }
 
     for (const child of Object.values(current)) {
       if (child && typeof child === "object") queue.push(child);
@@ -872,8 +884,17 @@ function acknowledgeInitTopic(eventName, payload) {
   // Correlate it from the nested tag/anchor record instead of reading floorId
   // from the root object (which produced floorId=undefined and prevented the
   // encrypted live rooms from ever being joined).
-  const floorId = inferInitFloorId(parsedPayload);
-  const topic = currentTopics.find((item) => String(item.floorId) === String(floorId));
+  const context = inferInitLocationContext(parsedPayload);
+  const floorId = context?.floorId ?? null;
+  const buildingId = context?.buildingId ?? null;
+  const placeId = context?.placeId ?? null;
+  const topic = currentTopics.find((item) => {
+    if (String(item.floorId) !== String(floorId)) return false;
+    if (buildingId !== null && item.buildingId !== null && String(item.buildingId) !== String(buildingId)) return false;
+    if (placeId !== null && item.placeId !== null && String(item.placeId) !== String(placeId)) return false;
+    return true;
+  });
+
   if (topic) {
     const encryptedTagTopic = `unai/${topic.encryptTopic}/tag`;
     const encryptedAnchorTopic = `unai/${topic.encryptTopic}/anchor`;
@@ -881,19 +902,40 @@ function acknowledgeInitTopic(eventName, payload) {
     socket.emit("/join", encryptedAnchorTopic);
     log("LIVE ROOMS JOINED", {
       floorId: topic.floorId,
+      buildingId: topic.buildingId,
+      placeId: topic.placeId,
+      responseTopic: context?.topic ?? null,
       eventName,
       encryptedTagTopic,
       encryptedAnchorTopic,
     });
   } else {
-    log("INIT ACK FLOOR NOT RESOLVED", {
+    log("INIT ACK TOPIC NOT RESOLVED", {
       eventName,
       floorId,
+      buildingId,
+      placeId,
+      responseTopic: context?.topic ?? null,
+      candidates: currentTopics
+        .filter((item) => String(item.floorId) === String(floorId))
+        .map((item) => ({
+          floorId: item.floorId,
+          buildingId: item.buildingId,
+          placeId: item.placeId,
+          encryptTopic: item.encryptTopic,
+        }))
+        .slice(0, 20),
       payloadKeys: Object.keys(parsedPayload).slice(0, 30),
     });
   }
 
-  log("INIT ACK SENT", { eventName, receivedRoom, floorId });
+  log("INIT ACK SENT", {
+    eventName,
+    receivedRoom,
+    floorId,
+    buildingId,
+    placeId,
+  });
 }
 
 function subscribeTopic(topic) {
@@ -1217,6 +1259,7 @@ async function refreshTopics(floors = []) {
       results.push({
         floorId,
         buildingId: firstValue(floor, ["buildingId", "building_id", "buildingID"]),
+        placeId: firstValue(floor, ["placeId", "place_id", "placeID"]),
         socket_token: result.socket_token,
         encrypt_topic: result.encrypt_topic,
       });
