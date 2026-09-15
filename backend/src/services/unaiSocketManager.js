@@ -23,6 +23,8 @@ let healthTimer = null;
 let reconnectAttempt = 0;
 let cooldownUntil = 0;
 let currentTopics = [];
+let initTopicIndex = 0;
+const initAckedEvents = new Map();
 // Keep the floor configuration separately from generated socket credentials.
 // If UNAI returns HTTP 429 while generating the first topic, currentTopics can
 // legitimately be empty. We still need the original floor list so the manager
@@ -217,6 +219,16 @@ function floorIdOf(value) {
   return locationFloor === undefined ? null : String(locationFloor);
 }
 
+function placeIdOf(value) {
+  const item = asObject(value);
+  if (!item) return null;
+  const direct = firstValue(item, ["placeId", "place_id", "placeID", "place"]);
+  if (direct !== undefined && typeof direct !== "object") return String(direct);
+  const location = asObject(item.location);
+  const nested = firstValue(location, ["placeId", "place_id", "placeID", "place"]);
+  return nested === undefined ? null : String(nested);
+}
+
 function buildingIdOf(value) {
   const item = asObject(value);
   if (!item) return null;
@@ -287,6 +299,7 @@ function collectLocationRecords(value, output = [], parentContext = {}) {
   const position = asObject(object.position);
   const location = asObject(object.location);
   const context = {
+    placeId: placeIdOf(object) ?? parentContext.placeId ?? null,
     floorId: floorIdOf(object) ?? parentContext.floorId ?? null,
     buildingId: buildingIdOf(object) ?? parentContext.buildingId ?? null,
     tagId: tagIdOf(object) ?? parentContext.tagId ?? null,
@@ -304,8 +317,11 @@ function collectLocationRecords(value, output = [], parentContext = {}) {
   if (context.tagId && x !== null && y !== null) {
     output.push({
       tagId: context.tagId,
+      placeId: context.placeId,
       floorId: context.floorId,
       buildingId: context.buildingId,
+      zoneId: firstValue(object, ["zoneId", "zone_id", "zoneID", "inExpectedZone"]) ?? null,
+      zoneName: firstValue(object, ["zoneName", "zone_name", "inExpectedZoneName"]) ?? null,
       x,
       y,
       z: coordinateValue(object, "z") ?? coordinateValue(position, "z") ?? coordinateValue(location, "z"),
@@ -319,6 +335,15 @@ function collectLocationRecords(value, output = [], parentContext = {}) {
         "label",
         "ui_display",
       ]) ?? parentContext.tagName ?? null,
+      firstName: firstValue(object, ["firstName", "firstname", "first_name"]) ?? null,
+      lastName: firstValue(object, ["lastName", "lastname", "last_name"]) ?? null,
+      uiDisplay: firstValue(object, ["ui_display", "uiDisplay"]) ?? null,
+      tagType: firstValue(object, ["tagType", "tag_type"]) ?? null,
+      batteryLevel: numberValue(firstValue(object, ["batteryLevel", "batt", "battery"])),
+      placeName: firstValue(object, ["placeName", "place_name"]) ?? null,
+      buildingName: firstValue(object, ["buildingName", "building_name"]) ?? null,
+      floorName: firstValue(object, ["floorName", "floor_name"]) ?? null,
+      lastSeenAt: timestampValue(firstValue(object, ["lastSeenAt", "last_seen", "date_now"])),
       rawData: object,
     });
   }
@@ -604,11 +629,23 @@ function enqueueHistorySave(records) {
 
         const document = {
           tagId: key,
+          placeId: record.placeId == null ? (topic.placeId == null ? null : String(topic.placeId)) : String(record.placeId),
           buildingId: normalizedBuildingId == null ? null : String(normalizedBuildingId),
           floorId: normalizedFloorId == null ? null : String(normalizedFloorId),
+          zoneId: record.zoneId == null ? null : String(record.zoneId),
+          zoneName: record.zoneName == null ? null : String(record.zoneName),
           groupId: record.groupId ?? null,
           groupName: record.groupName == null ? null : String(record.groupName),
           tagName: record.tagName == null ? null : String(record.tagName),
+          firstName: record.firstName == null ? null : String(record.firstName),
+          lastName: record.lastName == null ? null : String(record.lastName),
+          uiDisplay: record.uiDisplay == null ? null : String(record.uiDisplay),
+          tagType: record.tagType == null ? null : String(record.tagType),
+          batteryLevel: record.batteryLevel == null ? null : record.batteryLevel,
+          placeName: record.placeName == null ? null : String(record.placeName),
+          buildingName: record.buildingName == null ? null : String(record.buildingName),
+          floorName: record.floorName == null ? null : String(record.floorName),
+          lastSeenAt: record.lastSeenAt ?? record.timestamp,
           event: "position_update",
           status: "ALIVE",
           movementStatus: positionChanged ? "MOVING" : "STATIONARY",
@@ -649,11 +686,23 @@ function enqueueHistorySave(records) {
             update: {
               $set: {
                 tagId: document.tagId,
+                placeId: document.placeId,
                 buildingId: document.buildingId,
                 floorId: document.floorId,
+                zoneId: document.zoneId,
+                zoneName: document.zoneName,
                 groupId: document.groupId,
                 groupName: document.groupName,
                 tagName: document.tagName,
+                firstName: document.firstName,
+                lastName: document.lastName,
+                uiDisplay: document.uiDisplay,
+                tagType: document.tagType,
+                batteryLevel: document.batteryLevel,
+                placeName: document.placeName,
+                buildingName: document.buildingName,
+                floorName: document.floorName,
+                lastSeenAt: document.lastSeenAt,
                 status: "ALIVE",
                 movementStatus: document.movementStatus,
                 isAsset: false,
@@ -867,23 +916,14 @@ function acknowledgeInitTopic(eventName, payload) {
   const receivedRoom = isTag
     ? "init_unai_location_tag_received"
     : "init_unai_location_anchor_received";
-  const acknowledgement = {
-    ...parsedPayload,
-    action: receivedRoom,
-    customId: "backend_history_collector",
-    socketGetInitId: socket.id,
-  };
 
-  // The official protocol joins the *_received room only after the initial
-  // init response arrives. Sending an *_received event directly is not
-  // equivalent and can leave the UNAI server waiting for the room message.
-  socket.emit("/join", receivedRoom);
-  broadcastToRoom(receivedRoom, acknowledgement);
-
-  // The init response is a keyed object, not an envelope containing get_floor.
-  // Correlate it from the nested tag/anchor record instead of reading floorId
-  // from the root object (which produced floorId=undefined and prevented the
-  // encrypted live rooms from ever being joined).
+  // The init response itself is a keyed map of tag/anchor records. It is NOT
+  // the acknowledgement envelope described by the UNAI protocol. The
+  // acknowledgement must repeat the original request fields (action,
+  // customId, socketGetInitId, getMode, get_topic, get_floor). Previously we
+  // spread the keyed response object here, which omitted get_mode/get_topic/
+  // get_floor and could make the server accept the room join while never
+  // activating the realtime clientBox stream.
   const context = inferInitLocationContext(parsedPayload);
   const floorId = context?.floorId ?? null;
   const buildingId = context?.buildingId ?? null;
@@ -895,21 +935,7 @@ function acknowledgeInitTopic(eventName, payload) {
     return true;
   });
 
-  if (topic) {
-    const encryptedTagTopic = `unai/${topic.encryptTopic}/tag`;
-    const encryptedAnchorTopic = `unai/${topic.encryptTopic}/anchor`;
-    socket.emit("/join", encryptedTagTopic);
-    socket.emit("/join", encryptedAnchorTopic);
-    log("LIVE ROOMS JOINED", {
-      floorId: topic.floorId,
-      buildingId: topic.buildingId,
-      placeId: topic.placeId,
-      responseTopic: context?.topic ?? null,
-      eventName,
-      encryptedTagTopic,
-      encryptedAnchorTopic,
-    });
-  } else {
+  if (!topic) {
     log("INIT ACK TOPIC NOT RESOLVED", {
       eventName,
       floorId,
@@ -927,6 +953,59 @@ function acknowledgeInitTopic(eventName, payload) {
         .slice(0, 20),
       payloadKeys: Object.keys(parsedPayload).slice(0, 30),
     });
+    return;
+  }
+
+  const acknowledgement = {
+    action: receivedRoom,
+    customId: "backend_history_collector",
+    socketGetInitId: socket.id,
+    getMode: "only",
+    get_topic: topic.encryptTopic,
+    get_floor: String(topic.floorId),
+  };
+
+  // The official protocol joins the *_received room only after the initial
+  // init response arrives, then broadcasts the exact acknowledgement envelope.
+  socket.emit("/join", receivedRoom);
+  broadcastToRoom(receivedRoom, acknowledgement);
+
+  const encryptedTagTopic = `unai/${topic.encryptTopic}/tag`;
+  const encryptedAnchorTopic = `unai/${topic.encryptTopic}/anchor`;
+  socket.emit("/join", encryptedTagTopic);
+  socket.emit("/join", encryptedAnchorTopic);
+  log("LIVE ROOMS JOINED", {
+    floorId: topic.floorId,
+    buildingId: topic.buildingId,
+    placeId: topic.placeId,
+    responseTopic: context?.topic ?? null,
+    eventName,
+    encryptedTagTopic,
+    encryptedAnchorTopic,
+  });
+
+  const topicKey = `${topic.floorId}:${topic.buildingId ?? ""}:${topic.placeId ?? ""}`;
+  const acknowledged = initAckedEvents.get(topicKey) || new Set();
+  acknowledged.add(eventName);
+  initAckedEvents.set(topicKey, acknowledged);
+
+  if (
+    acknowledged.has("init_unai_location_tag") &&
+    acknowledged.has("init_unai_location_anchor")
+  ) {
+    const completedIndex = currentTopics.findIndex(
+      (item) => `${item.floorId}:${item.buildingId ?? ""}:${item.placeId ?? ""}` === topicKey,
+    );
+    if (completedIndex === initTopicIndex && completedIndex + 1 < currentTopics.length) {
+      initTopicIndex = completedIndex + 1;
+      subscribeInitTopics(currentTopics[initTopicIndex]);
+      log("INIT TOPIC ADVANCED", {
+        completedFloorId: topic.floorId,
+        nextFloorId: currentTopics[initTopicIndex].floorId,
+        nextIndex: initTopicIndex,
+        totalTopics: currentTopics.length,
+      });
+    }
   }
 
   log("INIT ACK SENT", {
@@ -953,13 +1032,17 @@ function subscribeTopic(topic) {
       // the *_received room a chance to become active, then repeat the exact
       // encrypted-room subscription once. This is deliberately bounded to one
       // retry so a dead upstream cannot turn into a reconnect/rate-limit loop.
-      log("No clientBox/tag location after init handshake; retrying encrypted live rooms once");
-      currentTopics.forEach((currentTopic) => {
-        const encryptedTagTopic = `unai/${currentTopic.encryptTopic}/tag`;
-        const encryptedAnchorTopic = `unai/${currentTopic.encryptTopic}/anchor`;
-        socket?.emit("/join", encryptedTagTopic);
-        socket?.emit("/join", encryptedAnchorTopic);
+      const currentTopic = currentTopics[initTopicIndex];
+      if (!currentTopic) return;
+
+      log("No clientBox/tag location after init handshake; retrying current encrypted live rooms once", {
+        floorId: currentTopic.floorId,
+        index: initTopicIndex,
       });
+      const encryptedTagTopic = `unai/${currentTopic.encryptTopic}/tag`;
+      const encryptedAnchorTopic = `unai/${currentTopic.encryptTopic}/anchor`;
+      socket?.emit("/join", encryptedTagTopic);
+      socket?.emit("/join", encryptedAnchorTopic);
 
       setTimeout(() => {
         if (!started || !socket?.connected || lastTagMessageAt) return;
@@ -1191,7 +1274,9 @@ async function connect() {
       });
       acknowledgeInitTopic("init_unai_location_anchor", payload);
     });
-    currentTopics.forEach(subscribeTopic);
+    initTopicIndex = 0;
+    initAckedEvents.clear();
+    if (currentTopics.length) subscribeTopic(currentTopics[0]);
   });
 
   socket.on("connect_error", async (error) => {
@@ -1358,6 +1443,8 @@ function stop() {
   closeSocket();
   currentTopics = [];
   configuredFloors = [];
+  initTopicIndex = 0;
+  initAckedEvents.clear();
   lastSavedPositions.clear();
   setState("STOPPED");
 }

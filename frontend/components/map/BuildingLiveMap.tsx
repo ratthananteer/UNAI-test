@@ -188,16 +188,25 @@ export default function BuildingLiveMap({
     const refresh = async () => {
       if (selectedFloorId === undefined) return;
       try {
-        // Production `unai-r` may run an older backend deployment without the
-        // additive last-location route. Building live movement must therefore
-        // use the authenticated MongoDB TagLatest read model, which is already
-        // updated by the shared realtime collector and is available at /db-tags.
-        const response = await fetch(
-          `/api/db-tags?buildingId=${encodeURIComponent(String(buildingId))}`,
-          { cache: "no-store" },
-        );
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const items = extractItems(await response.json());
+        // Prefer the richer last-location API. The backend synchronizes every
+        // successful read into TagLatest, while /db-tags remains the local
+        // fallback when the upstream location API is temporarily unavailable.
+        let items: Item[] = [];
+        try {
+          const response = await fetch("/api/v1/get_all_tag_last_location", { cache: "no-store" });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          items = extractItems(await response.json());
+        } catch {
+          // TagLatest remains the local fallback if the upstream last-location API
+          // is temporarily unavailable. The backend syncs successful API reads
+          // into TagLatest, so both paths expose the same canonical position.
+          const response = await fetch(
+            `/api/db-tags?buildingId=${encodeURIComponent(String(buildingId))}`,
+            { cache: "no-store" },
+          );
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          items = extractItems(await response.json());
+        }
         if (cancelled) return;
 
         const current = items.filter((item) => {

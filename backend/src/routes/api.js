@@ -44,6 +44,108 @@ const DB_TAGS_CACHE_MS = Math.max(
 let dbTagsCache = null;
 let dbTagsCacheAt = 0;
 let dbTagsRefreshPromise = null;
+const TAG_LAST_LOCATION_CACHE_MS = Math.max(500, Number(process.env.TAG_LAST_LOCATION_CACHE_MS) || 1000);
+let tagLastLocationCache = null;
+let tagLastLocationCacheAt = 0;
+let tagLastLocationRefreshPromise = null;
+
+function parseLocationDate(value, fallback = new Date()) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const ms = value < 100_000_000_000 ? value * 1000 : value;
+    const date = new Date(ms);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      const ms = numeric < 100_000_000_000 ? numeric * 1000 : numeric;
+      const numericDate = new Date(ms);
+      if (!Number.isNaN(numericDate.getTime())) return numericDate;
+    }
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+  return fallback;
+}
+
+async function syncTagLatestFromLastLocation(data) {
+  const rows = asArray(data, ["tags"]);
+  if (!rows.length) return;
+  const assetTagIds = await getAssetTagIds();
+  const operations = [];
+
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || isAsset(row)) continue;
+    const tagId = row.tagId ?? row.tag_id ?? row.id;
+    const x = Number(row.x);
+    const y = Number(row.y);
+    if (tagId == null || !Number.isFinite(x) || !Number.isFinite(y)) continue;
+    if (assetTagIds.has(String(tagId))) continue;
+
+    const timestamp = parseLocationDate(row.timestamp ?? row.lastSeenAt ?? row.created_at ?? row.date_now);
+    const lastSeenAt = parseLocationDate(row.lastSeenAt ?? row.date_now ?? row.created_at, timestamp);
+    operations.push({
+      updateOne: {
+        filter: { tagId: String(tagId) },
+        update: {
+          $set: {
+            tagId: String(tagId),
+            placeId: row.placeId ?? row.place_id ?? row.place ?? null,
+            buildingId: row.buildingId ?? row.building_id ?? row.building ?? null,
+            floorId: row.floorId ?? row.floor_id ?? row.floor ?? null,
+            zoneId: row.zoneId ?? row.zone_id ?? row.zoneID ?? row.inExpectedZone ?? null,
+            zoneName: row.zoneName ?? row.zone_name ?? row.inExpectedZoneName ?? null,
+            groupId: row.groupId ?? row.group_id ?? null,
+            groupName: row.groupName ?? row.group_name ?? null,
+            tagName: row.tagName ?? row.tag_name ?? row.ui_display ?? row.label ?? row.name ?? null,
+            firstName: row.firstName ?? row.firstname ?? row.first_name ?? null,
+            lastName: row.lastName ?? row.lastname ?? row.last_name ?? null,
+            uiDisplay: row.ui_display ?? row.uiDisplay ?? null,
+            tagType: row.tagType ?? row.tag_type ?? null,
+            batteryLevel: Number.isFinite(Number(row.batteryLevel ?? row.batt)) ? Number(row.batteryLevel ?? row.batt) : null,
+            placeName: row.placeName ?? row.place_name ?? null,
+            buildingName: row.buildingName ?? row.building_name ?? null,
+            floorName: row.floorName ?? row.floor_name ?? null,
+            x,
+            y,
+            z: Number.isFinite(Number(row.z)) ? Number(row.z) : null,
+            timestamp,
+            lastSeenAt,
+            status: "ALIVE",
+            movementStatus: "UNKNOWN",
+            isAsset: false,
+            receivedAt: new Date(),
+          },
+        },
+        upsert: true,
+      },
+    });
+  }
+
+  if (operations.length) await TagLatest.bulkWrite(operations, { ordered: false });
+}
+
+async function getLastLocationData() {
+  const now = Date.now();
+  if (tagLastLocationCache && now - tagLastLocationCacheAt < TAG_LAST_LOCATION_CACHE_MS) return tagLastLocationCache;
+  if (tagLastLocationRefreshPromise) return tagLastLocationRefreshPromise;
+
+  tagLastLocationRefreshPromise = (async () => {
+    const url = getTagLocationApiUrl(
+      "APITAG_LAST_LOCATION_URL",
+      "/api/v1/get_all_tag_last_location",
+    );
+    const data = await fetchFromApi(url, "Failed to get all tag last locations");
+    await syncTagLatestFromLastLocation(data);
+    tagLastLocationCache = data;
+    tagLastLocationCacheAt = Date.now();
+    return data;
+  })().finally(() => {
+    tagLastLocationRefreshPromise = null;
+  });
+
+  return tagLastLocationRefreshPromise;
+}
 
 async function readDbTagsFromMongo() {
   const assetTagIds = await getAssetTagIds();
@@ -64,9 +166,28 @@ async function readDbTagsFromMongo() {
       ...row,
       id: row.tagId,
       tagId: row.tagId,
+      placeId: row.placeId ?? null,
+      buildingId: row.buildingId ?? null,
+      floorId: row.floorId ?? null,
+      zoneId: row.zoneId ?? null,
+      zoneName: row.zoneName ?? null,
+      firstName: row.firstName ?? null,
+      lastName: row.lastName ?? null,
+      uiDisplay: row.uiDisplay ?? row.tagName ?? null,
+      tagType: row.tagType ?? null,
+      batteryLevel: row.batteryLevel ?? null,
+      placeName: row.placeName ?? null,
+      buildingName: row.buildingName ?? null,
+      floorName: row.floorName ?? null,
+      x: row.x ?? null,
+      y: row.y ?? null,
+      z: row.z ?? null,
+      timestamp: timestamp?.toISOString() ?? null,
+      lastSeenAt: row.lastSeenAt ? new Date(row.lastSeenAt).toISOString() : timestamp?.toISOString() ?? null,
       status: alive ? 1 : 0,
       statusText: alive ? "ONLINE" : "OFFLINE",
-      lastSeen: timestamp?.toISOString() ?? null,
+      lastSeen: row.lastSeenAt ? new Date(row.lastSeenAt).toISOString() : timestamp?.toISOString() ?? null,
+      _canonicalPosition: true,
     };
   });
 }
@@ -372,11 +493,7 @@ function getTagLocationApiUrl(name, fallbackPath) {
 
 router.get("/v1/get_all_tag_last_location", async (req, res) => {
   try {
-    const url = getTagLocationApiUrl(
-      "APITAG_LAST_LOCATION_URL",
-      "/api/v1/get_all_tag_last_location",
-    );
-    const data = await fetchFromApi(url, "Failed to get all tag last locations");
+    const data = await getLastLocationData();
     return res.json(data);
   } catch (error) {
     console.error("/api/v1/get_all_tag_last_location error:", error);
