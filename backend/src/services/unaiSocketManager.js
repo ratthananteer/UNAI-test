@@ -905,14 +905,12 @@ function broadcastToRoom(room, data) {
 function subscribeInitTopics(topic) {
   if (!socket?.connected) return;
 
-  // UNAI's documented realtime protocol requires an initialization handshake
-  // before the encrypted tag room starts producing clientBox updates. The
-  // normal tag-room joins below are intentionally kept; this handshake is an
-  // additional prerequisite, not a replacement for realtime subscription.
+  // UNAI protocol: join init rooms -> request init data -> receive init
+  // response -> join *_received room -> broadcast acknowledgement -> join the
+  // encrypted tag/anchor rooms. Joining *_received before the response is too
+  // early and can leave the server without the expected initialization state.
   socket.emit("/join", "init_unai_location_tag");
   socket.emit("/join", "init_unai_location_anchor");
-  socket.emit("/join", "init_unai_location_tag_received");
-  socket.emit("/join", "init_unai_location_anchor_received");
 
   const payload = buildInitLocationPayload(topic);
   broadcastToRoom("init_unai_location", payload);
@@ -925,29 +923,48 @@ function subscribeInitTopics(topic) {
 }
 
 function acknowledgeInitTopic(eventName, payload) {
-  if (!socket?.connected || !payload || typeof payload !== "object") return;
+  if (!socket?.connected) return;
+  if (eventName !== "init_unai_location_tag" && eventName !== "init_unai_location_anchor") return;
+
+  const parsedPayload = parseSocketPayload(payload);
+  if (!parsedPayload || typeof parsedPayload !== "object" || Array.isArray(parsedPayload)) return;
 
   const isTag = eventName === "init_unai_location_tag";
-  const isAnchor = eventName === "init_unai_location_anchor";
-  if (!isTag && !isAnchor) return;
-
   const receivedRoom = isTag
     ? "init_unai_location_tag_received"
     : "init_unai_location_anchor_received";
   const acknowledgement = {
-    ...payload,
-    action: isTag
-      ? "init_unai_location_tag_received"
-      : "init_unai_location_anchor_received",
+    ...parsedPayload,
+    action: receivedRoom,
+    customId: "backend_history_collector",
+    socketGetInitId: socket.id,
   };
 
+  socket.emit("/join", receivedRoom);
   broadcastToRoom(receivedRoom, acknowledgement);
-  socket.emit(eventName + "_received", acknowledgement);
-  log("INIT ACK SENT", {
-    eventName,
-    receivedRoom,
-    floorId: firstValue(payload, ["get_floor", "floorId", "floor_id"]),
-  });
+
+  const floorId = firstValue(parsedPayload, ["get_floor", "floorId", "floor_id", "floor"]);
+  const topic = currentTopics.find((item) => String(item.floorId) === String(floorId));
+  if (topic) {
+    const encryptedTagTopic = `unai/${topic.encryptTopic}/tag`;
+    const encryptedAnchorTopic = `unai/${topic.encryptTopic}/anchor`;
+    socket.emit("/join", encryptedTagTopic);
+    socket.emit("/join", encryptedAnchorTopic);
+    log("LIVE ROOMS JOINED", {
+      floorId: topic.floorId,
+      eventName,
+      encryptedTagTopic,
+      encryptedAnchorTopic,
+    });
+  } else {
+    log("INIT ACK FLOOR NOT RESOLVED", {
+      eventName,
+      floorId,
+      payloadKeys: Object.keys(parsedPayload).slice(0, 30),
+    });
+  }
+
+  log("INIT ACK SENT", { eventName, receivedRoom, floorId });
 }
 
 */
@@ -1149,36 +1166,29 @@ async function connect() {
 
 async function refreshTopics(floors = []) {
   const list = Array.isArray(floors) ? floors : [];
-  // Preserve the original floor configuration across rate-limit failures so a
-  // later retry can regenerate credentials without requiring another caller to
-  // invoke start().
+  // Preserve the floor configuration across rate-limit failures.
   if (list.length) configuredFloors = list.map((floor) => ({ ...floor }));
 
   const results = [];
-  const firstFloor = list.find((floor) => firstValue(floor, ["id", "floorId", "floor_id", "floorID"]) !== undefined);
-  const firstFloorId = firstFloor
-    ? firstValue(firstFloor, ["id", "floorId", "floor_id", "floorID"])
-    : undefined;
+  for (const floor of list) {
+    const floorId = firstValue(floor, ["id", "floorId", "floor_id", "floorID"]);
+    if (floorId === undefined) continue;
 
-  if (firstFloorId !== undefined) {
     try {
-      // Home already proved that one socket token from the first floor can be
-      // reused for wildcard rooms on every floor. Avoid generating 13 tokens
-      // for one connection: that adds unnecessary auth traffic and can trigger
-      // UNAI's token/rate limits.
-      const result = await generateSocketTopic(firstFloorId);
-      for (const floor of list) {
-        const floorId = firstValue(floor, ["id", "floorId", "floor_id", "floorID"]);
-        if (floorId === undefined) continue;
-        results.push({
-          floorId,
-          buildingId: firstValue(floor, ["buildingId", "building_id", "buildingID"]),
-          socket_token: result.socket_token,
-          encrypt_topic: result.encrypt_topic,
-        });
-      }
+      // The UNAI encrypted topic is floor-specific. generateSocketTopic() is
+      // already cached per floor for 29 days, so this does not create repeated
+      // requests during normal reconnects, while preventing floor 1 credentials
+      // from being incorrectly reused for every floor.
+      const result = await generateSocketTopic(floorId);
+      results.push({
+        floorId,
+        buildingId: firstValue(floor, ["buildingId", "building_id", "buildingID"]),
+        socket_token: result.socket_token,
+        encrypt_topic: result.encrypt_topic,
+      });
+      log("TOPIC READY", { floorId: String(floorId), hasEncryptTopic: Boolean(result.encrypt_topic) });
     } catch (error) {
-      log(`Topic generation failed floor=${firstFloorId}:`, error?.message || error);
+      log(`Topic generation failed floor=${floorId}:`, error?.message || error);
       if (Number(error?.status) === 429 || isRateLimitError(error)) {
         const retryAfter = Number(error?.retryAfterMs);
         cooldownUntil = Date.now() + (Number.isFinite(retryAfter) && retryAfter > 0
