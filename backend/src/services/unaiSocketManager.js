@@ -771,32 +771,98 @@ function handleTagPayload(payload, eventName = lastSocketEvent) {
   enqueueHistorySave(records);
 }
 
+function buildInitLocationPayload(topic) {
+  return {
+    action: "get_init_unai_location",
+    customId: "backend_history_collector",
+    socketGetInitId: socket?.id || null,
+    getMode: "only",
+    get_topic: topic.encryptTopic,
+    get_floor: String(topic.floorId),
+  };
+}
+
+function broadcastToRoom(room, data) {
+  if (!socket?.connected) return;
+  socket.emit("/broadcastToRoom", {
+    room,
+    data,
+    option: {},
+  });
+}
+
+function subscribeInitTopics(topic) {
+  if (!socket?.connected) return;
+
+  socket.emit("/join", "init_unai_location_tag");
+  socket.emit("/join", "init_unai_location_anchor");
+  socket.emit("/join", "init_unai_location_tag_received");
+  socket.emit("/join", "init_unai_location_anchor_received");
+
+  const payload = buildInitLocationPayload(topic);
+  broadcastToRoom("init_unai_location", payload);
+
+  log("INIT REQUEST SENT", {
+    floorId: topic.floorId,
+    encryptTopic: topic.encryptTopic,
+    socketGetInitId: payload.socketGetInitId,
+  });
+}
+
+function acknowledgeInitTopic(eventName, payload) {
+  if (!socket?.connected || !payload || typeof payload !== "object") return;
+  if (eventName !== "init_unai_location_tag" && eventName !== "init_unai_location_anchor") return;
+
+  const isTag = eventName === "init_unai_location_tag";
+  const receivedRoom = isTag
+    ? "init_unai_location_tag_received"
+    : "init_unai_location_anchor_received";
+  const acknowledgement = {
+    ...payload,
+    action: receivedRoom,
+    customId: "backend_history_collector",
+    socketGetInitId: socket.id,
+  };
+
+  broadcastToRoom(receivedRoom, acknowledgement);
+  socket.emit(eventName + "_received", acknowledgement);
+  log("INIT ACK SENT", {
+    eventName,
+    receivedRoom,
+    floorId: firstValue(payload, ["get_floor", "floorId", "floor_id"]),
+  });
+}
+
 function subscribeTopic(topic) {
-  // Match the known-working Home socket protocol: one shared Socket.IO
-  // connection, one socket token, and wildcard floor rooms. The official UNAI
-  // protocol documents the encrypted room too, but this backend already has a
-  // proven wildcard implementation and joining encrypted rooms with tokens
-  // generated for other floors can silently produce joinedRoom acknowledgements
-  // without delivering the tag stream.
+  // Use the documented UNAI initialization handshake first. A successful
+  // /join acknowledgement only proves room membership; it does not start the
+  // realtime tag stream. The init request asks UNAI to prepare the encrypted
+  // tag/anchor streams for this floor, after which the normal tag room is joined.
+  subscribeInitTopics(topic);
+
+  const encryptedTopic = `unai/${topic.encryptTopic}/tag`;
   const wildcardTopic = `unai/*/*/${topic.floorId}/tag`;
 
+  socket.emit("/join", encryptedTopic);
   socket.emit("/join", wildcardTopic);
+  log(`JOIN floor=${topic.floorId} mode=encrypted topic=${encryptedTopic}`);
   log(`JOIN floor=${topic.floorId} mode=wildcard topic=${wildcardTopic}`);
-
   log("JOIN SENT", {
     floorId: topic.floorId,
+    encryptedTopic,
     wildcardTopic,
   });
 
-  // Retry the wildcard rooms once on the SAME socket if no actual tag
-  // position has arrived. Never create another socket here.
+  // Retry both room forms once on the SAME socket if no actual tag position
+  // has arrived. Never create another upstream connection here.
   if (!topicFallbackTimer) {
     topicFallbackTimer = setTimeout(() => {
       topicFallbackTimer = null;
       if (!started || !socket?.connected || lastTagMessageAt) return;
 
-      log("No tag location received after initial joins; retrying wildcard tag rooms on the existing socket");
+      log("No tag location received after initial joins; retrying encrypted + wildcard tag rooms on the existing socket");
       currentTopics.forEach((currentTopic) => {
+        socket?.emit("/join", `unai/${currentTopic.encryptTopic}/tag`);
         socket?.emit("/join", `unai/*/*/${currentTopic.floorId}/tag`);
       });
     }, 5_000);
@@ -979,9 +1045,23 @@ async function connect() {
     setState("CONNECTED");
     log(`CONNECTED socketId=${socket.id}`);
 
-    // Keep register for deployments that expose it; /join is the documented
-    // subscription mechanism and is sent immediately after registration.
+    // Keep register for deployments that expose it; the UNAI realtime protocol
+    // then requires the init handshake before encrypted tag rooms emit clientBox.
     socket.emit("/register", { customId: "backend_history_collector" });
+    socket.on("init_unai_location_tag", (payload) => {
+      log("INIT TAG RESPONSE", {
+        payloadType: typeof payload,
+        payloadKeys: asObject(payload) ? Object.keys(payload).slice(0, 30) : [],
+      });
+      acknowledgeInitTopic("init_unai_location_tag", payload);
+    });
+    socket.on("init_unai_location_anchor", (payload) => {
+      log("INIT ANCHOR RESPONSE", {
+        payloadType: typeof payload,
+        payloadKeys: asObject(payload) ? Object.keys(payload).slice(0, 30) : [],
+      });
+      acknowledgeInitTopic("init_unai_location_anchor", payload);
+    });
     currentTopics.forEach(subscribeTopic);
   });
 
