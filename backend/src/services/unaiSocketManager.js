@@ -94,6 +94,41 @@ function numberValue(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function coordinateValue(object, axis) {
+  const item = asObject(object);
+  if (!item) return null;
+
+  const axisKeys = {
+    x: ["x", "pos_x", "position_x", "location_x", "coordinate_x"],
+    y: ["y", "pos_y", "position_y", "location_y", "coordinate_y"],
+    z: ["z", "pos_z", "position_z", "location_z", "coordinate_z"],
+  };
+
+  const direct = firstValue(item, axisKeys[axis]);
+  const directNumber = numberValue(direct);
+  if (directNumber !== null) return directNumber;
+
+  const coordinates = item.coordinates ?? item.coordinate ?? item.coords;
+  if (Array.isArray(coordinates)) {
+    const index = axis === "x" ? 0 : axis === "y" ? 1 : 2;
+    return numberValue(coordinates[index]);
+  }
+
+  const xyz = item.xyz;
+  if (Array.isArray(xyz)) {
+    const index = axis === "x" ? 0 : axis === "y" ? 1 : 2;
+    return numberValue(xyz[index]);
+  }
+
+  if (xyz && typeof xyz === "object") {
+    const xyzObject = asObject(xyz);
+    const value = firstValue(xyzObject, axisKeys[axis]);
+    return numberValue(value);
+  }
+
+  return null;
+}
+
 function timestampValue(value) {
   if (typeof value === "number") {
     const ms = value < 100_000_000_000 ? value * 1000 : value;
@@ -263,28 +298,8 @@ function collectLocationRecords(value, output = [], parentContext = {}) {
   // top-level x/y, so it silently produced zero records even though the socket
   // was connected. The browser parser already supported this shape; keep the
   // backend collector equally tolerant so SSE + TagLatest receive movement.
-  const x = numberValue(
-    firstValue(object, [
-      "x",
-      "pos_x",
-      "position_x",
-      "location_x",
-      "coordinate_x",
-    ]) ??
-      firstValue(position, ["x", "pos_x", "position_x", "coordinate_x"]) ??
-      firstValue(location, ["x", "pos_x", "position_x", "coordinate_x"]),
-  );
-  const y = numberValue(
-    firstValue(object, [
-      "y",
-      "pos_y",
-      "position_y",
-      "location_y",
-      "coordinate_y",
-    ]) ??
-      firstValue(position, ["y", "pos_y", "position_y", "coordinate_y"]) ??
-      firstValue(location, ["y", "pos_y", "position_y", "coordinate_y"]),
-  );
+  const x = coordinateValue(object, "x") ?? coordinateValue(position, "x") ?? coordinateValue(location, "x");
+  const y = coordinateValue(object, "y") ?? coordinateValue(position, "y") ?? coordinateValue(location, "y");
 
   if (context.tagId && x !== null && y !== null) {
     output.push({
@@ -293,17 +308,7 @@ function collectLocationRecords(value, output = [], parentContext = {}) {
       buildingId: context.buildingId,
       x,
       y,
-      z: numberValue(
-        firstValue(object, [
-          "z",
-          "pos_z",
-          "position_z",
-          "location_z",
-          "coordinate_z",
-        ]) ??
-          firstValue(position, ["z", "pos_z", "position_z", "coordinate_z"]) ??
-          firstValue(location, ["z", "pos_z", "position_z", "coordinate_z"]),
-      ),
+      z: coordinateValue(object, "z") ?? coordinateValue(position, "z") ?? coordinateValue(location, "z"),
       timestamp: timestampValue(timestampFromRecord(object)),
       groupId: firstValue(object, ["groupId", "group_id"]) ?? parentContext.groupId ?? null,
       groupName: firstValue(object, ["groupName", "group_name"]) ?? parentContext.groupName ?? null,
@@ -720,8 +725,16 @@ function handleTagPayload(payload, eventName = lastSocketEvent) {
         floorId: record.floorId,
         x: record.x,
         y: record.y,
+        z: record.z,
+        timestamp: record.timestamp?.toISOString?.() ?? record.timestamp,
       })),
     );
+  } else {
+    log("POSITION DATA EMPTY", {
+      event: eventName,
+      payloadType: typeof parsedPayload,
+      payloadKeys: asObject(parsedPayload) ? Object.keys(parsedPayload).slice(0, 30) : [],
+    });
   }
 
   if (!records.length) {
@@ -930,11 +943,22 @@ async function connect() {
   // actual event names emitted by the upstream Socket.IO server.
   socket.onAny((event, ...args) => {
     lastSocketEvent = event;
-    log(
-      "SOCKET EVENT",
+    log("SOCKET EVENT", event, {
+      argCount: args.length,
+      args: args.map((value, index) => ({
+        index,
+        type: typeof value,
+        keys: asObject(value) ? Object.keys(value).slice(0, 30) : [],
+        preview: typeof value === "string" ? value.slice(0, 1000) : value,
+      })),
+    });
+    log("SOCKET PING/PONG TRACE", {
       event,
-      JSON.stringify(args).slice(0, 5000),
-    );
+      socketId: socket?.id || null,
+      connected: Boolean(socket?.connected),
+      argCount: args.length,
+      at: new Date().toISOString(),
+    });
 
       // UNAI deployments do not always use the same event name for the tag
     // stream. Do not restrict the collector to clientBox/tag/message: inspect
