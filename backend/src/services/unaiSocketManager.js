@@ -758,6 +758,39 @@ function handleTagPayload(payload, eventName = lastSocketEvent) {
   enqueueHistorySave(records);
 }
 
+function subscribeTopic(topic) {
+  // Match the known-working Home socket protocol: one shared Socket.IO
+  // connection, one socket token, and wildcard floor rooms. The official UNAI
+  // protocol documents the encrypted room too, but this backend already has a
+  // proven wildcard implementation and joining encrypted rooms with tokens
+  // generated for other floors can silently produce joinedRoom acknowledgements
+  // without delivering the tag stream.
+  const wildcardTopic = `unai/*/*/${topic.floorId}/tag`;
+
+  socket.emit("/join", wildcardTopic);
+  log(`JOIN floor=${topic.floorId} mode=wildcard topic=${wildcardTopic}`);
+
+  log("JOIN SENT", {
+    floorId: topic.floorId,
+    wildcardTopic,
+  });
+
+  // Retry the wildcard rooms once on the SAME socket if no actual tag
+  // position has arrived. Never create another socket here.
+  if (!topicFallbackTimer) {
+    topicFallbackTimer = setTimeout(() => {
+      topicFallbackTimer = null;
+      if (!started || !socket?.connected || lastTagMessageAt) return;
+
+      log("No tag location received after initial joins; retrying wildcard tag rooms on the existing socket");
+      currentTopics.forEach((currentTopic) => {
+        socket?.emit("/join", `unai/*/*/${currentTopic.floorId}/tag`);
+      });
+    }, 5_000);
+  }
+}
+
+/*
 function buildInitLocationPayload(topic) {
   return {
     action: "get_init_unai_location",
@@ -826,49 +859,7 @@ function acknowledgeInitTopic(eventName, payload) {
   });
 }
 
-function subscribeTopic(topic) {
-  // The existing UNAI Building implementation used the wildcard floor room
-  // `unai/*/*/{floorId}/tag` over the same single Socket.IO connection and was
-  // able to receive live movement. Keep that known-working room as the primary
-  // subscription. The encrypted room remains a secondary compatibility join
-  // because the official UNAI documentation also supports it.
-  const wildcardTopic = `unai/*/*/${topic.floorId}/tag`;
-  const encryptedTopic = topic.encryptTopic
-    ? `unai/${topic.encryptTopic}/tag`
-    : null;
-
-  subscribeInitTopics(topic);
-
-  socket.emit("/join", wildcardTopic);
-  log(`JOIN floor=${topic.floorId} mode=wildcard topic=${wildcardTopic}`);
-
-  if (encryptedTopic && encryptedTopic !== wildcardTopic) {
-    socket.emit("/join", encryptedTopic);
-    log(`JOIN floor=${topic.floorId} mode=encrypted topic=${encryptedTopic}`);
-  }
-
-  log("JOIN SENT", {
-    floorId: topic.floorId,
-    wildcardTopic,
-    encryptedTopic,
-    hasEncryptTopic: Boolean(topic.encryptTopic),
-  });
-
-  // Keep one compatibility timer for the whole socket. If neither room has
-  // produced a real tag position, retry the wildcard rooms once on the SAME
-  // connection. Never create another socket or request another token here.
-  if (!topicFallbackTimer) {
-    topicFallbackTimer = setTimeout(() => {
-      topicFallbackTimer = null;
-      if (!started || !socket?.connected || lastTagMessageAt) return;
-
-      log("No tag location received after initial joins; retrying wildcard tag rooms on the existing socket");
-      currentTopics.forEach((currentTopic) => {
-        socket?.emit("/join", `unai/*/*/${currentTopic.floorId}/tag`);
-      });
-    }, 5_000);
-  }
-}
+*/
 
 async function regenerateTopics() {
   const nextTopics = [];
@@ -945,17 +936,7 @@ async function connect() {
       JSON.stringify(args).slice(0, 5000),
     );
 
-    // The documented UNAI protocol returns initial tag/anchor data before the
-    // realtime room becomes active. Acknowledge each init payload immediately,
-    // then continue passing the payload through the normal tolerant parser.
-    if (event === "init_unai_location_tag" || event === "init_unai_location_anchor") {
-      args.forEach((payload) => {
-        const parsed = parseSocketPayload(payload);
-        acknowledgeInitTopic(event, asObject(parsed));
-      });
-    }
-
-    // UNAI deployments do not always use the same event name for the tag
+      // UNAI deployments do not always use the same event name for the tag
     // stream. Do not restrict the collector to clientBox/tag/message: inspect
     // every application event and let collectLocationRecords decide whether
     // its payload actually contains a tag position. Lifecycle events are
@@ -1042,7 +1023,7 @@ async function connect() {
     if (started) scheduleReconnect("disconnect");
   });
 
-  // `socket.onAny` above is now the single application-event ingestion path.
+  // `socket.onAny` above is the single application-event ingestion path.
   // Keeping separate clientBox/tag/message listeners would process those
   // packets twice and could duplicate SSE notifications/logging.
 
@@ -1058,24 +1039,30 @@ async function refreshTopics(floors = []) {
   if (list.length) configuredFloors = list.map((floor) => ({ ...floor }));
 
   const results = [];
+  const firstFloor = list.find((floor) => firstValue(floor, ["id", "floorId", "floor_id", "floorID"]) !== undefined);
+  const firstFloorId = firstFloor
+    ? firstValue(firstFloor, ["id", "floorId", "floor_id", "floorID"])
+    : undefined;
 
-  for (const floor of list) {
-    const floorId = firstValue(floor, ["id", "floorId", "floor_id", "floorID"]);
-    if (floorId === undefined) continue;
-
+  if (firstFloorId !== undefined) {
     try {
-      const result = await generateSocketTopic(floorId);
-      results.push({
-        floorId,
-        buildingId: firstValue(floor, ["buildingId", "building_id", "buildingID"]),
-        socket_token: result.socket_token,
-        encrypt_topic: result.encrypt_topic,
-      });
+      // Home already proved that one socket token from the first floor can be
+      // reused for wildcard rooms on every floor. Avoid generating 13 tokens
+      // for one connection: that adds unnecessary auth traffic and can trigger
+      // UNAI's token/rate limits.
+      const result = await generateSocketTopic(firstFloorId);
+      for (const floor of list) {
+        const floorId = firstValue(floor, ["id", "floorId", "floor_id", "floorID"]);
+        if (floorId === undefined) continue;
+        results.push({
+          floorId,
+          buildingId: firstValue(floor, ["buildingId", "building_id", "buildingID"]),
+          socket_token: result.socket_token,
+          encrypt_topic: result.encrypt_topic,
+        });
+      }
     } catch (error) {
-      log(`Topic generation failed floor=${floorId}:`, error?.message || error);
-      // Do not continue requesting the remaining floors after UNAI returns
-      // 429. Continuing would turn one rate-limit response into a burst of
-      // additional requests and make the cooldown worse.
+      log(`Topic generation failed floor=${firstFloorId}:`, error?.message || error);
       if (Number(error?.status) === 429 || isRateLimitError(error)) {
         const retryAfter = Number(error?.retryAfterMs);
         cooldownUntil = Date.now() + (Number.isFinite(retryAfter) && retryAfter > 0
