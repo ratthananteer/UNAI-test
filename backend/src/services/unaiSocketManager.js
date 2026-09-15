@@ -287,11 +287,18 @@ function filterAssetPayload(value) {
   return result;
 }
 
-function collectLocationRecords(value, output = [], parentContext = {}) {
+function tagIdFromObjectKey(key) {
+  if (key === undefined || key === null) return null;
+  const text = String(key).trim();
+  if (!text || !/^\\d+$/.test(text)) return null;
+  return text;
+}
+
+function collectLocationRecords(value, output = [], parentContext = {}, parentKey = null) {
   if (!value || typeof value !== "object") return output;
 
   if (Array.isArray(value)) {
-    value.forEach((item) => collectLocationRecords(item, output, parentContext));
+    value.forEach((item) => collectLocationRecords(item, output, parentContext, null));
     return output;
   }
 
@@ -302,7 +309,7 @@ function collectLocationRecords(value, output = [], parentContext = {}) {
     placeId: placeIdOf(object) ?? parentContext.placeId ?? null,
     floorId: floorIdOf(object) ?? parentContext.floorId ?? null,
     buildingId: buildingIdOf(object) ?? parentContext.buildingId ?? null,
-    tagId: tagIdOf(object) ?? parentContext.tagId ?? null,
+    tagId: tagIdOf(object) ?? parentContext.tagId ?? tagIdFromObjectKey(parentKey),
   };
 
   // UNAI has multiple payload envelopes. In particular, some clientBox/tag
@@ -354,7 +361,7 @@ function collectLocationRecords(value, output = [], parentContext = {}) {
   for (const [key, child] of Object.entries(object)) {
     if (!child || typeof child !== "object") continue;
     if ((key === "position" || key === "location") && context.tagId && x !== null && y !== null) continue;
-    collectLocationRecords(child, output, context);
+    collectLocationRecords(child, output, context, key);
   }
 
   return output;
