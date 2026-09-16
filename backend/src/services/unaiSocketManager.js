@@ -1027,10 +1027,11 @@ function acknowledgeInitTopic(eventName, payload) {
   // before entering the encrypted live rooms. Joining after only one response
   // can race the second acknowledgement and leave the gateway subscribed but
   // not publishing clientBox updates.
-  if (
+  const handshakeComplete =
     acknowledged.has("init_unai_location_tag") &&
-    acknowledged.has("init_unai_location_anchor")
-  ) {
+    acknowledged.has("init_unai_location_anchor");
+
+  if (handshakeComplete) {
     const encryptedTagTopic = `unai/${topic.encryptTopic}/tag`;
     const encryptedAnchorTopic = `unai/${topic.encryptTopic}/anchor`;
     socket.emit("/join", encryptedTagTopic);
@@ -1044,7 +1045,12 @@ function acknowledgeInitTopic(eventName, payload) {
       encryptedTagTopic,
       encryptedAnchorTopic,
     });
-  }
+
+    // Do not advance to the next floor after only one init response. The second
+    // response must still be associated with this same topic; otherwise the
+    // fallback topic changes underneath the handshake and the current floor can
+    // never receive both acknowledgements, leaving its encrypted live rooms
+    // unsubscribed. Advance only after BOTH tag and anchor ACKs are complete.
     const completedIndex = currentTopics.findIndex(
       (item) => `${item.floorId}:${item.buildingId ?? ""}:${item.placeId ?? ""}` === topicKey,
     );
@@ -1058,6 +1064,7 @@ function acknowledgeInitTopic(eventName, payload) {
         totalTopics: currentTopics.length,
       });
     }
+  }
 
   log("INIT ACK SENT", {
     eventName,
