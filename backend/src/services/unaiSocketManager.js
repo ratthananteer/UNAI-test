@@ -1340,17 +1340,18 @@ async function connect() {
       at: new Date().toISOString(),
     });
 
-      // UNAI deployments do not always use the same event name for the tag
-    // stream. Do not restrict the collector to clientBox/tag/message: inspect
-    // every application event and let collectLocationRecords decide whether
-    // its payload actually contains a tag position. Lifecycle events are
-    // ignored to avoid treating connection metadata as location data.
+      // Keep one ingestion path. `clientBox` has its own listener below, so do
+    // not process it twice. Keep generic `message`/`data` and unknown events
+    // enabled because some UNAI gateway versions carry location packets under
+    // those event names; the payload parser safely ignores non-location text.
     if (
       event === "connect" ||
       event === "disconnect" ||
       event === "connect_error" ||
-      event === "clientBox"
+      event === "clientBox" ||
+      event === "joinedRoom"
     ) return;
+
     args.forEach((payload) => handleTagPayload(payload, event));
   });
 
