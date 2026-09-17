@@ -367,11 +367,11 @@ async function pollRestRealtime() {
 
     if (changed.length) {
       console.log(`[REST Realtime] POSITION UPDATE rows=${changed.length} sample=${JSON.stringify(changed[0])}`);
-      const message = `event: tags\\ndata: ${JSON.stringify({
+      const message = `event: tags\ndata: ${JSON.stringify({
         timestamp: new Date().toISOString(),
         transport: "rest",
         tags: changed,
-      })}\\n\\n`;
+      })}\n\n`;
       for (const client of realtimeClients) {
         try {
           client.write(message);
@@ -426,15 +426,14 @@ function ensureRealtimeHeartbeat() {
 }
 
 router.get("/realtime", async (req, res) => {
-  try {
-    await ensureRealtimeCollector();
-  } catch (error) {
-    console.error("[Realtime] collector start failed:", error.message);
-    return res.status(503).json({
-      error: "Realtime collector is unavailable",
-      details: error.message,
-    });
-  }
+  // REST polling is the primary realtime transport. Keep the legacy Socket.IO
+  // collector as a diagnostic/fallback path, but never let its startup failure
+  // prevent the SSE stream from serving REST-driven position updates.
+  // Start the legacy Socket.IO collector in the background. REST polling is
+  // the primary transport and must not wait for the socket handshake.
+  void ensureRealtimeCollector().catch((error) => {
+    console.warn("[Realtime] socket collector unavailable; continuing with REST transport:", error.message);
+  });
 
   res.status(200);
   res.set({
