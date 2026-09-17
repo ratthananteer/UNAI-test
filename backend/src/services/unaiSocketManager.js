@@ -881,17 +881,19 @@ function sendInitLocationRequest(topic) {
 function subscribeInitTopics(topic) {
   if (!socket?.connected) return;
 
-  // `/join` is asynchronous. Wait for both joinedRoom acknowledgements before
-  // broadcasting the init request; otherwise the request can race room setup.
+  // `/join` is asynchronous, but the init request must not wait for joinedRoom
+  // ACKs. Some gateway deployments only activate the init response flow after
+  // the request is broadcast. Keep joinedRoom ACKs as diagnostic state only.
   const topicKey = `${topic.floorId}:${topic.buildingId ?? ""}:${topic.placeId ?? ""}`;
   pendingInitRoomJoins.set(topicKey, {
     topic,
     joined: new Set(),
-    requestSent: false,
+    requestSent: true,
   });
 
   socket.emit("/join", "init_unai_location_tag");
   socket.emit("/join", "init_unai_location_anchor");
+  sendInitLocationRequest(topic);
 
   log("INIT ROOMS JOIN REQUESTED", {
     floorId: topic.floorId,
@@ -1281,7 +1283,7 @@ async function connect() {
     if (room !== "init_unai_location_tag" && room !== "init_unai_location_anchor") return;
 
     for (const [topicKey, pending] of pendingInitRoomJoins.entries()) {
-      if (!pending || pending.requestSent) continue;
+      if (!pending) continue;
 
       pending.joined.add(room);
       log("INIT ROOM JOIN CONFIRMED", {
@@ -1291,14 +1293,7 @@ async function connect() {
         requiredCount: 2,
       });
 
-      if (
-        pending.joined.has("init_unai_location_tag") &&
-        pending.joined.has("init_unai_location_anchor")
-      ) {
-        pending.requestSent = true;
-        pendingInitRoomJoins.set(topicKey, pending);
-        sendInitLocationRequest(pending.topic);
-      }
+      pendingInitRoomJoins.set(topicKey, pending);
     }
   });
 
