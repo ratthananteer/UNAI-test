@@ -146,7 +146,11 @@ async function getLastLocationData() {
       || "https://rtls.lailab.online/api/v1/get_all_tag_last_location";
 
     try {
-      const data = await fetchFromApi(url, "Failed to get all tag last locations");
+      // Force a fresh upstream read on every realtime poll so an intermediary
+      // cannot keep returning the same x/y snapshot.
+      const separator = url.includes("?") ? "&" : "?";
+      const freshUrl = `${url}${separator}_realtime=${Date.now()}`;
+      const data = await fetchFromApi(freshUrl, "Failed to get all tag last locations");
       await syncTagLatestFromLastLocation(data);
       tagLastLocationCache = data;
       tagLastLocationCacheAt = Date.now();
