@@ -38,139 +38,12 @@ function isAsset(item) {
 }
 
 const DB_TAGS_CACHE_MS = Math.max(
-  0,
-  Number(process.env.DB_TAGS_CACHE_MS) || 0,
+  5_000,
+  Number(process.env.DB_TAGS_CACHE_MS) || 5_000,
 );
 let dbTagsCache = null;
 let dbTagsCacheAt = 0;
 let dbTagsRefreshPromise = null;
-const TAG_LAST_LOCATION_CACHE_MS = Math.max(500, Number(process.env.TAG_LAST_LOCATION_CACHE_MS) || 1000);
-let tagLastLocationCache = null;
-let tagLastLocationCacheAt = 0;
-let tagLastLocationRefreshPromise = null;
-
-// REST is the fallback realtime transport when the UNAI socket gateway is
-// connected but does not deliver live clientBox/location packets. Poll only
-// while at least one browser is subscribed to /api/realtime.
-const REST_REALTIME_POLL_MS = Math.max(1000, Number(process.env.REST_REALTIME_POLL_MS) || 2000);
-let restRealtimePollTimer = null;
-let restRealtimePollRunning = false;
-const restRealtimeLastPositions = new Map();
-
-function parseLocationDate(value, fallback = new Date()) {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    const ms = value < 100_000_000_000 ? value * 1000 : value;
-    const date = new Date(ms);
-    if (!Number.isNaN(date.getTime())) return date;
-  }
-  if (typeof value === "string" && value.trim()) {
-    const numeric = Number(value);
-    if (Number.isFinite(numeric)) {
-      const ms = numeric < 100_000_000_000 ? numeric * 1000 : numeric;
-      const numericDate = new Date(ms);
-      if (!Number.isNaN(numericDate.getTime())) return numericDate;
-    }
-    const date = new Date(value);
-    if (!Number.isNaN(date.getTime())) return date;
-  }
-  return fallback;
-}
-
-async function syncTagLatestFromLastLocation(data) {
-  const rows = asArray(data, ["tags"]);
-  if (!rows.length) return;
-  const assetTagIds = await getAssetTagIds();
-  const operations = [];
-
-  for (const row of rows) {
-    if (!row || typeof row !== "object" || isAsset(row)) continue;
-    const tagId = row.tagId ?? row.tag_id ?? row.id;
-    const x = Number(row.x);
-    const y = Number(row.y);
-    if (tagId == null || !Number.isFinite(x) || !Number.isFinite(y)) continue;
-    if (assetTagIds.has(String(tagId))) continue;
-
-    const timestamp = parseLocationDate(row.timestamp ?? row.lastSeenAt ?? row.created_at ?? row.date_now);
-    const lastSeenAt = parseLocationDate(row.lastSeenAt ?? row.date_now ?? row.created_at, timestamp);
-    operations.push({
-      updateOne: {
-        filter: { tagId: String(tagId) },
-        update: {
-          $set: {
-            tagId: String(tagId),
-            placeId: row.placeId ?? row.place_id ?? row.place ?? null,
-            buildingId: row.buildingId ?? row.building_id ?? row.building ?? null,
-            floorId: row.floorId ?? row.floor_id ?? row.floor ?? null,
-            zoneId: row.zoneId ?? row.zone_id ?? row.zoneID ?? row.inExpectedZone ?? null,
-            zoneName: row.zoneName ?? row.zone_name ?? row.inExpectedZoneName ?? null,
-            groupId: row.groupId ?? row.group_id ?? null,
-            groupName: row.groupName ?? row.group_name ?? null,
-            tagName: row.tagName ?? row.tag_name ?? row.ui_display ?? row.label ?? row.name ?? null,
-            firstName: row.firstName ?? row.firstname ?? row.first_name ?? null,
-            lastName: row.lastName ?? row.lastname ?? row.last_name ?? null,
-            uiDisplay: row.ui_display ?? row.uiDisplay ?? null,
-            tagType: row.tagType ?? row.tag_type ?? null,
-            batteryLevel: Number.isFinite(Number(row.batteryLevel ?? row.batt)) ? Number(row.batteryLevel ?? row.batt) : null,
-            placeName: row.placeName ?? row.place_name ?? null,
-            buildingName: row.buildingName ?? row.building_name ?? null,
-            floorName: row.floorName ?? row.floor_name ?? null,
-            x,
-            y,
-            z: Number.isFinite(Number(row.z)) ? Number(row.z) : null,
-            timestamp,
-            lastSeenAt,
-            status: "ALIVE",
-            movementStatus: "UNKNOWN",
-            isAsset: false,
-            receivedAt: new Date(),
-          },
-        },
-        upsert: true,
-      },
-    });
-  }
-
-  if (operations.length) await TagLatest.bulkWrite(operations, { ordered: false });
-}
-
-async function getLastLocationData() {
-  const now = Date.now();
-  if (tagLastLocationCache && now - tagLastLocationCacheAt < TAG_LAST_LOCATION_CACHE_MS) return tagLastLocationCache;
-  if (tagLastLocationRefreshPromise) return tagLastLocationRefreshPromise;
-
-  tagLastLocationRefreshPromise = (async () => {
-    // Use UNAI's documented all-tag last-location endpoint as the realtime
-    // source. APITAG_LAST_LOCATION_URL can still override it on deployments
-    // that expose the API under another URL.
-    const url = process.env.APITAG_LAST_LOCATION_URL
-      || "https://rtls.lailab.online/api/v1/get_all_tag_last_location";
-
-    try {
-      // Force a fresh upstream read on every realtime poll so an intermediary
-      // cannot keep returning the same x/y snapshot.
-      const separator = url.includes("?") ? "&" : "?";
-      const freshUrl = `${url}${separator}_realtime=${Date.now()}`;
-      const data = await fetchFromApi(freshUrl, "Failed to get all tag last locations");
-      await syncTagLatestFromLastLocation(data);
-      tagLastLocationCache = data;
-      tagLastLocationCacheAt = Date.now();
-      return data;
-    } catch (error) {
-      if (Number(error?.status) === 404) {
-        console.warn("[TagLocation] upstream last-location endpoint is unavailable (404); using TagLatest fallback");
-        const fallback = await readDbTagsFromMongo();
-        tagLastLocationCache = fallback;
-        tagLastLocationCacheAt = Date.now();
-        return fallback;
-      }
-      throw error;
-    }
-  })().finally(() => {
-    tagLastLocationRefreshPromise = null;
-  });
-
-  return tagLastLocationRefreshPromise;
-}
 
 async function readDbTagsFromMongo() {
   const assetTagIds = await getAssetTagIds();
@@ -191,28 +64,9 @@ async function readDbTagsFromMongo() {
       ...row,
       id: row.tagId,
       tagId: row.tagId,
-      placeId: row.placeId ?? null,
-      buildingId: row.buildingId ?? null,
-      floorId: row.floorId ?? null,
-      zoneId: row.zoneId ?? null,
-      zoneName: row.zoneName ?? null,
-      firstName: row.firstName ?? null,
-      lastName: row.lastName ?? null,
-      uiDisplay: row.uiDisplay ?? row.tagName ?? null,
-      tagType: row.tagType ?? null,
-      batteryLevel: row.batteryLevel ?? null,
-      placeName: row.placeName ?? null,
-      buildingName: row.buildingName ?? null,
-      floorName: row.floorName ?? null,
-      x: row.x ?? null,
-      y: row.y ?? null,
-      z: row.z ?? null,
-      timestamp: timestamp?.toISOString() ?? null,
-      lastSeenAt: row.lastSeenAt ? new Date(row.lastSeenAt).toISOString() : timestamp?.toISOString() ?? null,
       status: alive ? 1 : 0,
       statusText: alive ? "ONLINE" : "OFFLINE",
-      lastSeen: row.lastSeenAt ? new Date(row.lastSeenAt).toISOString() : timestamp?.toISOString() ?? null,
-      _canonicalPosition: true,
+      lastSeen: timestamp?.toISOString() ?? null,
     };
   });
 }
@@ -337,75 +191,6 @@ async function ensureRealtimeCollector() {
   return realtimeCollectorPromise;
 }
 
-async function pollRestRealtime() {
-  if (restRealtimePollRunning || realtimeClients.size === 0) return;
-  restRealtimePollRunning = true;
-
-  try {
-    const data = await getLastLocationData();
-    const rows = asArray(data, ["tags"]);
-    const changed = [];
-
-    for (const row of rows) {
-      if (!row || typeof row !== "object") continue;
-      const tagId = row.tagId ?? row.tag_id ?? row.id;
-      const x = Number(row.x);
-      const y = Number(row.y);
-      if (tagId == null || !Number.isFinite(x) || !Number.isFinite(y)) continue;
-      if (isAsset(row)) continue;
-
-      const key = String(tagId);
-      const timestamp = row.timestamp
-        ?? row.unix_time
-        ?? row.unixTime
-        ?? row.lastSeenAt
-        ?? row.date_now
-        ?? row.created_at
-        ?? null;
-      const signature = `${x}|${y}|${timestamp ?? ""}`;
-      if (restRealtimeLastPositions.get(key) === signature) continue;
-
-      restRealtimeLastPositions.set(key, signature);
-      changed.push(row);
-    }
-
-    if (changed.length) {
-      console.log(`[REST Realtime] POSITION UPDATE rows=${changed.length} sample=${JSON.stringify(changed[0])}`);
-      const message = `event: tags\ndata: ${JSON.stringify({
-        timestamp: new Date().toISOString(),
-        transport: "rest",
-        tags: changed,
-      })}\n\n`;
-      for (const client of realtimeClients) {
-        try {
-          client.write(message);
-        } catch {
-          realtimeClients.delete(client);
-        }
-      }
-    }
-  } catch (error) {
-    console.warn(`[REST Realtime] poll failed: ${error.message}`);
-  } finally {
-    restRealtimePollRunning = false;
-  }
-}
-
-function ensureRestRealtimePolling() {
-  if (restRealtimePollTimer || realtimeClients.size === 0) return;
-  console.log(`[REST Realtime] polling UNAI last-location every ${REST_REALTIME_POLL_MS}ms`);
-  pollRestRealtime();
-  restRealtimePollTimer = setInterval(pollRestRealtime, REST_REALTIME_POLL_MS);
-}
-
-function stopRestRealtimePolling() {
-  if (!restRealtimePollTimer) return;
-  clearInterval(restRealtimePollTimer);
-  restRealtimePollTimer = null;
-  restRealtimeLastPositions.clear();
-  console.log("[REST Realtime] polling stopped");
-}
-
 function ensureRealtimeHeartbeat() {
   if (realtimeHeartbeat) return;
   realtimeHeartbeat = setInterval(() => {
@@ -430,14 +215,15 @@ function ensureRealtimeHeartbeat() {
 }
 
 router.get("/realtime", async (req, res) => {
-  // REST polling is the primary realtime transport. Keep the legacy Socket.IO
-  // collector as a diagnostic/fallback path, but never let its startup failure
-  // prevent the SSE stream from serving REST-driven position updates.
-  // Start the legacy Socket.IO collector in the background. REST polling is
-  // the primary transport and must not wait for the socket handshake.
-  void ensureRealtimeCollector().catch((error) => {
-    console.warn("[Realtime] socket collector unavailable; continuing with REST transport:", error.message);
-  });
+  try {
+    await ensureRealtimeCollector();
+  } catch (error) {
+    console.error("[Realtime] collector start failed:", error.message);
+    return res.status(503).json({
+      error: "Realtime collector is unavailable",
+      details: error.message,
+    });
+  }
 
   res.status(200);
   res.set({
@@ -454,7 +240,6 @@ router.get("/realtime", async (req, res) => {
   const client = res;
   realtimeClients.add(client);
   ensureRealtimeHeartbeat();
-  ensureRestRealtimePolling();
 
   const send = (eventName, payload) => {
     if (client.writableEnded || client.destroyed) return;
@@ -487,12 +272,9 @@ router.get("/realtime", async (req, res) => {
   req.on("close", () => {
     unsubscribe();
     realtimeClients.delete(client);
-    if (realtimeClients.size === 0) {
-      stopRestRealtimePolling();
-      if (realtimeHeartbeat) {
-        clearInterval(realtimeHeartbeat);
-        realtimeHeartbeat = null;
-      }
+    if (realtimeClients.size === 0 && realtimeHeartbeat) {
+      clearInterval(realtimeHeartbeat);
+      realtimeHeartbeat = null;
     }
   });
 
@@ -574,54 +356,6 @@ router.get("/v1/get_all_building", async (req, res) => {
   } catch (error) {
     console.error("/api/v1/get_all_building error:", error);
     return res.status(error.status || 500).json({ error: "Failed to get buildings", details: error.message });
-  }
-});
-
-// New UNAI tag-location APIs. These are deliberately exposed as additive
-// backend routes: existing /tag and /db-tags consumers keep their behaviour,
-// while the Building page can opt into the richer last-location read model.
-// The upstream detail endpoint expects its identifier in the `value` query
-// parameter, where value = tag_id.
-function getTagLocationApiUrl(name, fallbackPath) {
-  const configured = process.env[name];
-  if (configured) return configured;
-  return `https://rtls.lailab.online${fallbackPath}`;
-}
-
-router.get("/v1/get_all_tag_last_location", async (req, res) => {
-  try {
-    const data = await getLastLocationData();
-    return res.json(data);
-  } catch (error) {
-    console.error("/api/v1/get_all_tag_last_location error:", error);
-    return res.status(error.status || 500).json({
-      error: "Failed to get all tag last locations",
-      details: error.message,
-    });
-  }
-});
-
-router.get("/v1/get_last_location_by_tag_id", async (req, res) => {
-  try {
-    const value = req.query.value;
-    if (value === undefined || value === null || String(value).trim() === "") {
-      return res.status(400).json({ error: "value (tag_id) is required" });
-    }
-
-    const baseUrl = getTagLocationApiUrl(
-      "APITAG_LAST_LOCATION_BY_ID_URL",
-      "/api/v1/get_last_location_by_tag_id",
-    );
-    const separator = baseUrl.includes("?") ? "&" : "?";
-    const url = `${baseUrl}${separator}value=${encodeURIComponent(String(value))}`;
-    const data = await fetchFromApi(url, "Failed to get last location by tag ID");
-    return res.json(data);
-  } catch (error) {
-    console.error("/api/v1/get_last_location_by_tag_id error:", error);
-    return res.status(error.status || 500).json({
-      error: "Failed to get last location by tag ID",
-      details: error.message,
-    });
   }
 });
 
