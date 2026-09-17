@@ -277,7 +277,7 @@ export default function LiveMap({
   // Socket packets can arrive much faster than React needs to render. Keep a
   // compact signature per tag so duplicate/unchanged packets do not rebuild
   // the entire map, including the SVG zone layer.
-  const tagRenderSignatureRef = useRef<Map<string, string>>(new Map());
+
   const pendingTagUpdatesRef = useRef<Map<string, Tag>>(new Map());
   const initialFloorIdRef = useRef<number | string | undefined>(floor.id);
   const tagFlushFrameRef = useRef<number | null>(null);
@@ -602,16 +602,16 @@ export default function LiveMap({
           const changedUpdates = updates.filter((update) => {
             const tagId = update.id ?? update.tagId ?? update.tag_id;
             if (tagId == null || isAssetTag(update) || assetTagIdsRef.current.has(String(tagId))) return false;
-            const id = String(tagId);
-            const signature = [
-              update.x ?? "",
-              update.y ?? "",
-              update.z ?? "",
-              update.floor_id ?? update.floorId ?? floor.id,
-              update.status ?? "",
-            ].join("|");
-            if (tagRenderSignatureRef.current.get(id) === signature) return false;
-            tagRenderSignatureRef.current.set(id, signature);
+
+
+
+
+
+
+
+
+            return true;
+
             return true;
           });
 
