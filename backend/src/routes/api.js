@@ -49,6 +49,14 @@ let tagLastLocationCache = null;
 let tagLastLocationCacheAt = 0;
 let tagLastLocationRefreshPromise = null;
 
+// REST is the fallback realtime transport when the UNAI socket gateway is
+// connected but does not deliver live clientBox/location packets. Poll only
+// while at least one browser is subscribed to /api/realtime.
+const REST_REALTIME_POLL_MS = Math.max(1000, Number(process.env.REST_REALTIME_POLL_MS) || 2000);
+let restRealtimePollTimer = null;
+let restRealtimePollRunning = false;
+const restRealtimeLastPositions = new Map();
+
 function parseLocationDate(value, fallback = new Date()) {
   if (typeof value === "number" && Number.isFinite(value)) {
     const ms = value < 100_000_000_000 ? value * 1000 : value;
@@ -131,16 +139,11 @@ async function getLastLocationData() {
   if (tagLastLocationRefreshPromise) return tagLastLocationRefreshPromise;
 
   tagLastLocationRefreshPromise = (async () => {
-    const url = process.env.APITAG_LAST_LOCATION_URL;
-    if (!url) {
-      // This endpoint is not available on every UNAI deployment. TagLatest is
-      // the canonical local read model, so do not repeatedly call a known
-      // missing upstream route and flood Render logs with HTTP 404s.
-      const fallback = await readDbTagsFromMongo();
-      tagLastLocationCache = fallback;
-      tagLastLocationCacheAt = Date.now();
-      return fallback;
-    }
+    // Use UNAI's documented all-tag last-location endpoint as the realtime
+    // source. APITAG_LAST_LOCATION_URL can still override it on deployments
+    // that expose the API under another URL.
+    const url = process.env.APITAG_LAST_LOCATION_URL
+      || "https://rtls.lailab.online/api/v1/get_all_tag_last_location";
 
     try {
       const data = await fetchFromApi(url, "Failed to get all tag last locations");
@@ -330,6 +333,75 @@ async function ensureRealtimeCollector() {
   return realtimeCollectorPromise;
 }
 
+async function pollRestRealtime() {
+  if (restRealtimePollRunning || realtimeClients.size === 0) return;
+  restRealtimePollRunning = true;
+
+  try {
+    const data = await getLastLocationData();
+    const rows = asArray(data, ["tags"]);
+    const changed = [];
+
+    for (const row of rows) {
+      if (!row || typeof row !== "object") continue;
+      const tagId = row.tagId ?? row.tag_id ?? row.id;
+      const x = Number(row.x);
+      const y = Number(row.y);
+      if (tagId == null || !Number.isFinite(x) || !Number.isFinite(y)) continue;
+      if (isAsset(row)) continue;
+
+      const key = String(tagId);
+      const timestamp = row.timestamp
+        ?? row.unix_time
+        ?? row.unixTime
+        ?? row.lastSeenAt
+        ?? row.date_now
+        ?? row.created_at
+        ?? null;
+      const signature = `${x}|${y}|${timestamp ?? ""}`;
+      if (restRealtimeLastPositions.get(key) === signature) continue;
+
+      restRealtimeLastPositions.set(key, signature);
+      changed.push(row);
+    }
+
+    if (changed.length) {
+      console.log(`[REST Realtime] POSITION UPDATE rows=${changed.length} sample=${JSON.stringify(changed[0])}`);
+      const message = `event: tags\\ndata: ${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        transport: "rest",
+        tags: changed,
+      })}\\n\\n`;
+      for (const client of realtimeClients) {
+        try {
+          client.write(message);
+        } catch {
+          realtimeClients.delete(client);
+        }
+      }
+    }
+  } catch (error) {
+    console.warn(`[REST Realtime] poll failed: ${error.message}`);
+  } finally {
+    restRealtimePollRunning = false;
+  }
+}
+
+function ensureRestRealtimePolling() {
+  if (restRealtimePollTimer || realtimeClients.size === 0) return;
+  console.log(`[REST Realtime] polling UNAI last-location every ${REST_REALTIME_POLL_MS}ms`);
+  pollRestRealtime();
+  restRealtimePollTimer = setInterval(pollRestRealtime, REST_REALTIME_POLL_MS);
+}
+
+function stopRestRealtimePolling() {
+  if (!restRealtimePollTimer) return;
+  clearInterval(restRealtimePollTimer);
+  restRealtimePollTimer = null;
+  restRealtimeLastPositions.clear();
+  console.log("[REST Realtime] polling stopped");
+}
+
 function ensureRealtimeHeartbeat() {
   if (realtimeHeartbeat) return;
   realtimeHeartbeat = setInterval(() => {
@@ -379,6 +451,7 @@ router.get("/realtime", async (req, res) => {
   const client = res;
   realtimeClients.add(client);
   ensureRealtimeHeartbeat();
+  ensureRestRealtimePolling();
 
   const send = (eventName, payload) => {
     if (client.writableEnded || client.destroyed) return;
@@ -411,9 +484,12 @@ router.get("/realtime", async (req, res) => {
   req.on("close", () => {
     unsubscribe();
     realtimeClients.delete(client);
-    if (realtimeClients.size === 0 && realtimeHeartbeat) {
-      clearInterval(realtimeHeartbeat);
-      realtimeHeartbeat = null;
+    if (realtimeClients.size === 0) {
+      stopRestRealtimePolling();
+      if (realtimeHeartbeat) {
+        clearInterval(realtimeHeartbeat);
+        realtimeHeartbeat = null;
+      }
     }
   });
 
